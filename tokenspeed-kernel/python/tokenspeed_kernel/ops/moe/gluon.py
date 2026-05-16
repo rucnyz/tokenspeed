@@ -2383,6 +2383,24 @@ def _round_up_int(x: int, m: int) -> int:
     return ((x + m - 1) // m) * m
 
 
+def _ragged_slice_size(a_ragged_metadata, M: int) -> int | None:
+    """Per-expert M hint for autotune. Mirrors triton_kernels'
+    ``opt_flags_amd.make_default_opt_flags_amd`` slice-size formula so
+    our BLOCK_M picks match what upstream's kernel sees on the same
+    workload. Returns ``None`` (=> use the dense fallback) when no
+    ragged metadata is available."""
+    if a_ragged_metadata is None:
+        return None
+    expected = getattr(a_ragged_metadata, "expected_slice_size", None)
+    if expected is not None:
+        return int(expected)
+    try:
+        n_slices = int(a_ragged_metadata.slice_sizes.shape[0])
+    except (AttributeError, IndexError):
+        return None
+    return max(1, M // max(1, n_slices))
+
+
 def _autotune_block(
     M: int,
     N: int,
@@ -2393,6 +2411,7 @@ def _autotune_block(
     scaled_mfma: bool = False,
     a_format: str = "e2m1",
     scale_load_mode: str = "transpose",
+    slice_size: int | None = None,
 ) -> tuple[int, int, int, int]:
     """Pick ``(BLOCK_M, BLOCK_N, BLOCK_K, NUM_WARPS)`` for given shape.
 
@@ -2455,7 +2474,26 @@ def _autotune_block(
     """
     if scaled_mfma:
         is_fp8 = a_format == "e4m3"
-        if M <= 512:
+        # NOTE: a BM=16 sub-tier (for fp8 X + slice_size<=2, where the
+        # cdna4_upstream scale layout's BM%32 constraint doesn't apply
+        # because there's no per-block X scale) was tried and reverted:
+        # microbench (dispatch B=1, prod-block-m=32) showed 71.9us at
+        # BM=16 vs 75.0us at BM=32, but E2E c=1 TPOT regressed from
+        # 7.33ms -> 7.56ms over 3 stable runs. The bench shape uses
+        # slice_sizes[i]=per_expert_padded, so the microbench measures
+        # only MFMA pipeline efficiency at the smaller tile; production
+        # has slice_sizes[i]=actual which apparently exposes a different
+        # bottleneck (LDS pressure / gather path / num_buffers). Profile
+        # c=1 before re-enabling.
+        if slice_size is not None and slice_size <= 16:
+            # Tiny ragged decode (per-expert M <= 16, i.e. B=1..~8 served
+            # alone over E=128 experts). Empirically swept across
+            # ``check_gluon_decode_perf.py --H 2880 --I 2880 --prod-block-m
+            # 32`` on MI355: NW=4 + BK=256 wins by 5-9us vs the legacy
+            # 64/128/512/8 tier across B=4..8. BM=16 sub-tier was tried
+            # and reverted (see above comment block).
+            bm, bn, bk, nw = 32, 128, 256, 4
+        elif M <= 512:
             bm, bn, bk, nw = 64, 128, 512, 8
         elif is_fp8:
             # fp8 X tiles are 1 byte/elem so VGPR pressure is lower; we
@@ -2957,6 +2995,7 @@ def gluon_mxfp_dispatch_swiglu(
         scaled_mfma=True,
         a_format=a_format,
         scale_load_mode=scale_load_mode,
+        slice_size=_ragged_slice_size(a_ragged_metadata, M),
     )
     block_m = block_m or bm
     block_n = block_n or bn
@@ -3047,6 +3086,7 @@ def gluon_mxfp_combine(
         scaled_mfma=True,
         a_format=a_format,
         scale_load_mode=scale_load_mode,
+        slice_size=_ragged_slice_size(a_ragged_metadata, M),
     )
     block_m = block_m or bm
     block_n = block_n or bn
