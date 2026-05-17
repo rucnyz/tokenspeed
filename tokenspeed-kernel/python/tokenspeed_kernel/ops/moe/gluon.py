@@ -708,17 +708,27 @@ class MoEProgramBase:
             return gl.amd.cdna4.mfma(x, w, accumulator)
 
     @gluon.jit
-    def issue_global_loads(self, load_idx, pred=1):
+    def issue_global_loads(self, load_idx, pred=1, USE_MASK: gl.constexpr = -1):
         # X / W always go through LDS via async copy. Scales go through LDS
         # only when SCALE_VIA_LDS (== swizzle mode).
+        #
+        # ``USE_MASK`` (constexpr int) propagates the caller's mask choice
+        # to all four async loads in this batch. ``-1`` (default) preserves
+        # the legacy behaviour (mask iff ``not cfg.EVEN_K``); ``0`` forces
+        # unmasked (peeled main-loop iters); ``1`` forces masked (peeled
+        # tail iter). See ``AsyncCopyDescriptor.issue_async_load``.
         cfg = self.cfg
-        self.x_desc.issue_async_load(load_idx, self.x_buffer, pred)
-        self.w_desc.issue_async_load(load_idx, self.w_buffer, pred)
+        self.x_desc.issue_async_load(load_idx, self.x_buffer, pred, USE_MASK=USE_MASK)
+        self.w_desc.issue_async_load(load_idx, self.w_buffer, pred, USE_MASK=USE_MASK)
         if cfg.SCALE_VIA_LDS:
             if cfg.WITH_X_MX_SCALE:
-                self.x_scale_desc.issue_async_load(load_idx, self.x_scale_buffer, pred)
+                self.x_scale_desc.issue_async_load(
+                    load_idx, self.x_scale_buffer, pred, USE_MASK=USE_MASK
+                )
             if cfg.WITH_W_MX_SCALE:
-                self.w_scale_desc.issue_async_load(load_idx, self.w_scale_buffer, pred)
+                self.w_scale_desc.issue_async_load(
+                    load_idx, self.w_scale_buffer, pred, USE_MASK=USE_MASK
+                )
         return load_idx + 1
 
     @gluon.jit
@@ -847,12 +857,27 @@ class AsyncCopyDescriptor:
         )
 
     @gluon.jit
-    def issue_async_load(self, idx, buffer, pred=1):
+    def issue_async_load(self, idx, buffer, pred=1, USE_MASK: gl.constexpr = -1):
+        """Async copy one K-tile from HBM to LDS.
+
+        ``USE_MASK`` (constexpr int) selects the mask strategy:
+          *  -1 -> default: fall back to ``cfg.EVEN_K`` (mask iff
+                  ``not EVEN_K``). Preserves the legacy behaviour for
+                  callers that don't K-tail-peel.
+          *   0 -> force unmasked (caller has guaranteed this K-tile
+                  is fully in-bounds; e.g. main-loop iters when the
+                  tail is peeled out).
+          *   1 -> force masked (the peeled tail iter when EVEN_K=False).
+        """
         NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
         EVEN_K: gl.constexpr = self.cfg.EVEN_K
+        if USE_MASK == -1:
+            USE_MASK_RESOLVED: gl.constexpr = 0 if EVEN_K else 1
+        else:
+            USE_MASK_RESOLVED: gl.constexpr = USE_MASK
         off_k_step = idx * self.BLOCK_K
         offsets = self.offsets + off_k_step * self.stride_k
-        if EVEN_K:
+        if USE_MASK_RESOLVED == 0:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 buffer.index(idx % NUM_BUFFERS),
                 self.ptr,
@@ -1249,34 +1274,86 @@ class MoEPipelinedProgram:
         # Classical (multi-buffer / single-stage-per-iter) software pipeline:
         # prologue issues NUM_BUFFERS - 1 batches, then each main-iter
         # issues one batch, waits for the oldest, local-loads + MFMA.
+        #
+        # K-tail peeling: when ``cfg.EVEN_K`` is False (K % BLOCK_K != 0),
+        # only the final K-iter (load_idx = K_iters - 1) actually needs the
+        # per-element K-mask -- every earlier iter satisfies
+        # ``off_k_step + off_k < K`` trivially. Issuing the masked load
+        # in the main loop is what triggers the per-vector ``br i1``
+        # blocks in ``BufferLoadToLocalOpConversion`` (cf. comment in
+        # ``AsyncCopyDescriptor.issue_async_load``), so even with
+        # ``other=0`` stripped the mask still costs an extra
+        # ``v_cmp_lt_u32`` per lane + a warp-uniform predicate ``s_and``
+        # per buffer load in every iter. Peeling the tail keeps the hot
+        # loop body identical to the EVEN_K=True path; only the very
+        # last iter pays the mask cost.
         cfg = self.cfg
+        EVEN_K: gl.constexpr = cfg.EVEN_K
         load_idx = 0
         mfma_idx = 0
-
-        for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
-            load_idx = self.issue_global_loads(load_idx)
 
         accumulator = gl.zeros(
             (cfg.BLOCK_M, cfg.BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout
         )
-        main_iters = gl.cdiv(loop_k, cfg.BLOCK_K) - (cfg.NUM_BUFFERS - 1)
-        gl.assume(main_iters >= 0)
+        K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
 
-        for i in range(0, main_iters):
-            load_idx = self.issue_global_loads(load_idx)
+        if EVEN_K:
+            # No tail to peel: every iter is in-bounds, no mask anywhere.
+            for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
+                load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
+
+            main_iters = K_iters - (cfg.NUM_BUFFERS - 1)
+            gl.assume(main_iters >= 0)
+
+            for i in range(0, main_iters):
+                load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
+                self.async_wait(cfg.NUM_BUFFERS - 1)
+
+                x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
+                mfma_idx += 1
+
+                accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
+
+            # epilogue
+            for i in gl.static_range(cfg.NUM_BUFFERS - 1):
+                self.async_wait(cfg.NUM_BUFFERS - 2 - i)
+                x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
+                mfma_idx += 1
+                accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
+        else:
+            # Peel last K-iter as masked; main loop stays unmasked.
+            # Precondition: K_iters >= NUM_BUFFERS so the prologue + one
+            # peeled tail fit (main_iters = K_iters - NB >= 0). The
+            # launcher (gluon_mxfp_*; ``_autotune_block``) enforces
+            # this; ``gl.assume`` propagates it to LLVM.
+            for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
+                load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
+
+            main_iters = K_iters - cfg.NUM_BUFFERS
+            gl.assume(main_iters >= 0)
+
+            for i in range(0, main_iters):
+                load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
+                self.async_wait(cfg.NUM_BUFFERS - 1)
+
+                x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
+                mfma_idx += 1
+
+                accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
+
+            # Peeled tail: 1 masked issue + drain oldest + MFMA.
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=1)
             self.async_wait(cfg.NUM_BUFFERS - 1)
-
-            x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
-            mfma_idx += 1
-
-            accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
-
-        # epilogue
-        for i in gl.static_range(cfg.NUM_BUFFERS - 1):
-            self.async_wait(cfg.NUM_BUFFERS - 2 - i)
             x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
             mfma_idx += 1
             accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
+
+            # epilogue: same NUM_BUFFERS - 1 drain pattern as EVEN_K path.
+            for i in gl.static_range(cfg.NUM_BUFFERS - 1):
+                self.async_wait(cfg.NUM_BUFFERS - 2 - i)
+                x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
+                mfma_idx += 1
+                accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
 
         return accumulator
 
@@ -1662,7 +1739,16 @@ class MoESliceMNKProgram:
 
     @gluon.jit
     def pipeline(self, loop_k):
+        # See ``MoEPipelinedProgram.pipeline`` for the K-tail-peel
+        # rationale. The sliceMNK main-loop body is structurally the
+        # same except each "iter" issues 4 sub-MFMAs + 4 sub-local-loads
+        # around the single batched async issue. We peel one additional
+        # tail iter (only when EVEN_K=False) with the issue marked
+        # ``USE_MASK=1``; main-loop issues stay unmasked so
+        # ``BufferLoadToLocalOpConversion`` emits straight-line vector
+        # loads (no per-load ``br i1``) for the hot path.
         cfg = self.cfg
+        EVEN_K: gl.constexpr = cfg.EVEN_K
         gl.static_assert(
             (cfg.NUM_SUBTILES[0] == 2)
             and (cfg.NUM_SUBTILES[1] == 2)
@@ -1676,16 +1762,23 @@ class MoESliceMNKProgram:
         load_idx = 0
         mfma_idx = 0
 
-        # prologue
+        # prologue (NB-1 unmasked issues; the K-tail iter is peeled out
+        # to the dedicated block below when EVEN_K=False).
         for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
-            load_idx = self.issue_global_loads(load_idx)
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
 
         c00 = gl.zeros((SUBTILE_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
         c01 = gl.zeros((SUBTILE_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
         c10 = gl.zeros((SUBTILE_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
         c11 = gl.zeros((SUBTILE_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
 
-        main_iters = gl.cdiv(loop_k, cfg.BLOCK_K) - (cfg.NUM_BUFFERS - 1)
+        K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
+        if EVEN_K:
+            main_iters = K_iters - (cfg.NUM_BUFFERS - 1)
+        else:
+            # one fewer main iter; the K-tail is peeled out below.
+            # Precondition: K_iters >= NUM_BUFFERS (autotuner enforces).
+            main_iters = K_iters - cfg.NUM_BUFFERS
         gl.assume(main_iters >= 0)
 
         self.async_wait(cfg.NUM_BUFFERS - 2)
@@ -1701,7 +1794,7 @@ class MoESliceMNKProgram:
 
             mfma_idx += 1
 
-            load_idx = self.issue_global_loads(load_idx)
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
             self.async_wait(cfg.NUM_BUFFERS - 2)
 
             c10 = self.mfma(x1, sx1, w0, sw0, c10)
@@ -1710,7 +1803,28 @@ class MoESliceMNKProgram:
             c11 = self.mfma(x1, sx1, w1, sw1, c11)
             w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
 
-        # epilogue
+        # K-tail peel: only when EVEN_K=False. Same body shape as one
+        # main-loop iter, but the issue is the lone masked load in the
+        # whole pipeline (load_idx = K_iters - 1).
+        if not EVEN_K:
+            c00 = self.mfma(x0, sx0, w0, sw0, c00)
+            w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
+
+            c01 = self.mfma(x0, sx0, w1, sw1, c01)
+            x1, sx1 = self.issue_local_load_x_sub(mfma_idx, 1)
+
+            mfma_idx += 1
+
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=1)
+            self.async_wait(cfg.NUM_BUFFERS - 2)
+
+            c10 = self.mfma(x1, sx1, w0, sw0, c10)
+            x0, sx0 = self.issue_local_load_x_sub(mfma_idx, 0)
+
+            c11 = self.mfma(x1, sx1, w1, sw1, c11)
+            w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
+
+        # epilogue (NB-1 drain iters, no issues)
         for i in gl.static_range(cfg.NUM_BUFFERS - 1):
             c00 = self.mfma(x0, sx0, w0, sw0, c00)
             w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
