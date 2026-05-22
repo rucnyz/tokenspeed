@@ -358,6 +358,79 @@ def _test_swap_and_gather_cuda_graph_replay(
         dist.barrier()
 
 
+class _CountingNcclBackend:
+    """Thin wrapper around the global comm backend that counts how many
+    ``all_gather_into_tensor`` calls land on it. Used by Phase B to prove
+    the packed-payload NCCL gather collapses three back-to-back gathers
+    into exactly one collective launch.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.all_gather_calls = 0
+
+    def all_gather_into_tensor(self, output, input, group):
+        self.all_gather_calls += 1
+        return self._inner.all_gather_into_tensor(output, input, group)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _test_nccl_single_allgather(
+    rank, world_size, device, group, *, pad_bs, n
+):
+    """Phase B: NCCL ``gather_verify_outputs`` issues exactly one collective."""
+    from tokenspeed.runtime.distributed.comm_backend import get_global_backend
+    from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
+
+    counter = _CountingNcclBackend(get_global_backend())
+
+    comm = DpSamplingComm(
+        tp_size=world_size,
+        rank=rank,
+        group=group,
+        max_pad_bs=pad_bs,
+        num_tokens_per_req=n,
+        vocab_size=world_size * 4,
+        logits_dtype=torch.bfloat16,
+        backend="nccl",
+        fallback_comm_backend=counter,
+    )
+
+    tp = world_size
+    k_req = pad_bs // tp
+    predict_local = torch.arange(
+        rank * k_req * n, (rank + 1) * k_req * n, dtype=torch.int32, device=device
+    ).view(k_req, n)
+    accept_index_local = (predict_local * 5 + 3).contiguous()
+    accept_length_local = torch.arange(
+        rank * k_req, (rank + 1) * k_req, dtype=torch.int32, device=device
+    )
+
+    predict_full, accept_index_full, accept_length_full = comm.gather_verify_outputs(
+        predict_local,
+        accept_index_local,
+        accept_length_local,
+        pad_bs=pad_bs,
+    )
+
+    assert counter.all_gather_calls == 1, (
+        f"expected 1 all_gather call, got {counter.all_gather_calls}"
+    )
+
+    expected_predict = torch.arange(
+        0, pad_bs * n, dtype=torch.int32, device=device
+    ).view(pad_bs, n)
+    expected_accept_index = expected_predict * 5 + 3
+    expected_accept_length = torch.arange(
+        0, pad_bs, dtype=torch.int32, device=device
+    )
+    torch.testing.assert_close(predict_full, expected_predict)
+    torch.testing.assert_close(accept_index_full, expected_accept_index)
+    torch.testing.assert_close(accept_length_full, expected_accept_length)
+
+
 def _test_onesided_matches_nccl(
     rank, world_size, device, group, *, pad_bs, n, vocab, dtype
 ):
@@ -510,6 +583,22 @@ class TestDpSamplingComm:
             n=2,
             vocab=64,
             backend=backend,
+        )
+
+    @pytest.mark.parametrize("world_size", WORLD_SIZES)
+    @pytest.mark.parametrize("pad_bs,n", [(8, 1), (8, 4), (12, 3)])
+    def test_nccl_single_allgather(self, world_size, pad_bs, n):
+        """Phase B: NCCL ``gather_verify_outputs`` packs three int32
+        payloads into one buffer so the collective count drops from
+        three back-to-back ``all_gather_into_tensor`` calls to one.
+        """
+        if pad_bs % world_size != 0:
+            pytest.skip("pad_bs not divisible by tp")
+        _run(
+            world_size,
+            _test_nccl_single_allgather,
+            pad_bs=pad_bs,
+            n=n,
         )
 
     @pytest.mark.parametrize("world_size", WORLD_SIZES)

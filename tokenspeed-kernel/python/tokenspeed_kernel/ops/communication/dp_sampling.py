@@ -60,14 +60,6 @@ The per-step entrypoints are pure CUDA / Triton kernel launches over
 once and never resized; ``pad_bs`` is a runtime arg bounded by
 ``max_pad_bs`` at construction time.
 
-============================================================================
-STATUS: stubbed pending implementation. See ``DpSamplingComm`` runtime-side
-wiring; ``DpSamplingComm._onesided_available()`` returns False so callers
-default to the NCCL fallback until this lands. The stubs below define the
-exact surface ``DpSamplingComm._init_onesided`` / ``_swap_..._onesided`` /
-``_gather_..._onesided`` will bind to.
-============================================================================
-
 Implementation references when wiring this up:
 
   * Symmetric-memory rendezvous: see ``flashinfer.comm.torch_symmetric_memory.
@@ -168,7 +160,6 @@ class DpSamplingState:
 def _dp_sampling_swap_kernel(
     local_logits,
     recv_logits_ptrs_dev,
-    signal_pad_ptrs_dev,
     K_REQ: tl.constexpr,
     N: tl.constexpr,
     V_LOCAL: tl.constexpr,
@@ -205,7 +196,14 @@ def _dp_sampling_swap_kernel(
     dst_offset = req_local * N * V + draft_pos * V + RANK * V_LOCAL + offsets
     tl.store(peer_base + dst_offset, vals, mask=mask)
 
-    symm_mem_barrier(signal_pad_ptrs_dev, pid, RANK, WORLD_SIZE)
+
+@triton.jit
+def _dp_sampling_swap_barrier_kernel(
+    signal_pad_ptrs_dev,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+):
+    symm_mem_barrier(signal_pad_ptrs_dev, 0, RANK, WORLD_SIZE)
 
 
 @triton.jit
@@ -418,18 +416,17 @@ def dp_sampling_swap(
 ) -> torch.Tensor:
     """Stage 4 one-sided swap. Returns a view into ``state.recv_logits``.
 
-    Kernel structure (one Triton kernel launched on the local stream):
+    Kernel structure (two Triton kernels launched on the local stream):
       1. Compute ``(target_rank, target_index)`` for each input row from
          ``rank_in_group``, ``tp_size``, ``num_tokens_per_req``, and
          ``pad_bs`` -- purely arithmetic, no routing dependency.
       2. Issue vectorized stores into every peer's
          ``recv_logits[my_rank, target_index_within_my_stripe, :]`` at
          the corresponding vocab-slice offset.
-      3. ``__threadfence_system()`` (release).
-      4. Stamp my flag slot on every peer's ``flags`` array with the
-         current epoch.
-      5. Spin-wait on local ``flags`` until every peer has stamped.
-      6. ``__threadfence_system()`` (acquire).
+      3. Launch a single-CTA release/acquire barrier kernel. Stream
+         ordering guarantees all store CTAs on this rank completed before
+         the barrier CTA runs; the cross-rank barrier then makes peer
+         stores visible before the returned view is consumed.
 
     Returns the prefix view ``state.recv_logits[:K_req].view(K_req * N, V)``
     where ``K_req = pad_bs // tp_size``.
@@ -458,7 +455,6 @@ def dp_sampling_swap(
     _dp_sampling_swap_kernel[grid](
         local_logits,
         state.recv_logits_peer_ptrs,
-        state.flags_peer_ptrs,
         K_REQ=k_req,
         N=n,
         V_LOCAL=v_local,
@@ -468,6 +464,12 @@ def dp_sampling_swap(
         BLOCK_SIZE=block_size,
         LOGITS_DTYPE_CODE=_logits_dtype_code(state.logits_dtype),
         num_warps=4,
+    )
+    _dp_sampling_swap_barrier_kernel[(1,)](
+        state.flags_peer_ptrs,
+        RANK=state.rank_in_group,
+        WORLD_SIZE=tp_size,
+        num_warps=1,
     )
     return state.recv_logits[:k_req].view(k_req * n, vocab_size)
 

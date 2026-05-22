@@ -70,6 +70,9 @@ from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
 from tokenspeed.runtime.distributed.dp_sampling_swap import (
     swap_batch_vocab as _swap_batch_vocab_nccl,
 )
+from tokenspeed.runtime.utils import get_colorful_logger
+
+logger = get_colorful_logger(__name__)
 
 DpSamplingBackend = Literal["auto", "nccl", "onesided"]
 _ResolvedBackend = Literal["nccl", "onesided"]
@@ -188,6 +191,17 @@ class DpSamplingComm:
 
         self._backend: _ResolvedBackend = _resolve_backend(backend, group)
         self._state = None
+
+        logger.info(
+            "DpSamplingComm backend=%s tp_size=%d rank=%d max_pad_bs=%d "
+            "num_tokens_per_req=%d vocab_size=%d",
+            self._backend,
+            tp_size,
+            rank,
+            max_pad_bs,
+            num_tokens_per_req,
+            vocab_size,
+        )
 
         n = num_tokens_per_req
         self._predict_full = torch.empty(

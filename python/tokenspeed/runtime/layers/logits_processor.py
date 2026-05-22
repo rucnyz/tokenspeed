@@ -195,6 +195,13 @@ class LogitsProcessor(nn.Module):
         self.dp_sampling_enabled = dp_sampling_enabled
         self.dp_num_tokens_per_req = dp_num_tokens_per_req
         self.logit_scale = logit_scale
+        # Optional DpSamplingComm injected by ModelExecutor when M4.6+ is
+        # active. When set, `_dp_swap_batch_vocab` dispatches through it
+        # (which picks NCCL or onesided per resolved backend) instead of
+        # calling the raw NCCL `swap_batch_vocab` helper directly. We
+        # forward-declare the type as Any to avoid the runtime-level
+        # import in a layer module.
+        self._dp_comm = None  # type: ignore[assignment]
 
         if tp_rank is None:
             assert tp_size is None
@@ -487,15 +494,22 @@ class LogitsProcessor(nn.Module):
             if pad_rows > 0:
                 logits = torch.nn.functional.pad(logits, (0, 0, 0, pad_rows))
             v_padded = logits.shape[1] * self.tp_size
-            logits = swap_batch_vocab(
-                logits,
-                tp_size=self.tp_size,
-                pad_bs=pad_bs,
-                num_tokens_per_req=n,
-                vocab_size=v_padded,
-                rank=self.tp_rank,
-                group=self.tp_group,
-            )  # (req * N, V_padded)
+            if self._dp_comm is not None:
+                # M4.7: DpSamplingComm owns the resolved backend. The
+                # onesided swap uses a store-only kernel followed by a
+                # single cross-rank barrier, avoiding the old per-CTA
+                # barrier cost and the NCCL helper's permute-copy tail.
+                logits = self._dp_comm.swap_batch_vocab(logits, pad_bs=pad_bs)
+            else:
+                logits = swap_batch_vocab(
+                    logits,
+                    tp_size=self.tp_size,
+                    pad_bs=pad_bs,
+                    num_tokens_per_req=n,
+                    vocab_size=v_padded,
+                    rank=self.tp_rank,
+                    group=self.tp_group,
+                )  # (req * N, V_padded)
         elif not dp_sampling and self.tp_size > 1 and not self.skip_all_gather:
             # Legacy: gather full vocab on the full batch, sample redundantly.
             gathered_logits = torch.empty(

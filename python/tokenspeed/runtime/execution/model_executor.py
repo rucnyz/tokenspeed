@@ -328,6 +328,14 @@ class ModelExecutor:
         if self.dp_sampling_enabled:
             processor.dp_sampling_enabled = True
             processor.dp_num_tokens_per_req = spec_num_tokens
+            # M4.6+: share the FlashInfer backend's DpSamplingComm with the
+            # LogitsProcessor so the stage-4 batch<->vocab swap dispatches
+            # through the same resolved backend (NCCL or onesided) as the
+            # stage-6 verify gather. Without this, the LM-head swap stays
+            # on raw NCCL all_to_all_single even when dp_sampling_backend=
+            # onesided, defeating onesided's bandwidth win on the bigger
+            # (16 MB) of the two DP collectives.
+            processor._dp_comm = self.sampling_backend._dp_comm
         logger.info(
             "Batch-DP spec-verify: mode=%s, infra_supports=%s, enabled=%s "
             "(drafter=%s, flashinfer=%s, tp_size=%s, tp_group=%s)",
