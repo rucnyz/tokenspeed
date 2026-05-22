@@ -155,6 +155,31 @@ def _test_all_gather_into_tensor(rank, world_size, device, group, ref_group):
     torch.testing.assert_close(output, expected)
 
 
+def _test_all_to_all_single(rank, world_size, device, group, ref_group):
+    from tokenspeed.runtime.distributed.comm_ops import all_to_all_single
+
+    for sz in TEST_SIZES:
+        for dtype in DTYPES:
+            total = sz * world_size
+            inp = torch.randint(1, 16, (total,), dtype=dtype, device=device)
+            expected = torch.empty_like(inp)
+            dist.all_to_all_single(expected, inp, group=ref_group)
+            output = torch.empty_like(inp)
+            all_to_all_single(output, inp, rank, group)
+            torch.testing.assert_close(output, expected)
+
+    # 2D: even split along dim 0, full rows traverse the a2a together.
+    for dtype in DTYPES:
+        rows_per_rank = 4
+        total_rows = rows_per_rank * world_size
+        inp = torch.randint(1, 16, (total_rows, 128), dtype=dtype, device=device)
+        expected = torch.empty_like(inp)
+        dist.all_to_all_single(expected, inp, group=ref_group)
+        output = torch.empty_like(inp)
+        all_to_all_single(output, inp, rank, group)
+        torch.testing.assert_close(output, expected)
+
+
 def _test_reduce_scatter(rank, world_size, device, group, ref_group):
     from tokenspeed.runtime.distributed.comm_ops import reduce_scatter
 
@@ -358,6 +383,10 @@ class TestCommOps:
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
     def test_all_gather_into_tensor(self, world_size):
         _run(world_size, _test_all_gather_into_tensor)
+
+    @pytest.mark.parametrize("world_size", WORLD_SIZES)
+    def test_all_to_all_single(self, world_size):
+        _run(world_size, _test_all_to_all_single)
 
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
     def test_reduce_scatter(self, world_size):

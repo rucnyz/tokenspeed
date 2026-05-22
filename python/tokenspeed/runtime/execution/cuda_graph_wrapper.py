@@ -194,6 +194,7 @@ class CudaGraphWrapper:
         eager_grammar_buffers=None,
         sampling_backend: SamplingBackend | None = None,
         runtime_states: RuntimeStates | None = None,
+        dp_sampling_enabled: bool = False,
     ):
         self.config = config
         self.attn_backend = attn_backend
@@ -206,6 +207,7 @@ class CudaGraphWrapper:
         self.capturable_grammar = capturable_grammar
         self.eager_grammar_buffers = eager_grammar_buffers
         self.runtime_states = runtime_states
+        self.dp_sampling_enabled = dp_sampling_enabled
         self.enable_torch_compile = getattr(config, "enable_torch_compile", False)
         self.disable_padding = config.disable_cuda_graph_padding
         self.enable_cudagraph_gc = getattr(config, "enable_cudagraph_gc", True)
@@ -306,6 +308,8 @@ class CudaGraphWrapper:
                 if self.drafter is not None
                 else CaptureHiddenMode.NULL
             ),
+            keep_full_logits=True,
+            dp_sampling=self.dp_sampling_enabled,
         )
 
         # For DP mode, global_num_tokens must be set so that the MoE
@@ -330,6 +334,7 @@ class CudaGraphWrapper:
             is_all_greedy=False,
             vocab_size=self.vocab_size,
             device=self.device,
+            dp_sampling=self.dp_sampling_enabled,
         )
 
         from tokenspeed.runtime.grammar.capturable_grammar import (

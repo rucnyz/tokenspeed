@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -274,6 +275,71 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
             )
 
+        # Always-on Batch-DP spec-verify gate (M4.5). Lights up the
+        # DP path on every spec-verify capture/eager decode whenever the
+        # infra physically supports it (drafter present, FlashInfer
+        # backend, LogitsProcessor built with a real TP group). The
+        # bs-threshold refinement is M5; until then DP runs for every
+        # bucket and sampling_backend.verify pads to pad_bs internally.
+        # DP-attention models (skip_all_gather=True without tp_group)
+        # have processor.tp_size == 1 and naturally fall through.
+        #
+        # Env-var override TOKENSPEED_DP_SAMPLING={auto,on,off}
+        # lets bench scripts pin the path while we still measure M4.5:
+        #   auto (default) - engage iff infra supports it (M4.5 default).
+        #   on             - assert infra supports it, then engage. Hard
+        #                    error if any precondition is missing -- this
+        #                    catches silent fallbacks on the DP bench
+        #                    script (e.g. accidentally launched without
+        #                    spec, or with a Greedy backend).
+        #   off            - force the legacy path even when infra would
+        #                    support DP. Used by the baseline launch
+        #                    script for A/B comparison.
+        from tokenspeed.runtime.sampling.backends.flashinfer import (
+            FlashInferSamplingBackend,
+        )
+
+        processor = self.model_runner.model.logits_processor
+        infra_supports_dp = (
+            self.drafter is not None
+            and isinstance(self.sampling_backend, FlashInferSamplingBackend)
+            and processor.tp_size > 1
+            and processor.tp_group is not None
+        )
+
+        dp_mode = os.environ.get("TOKENSPEED_DP_SAMPLING", "auto").lower()
+        if dp_mode not in {"auto", "on", "off"}:
+            raise ValueError(
+                f"TOKENSPEED_DP_SAMPLING must be one of "
+                f"{{auto, on, off}}, got {dp_mode!r}"
+            )
+        if dp_mode == "on" and not infra_supports_dp:
+            raise RuntimeError(
+                "TOKENSPEED_DP_SAMPLING=on but Batch-DP spec-verify "
+                "preconditions are not met: "
+                f"drafter={self.drafter is not None}, "
+                f"flashinfer_backend="
+                f"{isinstance(self.sampling_backend, FlashInferSamplingBackend)}, "
+                f"processor.tp_size={processor.tp_size}, "
+                f"processor.tp_group_set={processor.tp_group is not None}"
+            )
+
+        self.dp_sampling_enabled = infra_supports_dp and dp_mode != "off"
+        if self.dp_sampling_enabled:
+            processor.dp_sampling_enabled = True
+            processor.dp_num_tokens_per_req = spec_num_tokens
+        logger.info(
+            "Batch-DP spec-verify: mode=%s, infra_supports=%s, enabled=%s "
+            "(drafter=%s, flashinfer=%s, tp_size=%s, tp_group=%s)",
+            dp_mode,
+            infra_supports_dp,
+            self.dp_sampling_enabled,
+            self.drafter is not None,
+            isinstance(self.sampling_backend, FlashInferSamplingBackend),
+            processor.tp_size,
+            processor.tp_group is not None,
+        )
+
         self.forward_step = CudaGraphWrapper(
             forward_func=self._forward_step,
             attn_backend=attn_backend,
@@ -287,6 +353,7 @@ class ModelExecutor:
             eager_grammar_buffers=self.eager_grammar_buffers,
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
+            dp_sampling_enabled=self.dp_sampling_enabled,
         )
 
         self.execution_stream = torch.cuda.Stream()
@@ -488,6 +555,7 @@ class ModelExecutor:
         self,
         bs: int,
         sampling_params_list: list[SamplingParams],
+        dp_sampling: bool = False,
     ) -> SamplingBatchInfo:
         return SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
@@ -495,6 +563,7 @@ class ModelExecutor:
             is_all_greedy=all(p.top_k <= 1 for p in sampling_params_list),
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
+            dp_sampling=dp_sampling,
         )
 
     def accumulate_decode_stats(self, results: ModelExecutionResult, bs: int):
@@ -1068,6 +1137,11 @@ class ModelExecutor:
                         else CaptureHiddenMode.NULL
                     ),
                     gather_ids=gather_ids,
+                    padded_static_len=-1,
+                    keep_full_logits=forward_mode.is_decode_or_idle(),
+                    dp_sampling=(
+                        self.dp_sampling_enabled and forward_mode.is_decode()
+                    ),
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:
@@ -1080,7 +1154,9 @@ class ModelExecutor:
                     ctx.all_decode_or_idle = dp_all_decode_or_idle
 
                 with nvtx_range("sampling_prep", color="yellow"):
-                    sampling_info = self._build_sampling_info(bs, sampling_params_list)
+                    sampling_info = self._build_sampling_info(
+                        bs, sampling_params_list, dp_sampling=ctx.dp_sampling
+                    )
                     grammar_completion = setup_grammar_step(
                         sampling_info=sampling_info,
                         bs=bs,

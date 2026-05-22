@@ -46,6 +46,7 @@ from tokenspeed_kernel.torch_compile import get_compiler_backend
 # branch-free in the captured graph.
 _FUSED_TOPK_TOPP_AVAILABLE = current_platform().is_nvidia
 
+from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
     SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
@@ -84,12 +85,44 @@ class FlashInferSamplingBackend(SamplingBackend):
     def __init__(self, config: SamplingBackendConfig) -> None:
 
         super().__init__(config)
+        self._init_dp_geometry(config)
         self._init_shared_buffers(config)
         self._init_pool_scalars(config)
         # Pre-create the side stream used by fused_topk_topp_renorm. Must
         # happen before any CUDA graph capture — cudaStreamCreate is illegal
         # inside capture, and verify() runs from the captured graph.
         fused_topk_topp_prepare(config.device)
+
+    def _init_dp_geometry(self, config: SamplingBackendConfig) -> None:
+        # DP sampling needs the TP group unconditionally (verify contract),
+        # not gated on enable_tp_sync like maybe_broadcast.
+        tp_group = config.tp_group
+        tp_size = len(tp_group) if tp_group is not None else 1
+
+        self._dp_tp_size = tp_size
+        self._dp_tp_group = tp_group
+        self._dp_pg = None
+        self._dp_rank = 0
+
+        if tp_size > 1:
+            self._dp_max_pad_bs = (
+                (config.max_bs + tp_size - 1) // tp_size
+            ) * tp_size
+            self._dp_max_k_req = self._dp_max_pad_bs // tp_size
+
+            from tokenspeed.runtime.distributed.process_group_manager import (
+                process_group_manager as pg_manager,
+            )
+
+            self._dp_pg = pg_manager.get_process_group("nccl", tp_group)
+            # Use the resolved PG's rank, not tp_group.index(global_rank),
+            # so we don't assume the caller's PG layout matches global rank order.
+            import torch.distributed as dist
+
+            self._dp_rank = dist.get_rank(group=self._dp_pg)
+        else:
+            self._dp_max_pad_bs = config.max_bs
+            self._dp_max_k_req = config.max_bs
 
     def _init_pool_scalars(self, config: SamplingBackendConfig) -> None:
         # Capture warm-up reads row 0 with req_pool_indices zeroed, so row 0
@@ -141,14 +174,14 @@ class FlashInferSamplingBackend(SamplingBackend):
     def _init_shared_buffers(self, config: SamplingBackendConfig) -> None:
 
         # Persistent coin buffers. Filled per-request in prepare() outside the
-        # CUDA graph so verify() only reads from them.
+        # _dp_max_pad_bs can go over max_bs
         self._coins_buf = torch.zeros(
-            (config.max_bs, config.max_draft_tokens_per_req),
+            (self._dp_max_pad_bs, config.max_draft_tokens_per_req),
             dtype=torch.float32,
             device=config.device,
         )
         self._final_coins_buf = torch.zeros(
-            (config.max_bs,), dtype=torch.float32, device=config.device
+            (self._dp_max_pad_bs,), dtype=torch.float32, device=config.device
         )
 
         self._cpu_coins_buf = torch.empty(
@@ -166,23 +199,48 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._capture_gen.manual_seed(config.random_seed)
 
         # Pre-allocated persistent buffers — no per-step alloc in the hot path.
+        # Sized to max_pad_bs so the DP gather destination has stable storage;
+        # legacy path slices [:bs * n] / [:bs] so the extra capacity is invisible.
+        max_pad_bs = self._dp_max_pad_bs
+        max_n = config.max_draft_tokens_per_req
+        max_k_req = self._dp_max_k_req
         self._ones_buf = torch.ones(
-            (config.max_bs,), dtype=torch.int32, device=config.device
+            (max_pad_bs,), dtype=torch.int32, device=config.device
         )
         self._predict_buf = torch.zeros(
-            (config.max_bs * config.max_draft_tokens_per_req,),
+            (max_pad_bs * max_n,),
             dtype=torch.int32,
             device=config.device,
         )
         # Flat layout so [:bs * n].view(bs, n) is contiguous for any bs/n
         # (required by maybe_broadcast / NCCL).
         self._accept_index_buf = torch.zeros(
-            (config.max_bs * config.max_draft_tokens_per_req,),
+            (max_pad_bs * max_n,),
             dtype=torch.int32,
             device=config.device,
         )
         self._accept_length_buf = torch.zeros(
-            (config.max_bs,), dtype=torch.int32, device=config.device
+            (max_pad_bs,), dtype=torch.int32, device=config.device
+        )
+
+        # DP shard buffers; unused when tp_size==1.
+        self._predict_local_buf = torch.zeros(
+            (max_k_req * max_n,), dtype=torch.int32, device=config.device
+        )
+        self._accept_index_local_buf = torch.zeros(
+            (max_k_req * max_n,), dtype=torch.int32, device=config.device
+        )
+        self._accept_length_local_buf = torch.zeros(
+            (max_k_req,), dtype=torch.int32, device=config.device
+        )
+        # Stack predict + accept_index to halve the DP output collectives
+        # (2 instead of 3); the gather destination must be contiguous so
+        # local and full are separate buffers.
+        self._combined_local_buf = torch.zeros(
+            (max_k_req, 2 * max_n), dtype=torch.int32, device=config.device
+        )
+        self._combined_full_buf = torch.zeros(
+            (max_pad_bs, 2 * max_n), dtype=torch.int32, device=config.device
         )
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -296,13 +354,57 @@ class FlashInferSamplingBackend(SamplingBackend):
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
 
-        predict = self._predict_buf[: bs * num_tokens_per_req]
-        accept_index = (
-            self._accept_index_buf[: bs * num_tokens_per_req]
-            .view(bs, num_tokens_per_req)
-            .fill_(-1)
-        )
-        accept_length = self._accept_length_buf[:bs]
+        if sampling_info.dp_sampling:
+            assert (
+                self._dp_tp_size > 1 and self._dp_pg is not None
+            ), "dp_sampling requires tp_size > 1 and a resolved tp_group"
+            assert sampling_info.vocab_mask is None, (
+                "dp_sampling + grammar bitmask is not supported in M4"
+            )
+            tp_size = self._dp_tp_size
+            rank = self._dp_rank
+            # Whole-request padding (not flat-row) keeps N causally co-located
+            # on one rank; chain_speculative_sampling walks N sequentially.
+            full_bs = bs
+            pad_bs = ((bs + tp_size - 1) // tp_size) * tp_size
+            assert pad_bs <= self._dp_max_pad_bs, (
+                f"pad_bs={pad_bs} exceeds dp_max_pad_bs={self._dp_max_pad_bs}"
+            )
+            bs = pad_bs // tp_size
+
+            # Padded rows in [full_bs:pad_bs] get pool_idx=0
+            # keeping the scalar gather NaN/inf-free.
+            shard = slice(rank * bs, (rank + 1) * bs)
+            if pad_bs > full_bs:
+                candidates = torch.nn.functional.pad(
+                    candidates, (0, 0, 0, pad_bs - full_bs)
+                )[shard]
+                pool_indices = torch.nn.functional.pad(
+                    sampling_info.req_pool_indices, (0, pad_bs - full_bs)
+                )[shard]
+            else:
+                candidates = candidates[shard]
+                pool_indices = sampling_info.req_pool_indices[shard]
+            coins = self._coins_buf[shard]
+            final_coins = self._final_coins_buf[shard]
+            predict = self._predict_local_buf[: bs * num_tokens_per_req]
+            accept_index = (
+                self._accept_index_local_buf[: bs * num_tokens_per_req]
+                .view(bs, num_tokens_per_req)
+                .fill_(-1)
+            )
+            accept_length = self._accept_length_local_buf[:bs]
+        else:
+            pool_indices = sampling_info.req_pool_indices
+            coins = self._coins_buf
+            final_coins = self._final_coins_buf
+            predict = self._predict_buf[: bs * num_tokens_per_req]
+            accept_index = (
+                self._accept_index_buf[: bs * num_tokens_per_req]
+                .view(bs, num_tokens_per_req)
+                .fill_(-1)
+            )
+            accept_length = self._accept_length_buf[:bs]
 
         # Per-draft-position grammar bitmask: buffer shape
         # [bs * num_tokens_per_req, V/32] matches the flat target logits.
@@ -335,7 +437,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             # tuple; flat [bs*N] per-row knobs match the flat [bs*N, vocab] logits.
             n = num_tokens_per_req
             temperatures, top_ks, top_ps, _, _, _ = gather_and_expand_scalars(
-                sampling_info.req_pool_indices,
+                pool_indices,
                 temperature=self._temperature_pool,
                 top_k=self._top_k_pool,
                 top_p=self._top_p_pool,
@@ -366,8 +468,8 @@ class FlashInferSamplingBackend(SamplingBackend):
                 accept_index=accept_index,
                 accept_token_num=accept_length,
                 candidates=candidates,
-                uniform_samples=self._coins_buf[:bs, :n],
-                uniform_samples_for_final_sampling=self._final_coins_buf[:bs],
+                uniform_samples=coins[:bs, :n],
+                uniform_samples_for_final_sampling=final_coins[:bs],
                 target_probs=target_probs,
                 draft_probs=None,
                 threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
@@ -378,13 +480,33 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         accept_length += 1
 
-        # TP-rank sync: rank 0 wins on the full verify-output triple.
-        # Load-bearing: flashinfer top_k_renorm_prob has no is_deterministic
-        # knob and produces non-bit-identical results across ranks (sub-ulp
-        # FP accumulation order).
-        # For fused top-k + top-p, the results are bit-identical across ranks.
-        # So we don't need to broadcast the results.
-        if not _FUSED_TOPK_TOPP_AVAILABLE:
+        if sampling_info.dp_sampling:
+            n = num_tokens_per_req
+            combined_local = self._combined_local_buf[:bs, : 2 * n]
+            combined_local[:, :n].copy_(predict.view(bs, n))
+            combined_local[:, n:].copy_(accept_index)
+
+            combined_full = self._combined_full_buf[:pad_bs, : 2 * n]
+            all_gather_into_tensor(
+                combined_full, combined_local, rank, self._dp_tp_group
+            )
+            accept_length_full = self._accept_length_buf[:pad_bs]
+            all_gather_into_tensor(
+                accept_length_full, accept_length, rank, self._dp_tp_group
+            )
+
+            # Land outputs in the persistent full-batch buffers so caller
+            # view aliases stay stable across CUDA-graph replays.
+            predict = self._predict_buf[: full_bs * n]
+            accept_index = self._accept_index_buf[: full_bs * n].view(full_bs, n)
+            predict.view(full_bs, n).copy_(combined_full[:full_bs, :n])
+            accept_index.copy_(combined_full[:full_bs, n:])
+            accept_length = accept_length_full[:full_bs]
+        elif not _FUSED_TOPK_TOPP_AVAILABLE:
+            # TP-rank sync: rank 0 wins on the full verify-output triple.
+            # Load-bearing: flashinfer top_k_renorm_prob has no is_deterministic
+            # knob and produces non-bit-identical results across ranks (sub-ulp
+            # FP accumulation order).
             self.maybe_broadcast(predict, accept_index, accept_length)
 
         if self.config.enable_output_logprobs:

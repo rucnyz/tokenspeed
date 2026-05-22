@@ -189,6 +189,7 @@ class ServerArgs:
     attention_backend: str | None = None
     drafter_attention_backend: str | None = None
     sampling_backend: str | None = None
+    dp_sampling_backend: Literal["auto", "nccl", "onesided"] = "auto"
     attention_use_fp4_indexer_cache: bool | None = None
     use_trtllm_ragged_deepseek_prefill: bool | None = None
     mha_extend_mode: Literal["paged", "ragged"] = "paged"
@@ -1298,6 +1299,19 @@ class ServerArgs:
             "via the softmax+renorm+min_p kernel sequence. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
             "Both 'flashinfer' and 'flashinfer_full' require top_k < 128 (fused kernel limit) or -1.",
+        )
+        parser.add_argument(
+            "--dp-sampling-backend",
+            type=str,
+            choices=["auto", "nccl", "onesided"],
+            default=ServerArgs.dp_sampling_backend,
+            help="Backend for the Batch-DP sampling pipeline's cross-rank "
+            "collectives (see bench/dp_sampling_flow.html). "
+            "'nccl': all_to_all_single + 3x all_gather_into_tensor on top of NCCL. "
+            "'onesided': symmetric-memory one-sided puts with a flag-based "
+            "release/acquire barrier (NVLinkOneSided-style), intra-NVLink-domain only. "
+            "'auto': prefer 'onesided' when supported, fall back to 'nccl'. "
+            "Override at runtime with TOKENSPEED_DP_SAMPLING_BACKEND.",
         )
         parser.add_argument(
             "--attention-use-fp4-indexer-cache",
