@@ -60,12 +60,12 @@ import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass._mlir.dialects import builtin, llvm, nvvm
 from cutlass.cute.arch import Arch
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Boolean, Int32
 from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutlass._mlir.dialects import builtin, llvm, nvvm
 
 try:
     from .mla_helpers import (
@@ -94,12 +94,12 @@ except ImportError:
 # For how to construct the Instruction Descriptor value.
 # Note: this is a WAR for WS mode MMA, need to be replaced when CuTe DSL supports.
 _IDESC_F8E4M3_F32_M64_N128_KMAJ_1CTA = 0x04200010
-_IDESC_F8E4M3_F32_M64_N128_AK_BMN_1CTA = (
-    _IDESC_F8E4M3_F32_M64_N128_KMAJ_1CTA | (1 << 16)
+_IDESC_F8E4M3_F32_M64_N128_AK_BMN_1CTA = _IDESC_F8E4M3_F32_M64_N128_KMAJ_1CTA | (
+    1 << 16
 )
 _IDESC_F8E4M3_F32_M64_N256_KMAJ_1CTA = 0x04400010
-_IDESC_F8E4M3_F32_M64_N256_AK_BMN_1CTA = (
-    _IDESC_F8E4M3_F32_M64_N256_KMAJ_1CTA | (1 << 16)
+_IDESC_F8E4M3_F32_M64_N256_AK_BMN_1CTA = _IDESC_F8E4M3_F32_M64_N256_KMAJ_1CTA | (
+    1 << 16
 )
 
 _TMEM_ROW_STRIDE = 1 << 16
@@ -116,9 +116,7 @@ def tcgen05_mma_ws_f8f6f4_one(
 ):
     """Issue one K-block tcgen05.mma.ws.kind::f8f6f4 instruction.
     Should be replaced when CuTe DSL supports."""
-    d = builtin.unrealized_conversion_cast(
-        [Int32.mlir_type], [tCtC.iterator.value]
-    )
+    d = builtin.unrealized_conversion_cast([Int32.mlir_type], [tCtC.iterator.value])
     d = llvm.inttoptr(llvm.PointerType.get(6), d)
 
     a = tcgen05.smem_descriptor_to_int(tCrA.iterator).ir_value()
@@ -135,6 +133,7 @@ def tcgen05_mma_ws_f8f6f4_one(
             idesc,
             enable_input_d,
         )
+
 
 """
 A Multi-Head Latent Attention (MLA) example using fp8 as input/output for the NVIDIA Blackwell SM100 architecture using CUTE DSL
@@ -619,9 +618,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             OperandMajorMode.K,
             self.acc_dtype,
             cta_group,
-            (128, self.mma_pv_tiler[1] // self.warps_in_n)
-            if cutlass.const_expr(self.use_m64_ws)
-            else self.mma_qk_tiler[:2],
+            (
+                (128, self.mma_pv_tiler[1] // self.warps_in_n)
+                if cutlass.const_expr(self.use_m64_ws)
+                else self.mma_qk_tiler[:2]
+            ),
         )
         ws_tiled_mma_splitn_epi = sm100_utils.make_trivial_tiled_mma(
             self.q_dtype,
@@ -817,13 +818,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             * cute.size(qk_tiled_mma.thr_id.shape)
             * self.iterations_qk_latent
         )
-        kc_latent_subtile_copy_size = (
-            cute.size_in_bytes(
-                self.k_dtype,
-                cute.select(kc_latent_smem_layout_staged, mode=[0, 1, 2]),
-            )
-            * cute.size(qk_tiled_mma.thr_id.shape)
-        )
+        kc_latent_subtile_copy_size = cute.size_in_bytes(
+            self.k_dtype,
+            cute.select(kc_latent_smem_layout_staged, mode=[0, 1, 2]),
+        ) * cute.size(qk_tiled_mma.thr_id.shape)
         kc_rope_copy_size = (
             cute.size_in_bytes(
                 self.k_dtype,
@@ -840,12 +838,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             * self.iterations_pv_n
             * self.iterations_pv_k
         )
-        vc_subtile_copy_size = (
-            cute.size_in_bytes(
-                self.v_dtype, cute.select(vc_smem_layout_staged, mode=[0, 1, 2])
-            )
-            * cute.size(pv_tiled_mma.thr_id.shape)
-        )
+        vc_subtile_copy_size = cute.size_in_bytes(
+            self.v_dtype, cute.select(vc_smem_layout_staged, mode=[0, 1, 2])
+        ) * cute.size(pv_tiled_mma.thr_id.shape)
 
         self.tma_copy_q_bytes = q_latent_copy_size + q_rope_copy_size
         self.tma_copy_kc_bytes = kc_latent_copy_size + kc_rope_copy_size
@@ -2137,9 +2132,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 tma_bar_ptr = common_params.load_k_pipeline.producer_get_barrier(
                     load_k_producer_state
                 )
-                common_params.load_k_pipeline.producer_acquire(
-                    load_k_producer_state
-                )
+                common_params.load_k_pipeline.producer_acquire(load_k_producer_state)
                 for k in cutlass.range_constexpr(page_per_tile):
                     if cutlass.const_expr(page_per_tile > 1):
                         sKC_page_base = cute.domain_offset(
@@ -2407,7 +2400,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 (128, self.mma_pv_tiler[1] // self.warps_in_n)
             )
             if cutlass.const_expr(self.use_m64_ws)
-            else tiled_mma_pv.partition_shape_C(cute.select(self.mma_pv_tiler, mode=[0, 1]))
+            else tiled_mma_pv.partition_shape_C(
+                cute.select(self.mma_pv_tiler, mode=[0, 1])
+            )
         )
         # mma O has 1 stage.
         tOtO = (
@@ -2697,7 +2692,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                 k_block,
                                 (p_stage, p_mma_consumer_state.index),
                             ],
-                            pv_params.tOrVC[None, None, k_block, ((acc_stage, p_stage), 0)],
+                            pv_params.tOrVC[
+                                None, None, k_block, ((acc_stage, p_stage), 0)
+                            ],
                             tOtO_m64,
                             Int32(idesc),
                             Boolean(
@@ -3182,9 +3179,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             qk_row = tTR_tS[i][0]
                             q_tok = (
                                 common_params.blk_coord[1] * self.fold_sq_factor
-                                + (
-                                    qk_row + common_params.blk_coord[0] * cta_m_rows
-                                )
+                                + (qk_row + common_params.blk_coord[0] * cta_m_rows)
                                 // self.num_heads
                             )
                         else:
@@ -3201,9 +3196,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         else self.acc_dtype(-1.0e6)
                     )
             # reduction for row_max
-            row_max_new = tTR_rAcc.load().reduce(
-                cute.ReductionOp.MAX, row_max_new, 0
-            )
+            row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
         elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_103f):
             tmem_load_red_atom = cute.make_copy_atom(
                 tcgen05.copy.LdRed32x32bOp(
@@ -3305,9 +3298,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         fma_b = softmax_params.softmax_scale_log2
         fma_c = (0.0 - row_max_new) * softmax_params.softmax_scale_log2
 
-        for i in cutlass.range(
-            cute.size(tTR_rAcc), vectorize=True, unroll_full=True
-        ):
+        for i in cutlass.range(cute.size(tTR_rAcc), vectorize=True, unroll_full=True):
             tTR_rAcc[i] = tTR_rAcc[i] * fma_b + fma_c
             tTR_rAcc[i] = cute.math.exp2(tTR_rAcc[i], fastmath=True)
 
@@ -3807,12 +3798,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     tR2G_rO_src = tTR_rAcc
 
                 for d_sub in cutlass.range_constexpr(num_epi_subtiles):
-                    for i in cutlass.range(
-                        vec_size, vectorize=True, unroll_full=True
-                    ):
-                        tTR_rAcc[i, 0, d_sub] = (
-                            tTR_rAcc[i, 0, d_sub] * epi_scale
-                        )
+                    for i in cutlass.range(vec_size, vectorize=True, unroll_full=True):
+                        tTR_rAcc[i, 0, d_sub] = tTR_rAcc[i, 0, d_sub] * epi_scale
 
                     if cutlass.const_expr(common_params.mAccO is None):
                         tR2G_rO_src[None, None, d_sub].store(
@@ -3826,14 +3813,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                         )
             else:
-            # Subtiled elementwise + STG: elementwise of subtile N+1 overlaps
-            # with STG of subtile N via instruction-level parallelism.
-            # tTR_rAcc shape: ((V, 1), 1, rest_tiles) where rest_tiles = 4.
-            # Split along rest_tiles (mode 2) for subtiling.
+                # Subtiled elementwise + STG: elementwise of subtile N+1 overlaps
+                # with STG of subtile N via instruction-level parallelism.
+                # tTR_rAcc shape: ((V, 1), 1, rest_tiles) where rest_tiles = 4.
+                # Split along rest_tiles (mode 2) for subtiling.
                 num_epi_subtiles = tTR_rAcc.shape[2]
                 vec_size = cute.size(cute.select(tTR_rAcc.shape, mode=[0]))
 
-            # Prepare output fragment for type conversion
+                # Prepare output fragment for type conversion
                 tR2G_rO_src = None
                 tR2G_rO_dst = tTR_gO
                 if cutlass.const_expr(common_params.mAccO is None):
@@ -3842,23 +3829,19 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     tR2G_rO_src = tTR_rAcc
 
                 for d_sub in cutlass.range_constexpr(num_epi_subtiles):
-                # Elementwise: scale and normalize (using pre-computed epi_scale)
-                    for i in cutlass.range(
-                        vec_size, vectorize=True, unroll_full=True
-                    ):
-                        tTR_rAcc[i, 0, d_sub] = (
-                            tTR_rAcc[i, 0, d_sub] * epi_scale
-                        )
+                    # Elementwise: scale and normalize (using pre-computed epi_scale)
+                    for i in cutlass.range(vec_size, vectorize=True, unroll_full=True):
+                        tTR_rAcc[i, 0, d_sub] = tTR_rAcc[i, 0, d_sub] * epi_scale
 
-                # Type convert per subtile using vectorized load/to/store
-                # (scalar f32→fp8 cvt is not supported by hardware)
+                    # Type convert per subtile using vectorized load/to/store
+                    # (scalar f32→fp8 cvt is not supported by hardware)
                     if cutlass.const_expr(common_params.mAccO is None):
                         tR2G_rO_src[None, None, d_sub].store(
                             tTR_rAcc[None, None, d_sub].load().to(self.o_dtype)
                         )
 
-                # Store this subtile to global memory using autovec_copy
-                # for vectorized stores (STG.128).
+                    # Store this subtile to global memory using autovec_copy
+                    # for vectorized stores (STG.128).
                     if cute.elem_less(tTR_cO[0][0], common_params.H):
                         cute.autovec_copy(
                             tR2G_rO_src[None, None, d_sub],
@@ -4309,7 +4292,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # page size equals 1 is prohibited by tma specification, not 128B aligned.
         if mma_qk_tiler_mn[1] % page_size != 0 or page_size == 1:
             return False
-        if mma_qk_tiler_mn[0] != mma_pv_tiler_mn[0] or mma_qk_tiler_mn[0] not in (64, 128):
+        if mma_qk_tiler_mn[0] != mma_pv_tiler_mn[0] or mma_qk_tiler_mn[0] not in (
+            64,
+            128,
+        ):
             return False
         if mma_qk_tiler_mn[0] == 64 and (
             mma_qk_tiler_mn[1] != 128 or mma_pv_tiler_mn[1] not in (128, 256)

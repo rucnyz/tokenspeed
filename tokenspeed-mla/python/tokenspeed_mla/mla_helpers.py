@@ -42,7 +42,7 @@ def select_mla_decode_tilers(
 
     # Prefer M=64 for small FP8 decode shapes, including H=64 cases requested by
     # runtime tuning. This subsumes the earlier H=16, S_q=4 special-case.
-    if num_heads > 0 and seq_len_q > 0 and num_heads <= 64 and num_heads * seq_len_q <= 64:
+    if num_heads * seq_len_q <= 64:
         return (64, 128), (64, 256)
     return default_qk, default_pv
 
