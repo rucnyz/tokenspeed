@@ -143,6 +143,7 @@ def _build_backend(*, max_bs: int, max_n: int, vocab: int, device, group):
         random_seed=123,
         tp_group=group,
         enable_tp_sync=False,
+        dp_sampling=True,
     )
     return FlashInferSamplingBackend(cfg)
 
