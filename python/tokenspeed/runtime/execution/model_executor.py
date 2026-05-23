@@ -99,6 +99,7 @@ class ModelExecutorConfig:
     spec_num_steps: int | None = None
     # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
     spec_num_tokens: int | None = None
+    dp_sampling: bool = False
 
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
@@ -146,6 +147,7 @@ class ModelExecutorConfig:
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
+            dp_sampling=server_args.dp_sampling,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
@@ -275,18 +277,17 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
             )
 
-        # Always-on Batch-DP spec-verify gate (M4.5). Lights up the
-        # DP path on every spec-verify capture/eager decode whenever the
-        # infra physically supports it (drafter present, FlashInfer
-        # backend, LogitsProcessor built with a real TP group). The
-        # bs-threshold refinement is M5; until then DP runs for every
-        # bucket and sampling_backend.verify pads to pad_bs internally.
+        # Batch-DP spec-verify gate. The CLI flag is opt-in so ordinary
+        # spec-verify launches keep the legacy TP all-gather + redundant
+        # sampling path unless --dp-sampling (or the env override) requests DP.
+        # The bs-threshold refinement is M5; until then an opted-in DP launch
+        # runs for every bucket and sampling_backend.verify pads internally.
         # DP-attention models (skip_all_gather=True without tp_group)
         # have processor.tp_size == 1 and naturally fall through.
         #
-        # Env-var override TOKENSPEED_DP_SAMPLING={auto,on,off}
-        # lets bench scripts pin the path while we still measure M4.5:
-        #   auto (default) - engage iff infra supports it (M4.5 default).
+        # Env-var override TOKENSPEED_DP_SAMPLING={auto,on,off} lets bench
+        # scripts pin the path without editing launch scripts:
+        #   auto           - engage iff infra supports it.
         #   on             - assert infra supports it, then engage. Hard
         #                    error if any precondition is missing -- this
         #                    catches silent fallbacks on the DP bench
@@ -307,7 +308,10 @@ class ModelExecutor:
             and processor.tp_group is not None
         )
 
-        dp_mode = os.environ.get("TOKENSPEED_DP_SAMPLING", "auto").lower()
+        dp_mode = os.environ.get(
+            "TOKENSPEED_DP_SAMPLING",
+            "on" if self.config.dp_sampling else "off",
+        ).lower()
         if dp_mode not in {"auto", "on", "off"}:
             raise ValueError(
                 f"TOKENSPEED_DP_SAMPLING must be one of "
@@ -324,7 +328,7 @@ class ModelExecutor:
                 f"processor.tp_group_set={processor.tp_group is not None}"
             )
 
-        self.dp_sampling_enabled = infra_supports_dp and dp_mode != "off"
+        self.dp_sampling_enabled = infra_supports_dp and dp_mode in {"auto", "on"}
         if self.dp_sampling_enabled:
             processor.dp_sampling_enabled = True
             processor.dp_num_tokens_per_req = spec_num_tokens

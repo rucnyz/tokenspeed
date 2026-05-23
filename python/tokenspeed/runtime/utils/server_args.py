@@ -189,6 +189,7 @@ class ServerArgs:
     attention_backend: str | None = None
     drafter_attention_backend: str | None = None
     sampling_backend: str | None = None
+    dp_sampling: bool = False
     dp_sampling_backend: Literal["auto", "nccl", "onesided"] = "auto"
     attention_use_fp4_indexer_cache: bool | None = None
     use_trtllm_ragged_deepseek_prefill: bool | None = None
@@ -1299,6 +1300,14 @@ class ServerArgs:
             "via the softmax+renorm+min_p kernel sequence. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
             "Both 'flashinfer' and 'flashinfer_full' require top_k < 128 (fused kernel limit) or -1.",
+        )
+        parser.add_argument(
+            "--dp-sampling",
+            action="store_true",
+            default=ServerArgs.dp_sampling,
+            help="Opt into the Batch-DP spec-verify sampling path. "
+            "When omitted, spec-verify uses the legacy TP all-gather "
+            "sampling path.",
         )
         parser.add_argument(
             "--dp-sampling-backend",

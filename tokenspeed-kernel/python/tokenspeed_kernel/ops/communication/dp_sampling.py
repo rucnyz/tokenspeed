@@ -214,7 +214,6 @@ def _dp_sampling_gather_kernel(
     recv_predict_ptrs_dev,
     recv_accept_idx_ptrs_dev,
     recv_accept_len_ptrs_dev,
-    signal_pad_ptrs_dev,
     K_REQ: tl.constexpr,
     N: tl.constexpr,
     RANK: tl.constexpr,
@@ -247,7 +246,14 @@ def _dp_sampling_gather_kernel(
     tl.store(accept_idx_peer + dst_base + offsets, accept_idx_vals, mask=mask)
     tl.store(accept_len_peer + dst_row, accept_len_val)
 
-    symm_mem_barrier(signal_pad_ptrs_dev, pid, RANK, WORLD_SIZE)
+
+@triton.jit
+def _dp_sampling_gather_barrier_kernel(
+    signal_pad_ptrs_dev,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+):
+    symm_mem_barrier(signal_pad_ptrs_dev, 0, RANK, WORLD_SIZE)
 
 
 # ----------------------------------------------------------------------------
@@ -523,12 +529,17 @@ def dp_sampling_gather(
         state.recv_predict_peer_ptrs,
         state.recv_accept_idx_peer_ptrs,
         state.recv_accept_len_peer_ptrs,
-        state.flags_peer_ptrs,
         K_REQ=k_req,
         N=n,
         RANK=state.rank_in_group,
         WORLD_SIZE=tp_size,
         BLOCK_N=block_n,
+        num_warps=1,
+    )
+    _dp_sampling_gather_barrier_kernel[(1,)](
+        state.flags_peer_ptrs,
+        RANK=state.rank_in_group,
+        WORLD_SIZE=tp_size,
         num_warps=1,
     )
     return (

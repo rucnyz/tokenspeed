@@ -504,6 +504,15 @@ class TestCLIConfigCompat(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "speculative_eagle_topk"):
             sa.resolve_speculative_decoding()
 
+    def test_dp_sampling_is_opt_in(self):
+        args = self._parse_args(["--model", "test/model"])
+        sa = self._from_cli_args_no_init(args)
+        self.assertFalse(sa.dp_sampling)
+
+        args = self._parse_args(["--model", "test/model", "--dp-sampling"])
+        sa = self._from_cli_args_no_init(args)
+        self.assertTrue(sa.dp_sampling)
+
     # ---- Full server command example ----
 
     def test_full_server_command(self):

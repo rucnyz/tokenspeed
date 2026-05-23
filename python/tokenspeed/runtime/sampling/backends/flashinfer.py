@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -69,6 +70,19 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
+def _dp_sampling_requested(config: SamplingBackendConfig) -> bool:
+    mode = os.environ.get("TOKENSPEED_DP_SAMPLING")
+    if mode is None:
+        return config.dp_sampling
+    mode = mode.lower()
+    if mode not in {"auto", "on", "off"}:
+        raise ValueError(
+            f"TOKENSPEED_DP_SAMPLING must be one of "
+            f"{{auto, on, off}}, got {mode!r}"
+        )
+    return mode in {"auto", "on"}
+
+
 class FlashInferSamplingBackend(SamplingBackend):
     """Fast fused backend: single-kernel top_k_top_p_sampling_from_logits
     for stochastic single-step sampling; cuda chain kernels (greedy +
@@ -105,7 +119,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._dp_rank = 0
         self._dp_comm: DpSamplingComm | None = None
 
-        if tp_size > 1:
+        if tp_size > 1 and _dp_sampling_requested(config):
             self._dp_max_pad_bs = (
                 (config.max_bs + tp_size - 1) // tp_size
             ) * tp_size
