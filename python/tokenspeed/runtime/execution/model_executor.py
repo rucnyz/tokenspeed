@@ -35,7 +35,10 @@ from tokenspeed.runtime.engine.scheduler_utils import (
 )
 from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
+from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+    CudaGraphWrapper,
+    resolve_dp_sampling_min_bs,
+)
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
@@ -62,23 +65,6 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 _DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle}
-_DP_SAMPLING_MIN_BS_ENV = "TOKENSPEED_DP_SAMPLING_MIN_BS"
-
-
-def _resolve_dp_sampling_min_bs(tp_size: int, configured_min_bs: int | None) -> int:
-    env_value = os.environ.get(_DP_SAMPLING_MIN_BS_ENV)
-    if env_value is not None:
-        try:
-            min_bs = int(env_value)
-        except ValueError as exc:
-            raise ValueError(f"{_DP_SAMPLING_MIN_BS_ENV} must be an integer") from exc
-    elif configured_min_bs is not None:
-        min_bs = int(configured_min_bs)
-    else:
-        min_bs = 2 * tp_size
-    if min_bs < 1:
-        raise ValueError("dp_sampling_min_bs must be >= 1")
-    return min_bs
 
 
 @dataclass
@@ -301,7 +287,7 @@ class ModelExecutor:
         )
 
         processor = self.model_runner.model.logits_processor
-        self.dp_sampling_min_bs = _resolve_dp_sampling_min_bs(
+        self.dp_sampling_min_bs = resolve_dp_sampling_min_bs(
             processor.tp_size, self.config.dp_sampling_min_bs
         )
         infra_supports_dp = (
