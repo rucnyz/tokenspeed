@@ -86,7 +86,9 @@ def _test_swap_matches_reference(
         group=group,
     )
 
-    expected = full[rank * reqs_per_rank * n : (rank + 1) * reqs_per_rank * n].contiguous()
+    expected = full[
+        rank * reqs_per_rank * n : (rank + 1) * reqs_per_rank * n
+    ].contiguous()
     assert tuple(out.shape) == tuple(
         expected.shape
     ), f"shape mismatch: got {tuple(out.shape)} expected {tuple(expected.shape)}"

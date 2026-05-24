@@ -262,9 +262,7 @@ def create_dp_sampling_state(
     )
     gather_max_blocks = tp_size * max_reqs_per_rank
     signal_pad_bytes = max(swap_max_blocks, gather_max_blocks) * tp_size * 4
-    symm_mem.set_signal_pad_size(
-        max(symm_mem.get_signal_pad_size(), signal_pad_bytes)
-    )
+    symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), signal_pad_bytes))
 
     recv_logits, recv_logits_hdl = _alloc_symm(
         (max_reqs_per_rank, num_tokens_per_req, vocab_size), logits_dtype, device, group
@@ -347,9 +345,9 @@ def dp_sampling_swap(
     reqs_per_rank = pad_bs // tp_size
     v_local = vocab_size // tp_size
     expected_shape = (pad_bs * n, v_local)
-    assert tuple(local_logits.shape) == expected_shape, (
-        f"local_logits shape {tuple(local_logits.shape)} != {expected_shape}"
-    )
+    assert (
+        tuple(local_logits.shape) == expected_shape
+    ), f"local_logits shape {tuple(local_logits.shape)} != {expected_shape}"
     assert state.recv_logits is not None
     assert state.recv_logits_peer_ptrs is not None
     assert state.flags_peer_ptrs is not None

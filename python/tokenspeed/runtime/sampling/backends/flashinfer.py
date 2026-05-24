@@ -77,8 +77,7 @@ def _dp_sampling_requested(config: SamplingBackendConfig) -> bool:
     mode = mode.lower()
     if mode not in {"auto", "on", "off"}:
         raise ValueError(
-            f"TOKENSPEED_DP_SAMPLING must be one of "
-            f"{{auto, on, off}}, got {mode!r}"
+            f"TOKENSPEED_DP_SAMPLING must be one of " f"{{auto, on, off}}, got {mode!r}"
         )
     return mode in {"auto", "on"}
 
@@ -118,9 +117,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._dp_comm: DpSamplingComm | None = None
 
         if tp_size > 1 and _dp_sampling_requested(config):
-            self._dp_max_pad_bs = (
-                (config.max_bs + tp_size - 1) // tp_size
-            ) * tp_size
+            self._dp_max_pad_bs = ((config.max_bs + tp_size - 1) // tp_size) * tp_size
             self._dp_max_reqs_per_rank = self._dp_max_pad_bs // tp_size
 
             from tokenspeed.runtime.distributed.process_group_manager import (
@@ -373,16 +370,16 @@ class FlashInferSamplingBackend(SamplingBackend):
             assert (
                 self._dp_tp_size > 1 and self._dp_pg is not None
             ), "dp_sampling requires tp_size > 1 and a resolved tp_group"
-            assert sampling_info.vocab_mask is None, (
-                "dp_sampling + grammar bitmask is not supported"
-            )
+            assert (
+                sampling_info.vocab_mask is None
+            ), "dp_sampling + grammar bitmask is not supported"
             tp_size = self._dp_tp_size
             rank = self._dp_rank
             full_bs = bs
             pad_bs = ((bs + tp_size - 1) // tp_size) * tp_size
-            assert pad_bs <= self._dp_max_pad_bs, (
-                f"pad_bs={pad_bs} exceeds dp_max_pad_bs={self._dp_max_pad_bs}"
-            )
+            assert (
+                pad_bs <= self._dp_max_pad_bs
+            ), f"pad_bs={pad_bs} exceeds dp_max_pad_bs={self._dp_max_pad_bs}"
             bs = pad_bs // tp_size
 
             # Shard by request so each request's draft chain stays on one rank.

@@ -91,7 +91,9 @@ def _make_candidates(bs: int, n: int, vocab: int, *, device, seed: int):
     )
 
 
-def _seed_pool_scalars(backend, *, bs: int, temperature: float, top_k: int, top_p: float):
+def _seed_pool_scalars(
+    backend, *, bs: int, temperature: float, top_k: int, top_p: float
+):
     backend._temperature_pool[: bs + 1].fill_(temperature)
     backend._top_k_pool[: bs + 1].fill_(top_k)
     backend._top_p_pool[: bs + 1].fill_(top_p)
@@ -193,9 +195,7 @@ def _test_verify_dp_matches_today(
     ].clone()
     dp_in = _StubOutput()
     dp_in.next_token_logits = local_logits
-    predict_dp, accept_length_dp = backend.verify(
-        dp_in, sampling_info_dp, candidates
-    )
+    predict_dp, accept_length_dp = backend.verify(dp_in, sampling_info_dp, candidates)
 
     torch.testing.assert_close(predict_dp, predict_full, rtol=0, atol=0)
     torch.testing.assert_close(accept_length_dp, accept_length_full, rtol=0, atol=0)

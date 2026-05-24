@@ -145,11 +145,17 @@ def _test_gather_verify_outputs_correctness(
     )
 
     predict_local = torch.arange(
-        rank * reqs_per_rank * n, (rank + 1) * reqs_per_rank * n, dtype=torch.int32, device=device
+        rank * reqs_per_rank * n,
+        (rank + 1) * reqs_per_rank * n,
+        dtype=torch.int32,
+        device=device,
     ).view(reqs_per_rank, n)
     accept_index_local = (predict_local * 2 + 1).contiguous()
     accept_length_local = torch.arange(
-        rank * reqs_per_rank, (rank + 1) * reqs_per_rank, dtype=torch.int32, device=device
+        rank * reqs_per_rank,
+        (rank + 1) * reqs_per_rank,
+        dtype=torch.int32,
+        device=device,
     )
 
     predict_full, accept_index_full, accept_length_full = comm.gather_verify_outputs(
@@ -225,8 +231,12 @@ def _test_swap_and_gather_cuda_graph_replay(
         pad_bs * n, v_local, dtype=torch.float32, device=device
     )
     predict_local_buf = torch.empty(reqs_per_rank, n, dtype=torch.int32, device=device)
-    accept_index_local_buf = torch.empty(reqs_per_rank, n, dtype=torch.int32, device=device)
-    accept_length_local_buf = torch.empty(reqs_per_rank, dtype=torch.int32, device=device)
+    accept_index_local_buf = torch.empty(
+        reqs_per_rank, n, dtype=torch.int32, device=device
+    )
+    accept_length_local_buf = torch.empty(
+        reqs_per_rank, dtype=torch.int32, device=device
+    )
 
     def _fill_inputs(step: int):
         full = _ground_truth_full_logits(
@@ -238,16 +248,22 @@ def _test_swap_and_gather_cuda_graph_replay(
         )
         predict_local_buf.copy_(
             torch.arange(
-                rank * reqs_per_rank * n, (rank + 1) * reqs_per_rank * n,
-                dtype=torch.int32, device=device,
-            ).view(reqs_per_rank, n) + step
+                rank * reqs_per_rank * n,
+                (rank + 1) * reqs_per_rank * n,
+                dtype=torch.int32,
+                device=device,
+            ).view(reqs_per_rank, n)
+            + step
         )
         accept_index_local_buf.copy_(predict_local_buf * 2)
         accept_length_local_buf.copy_(
             torch.arange(
-                rank * reqs_per_rank, (rank + 1) * reqs_per_rank,
-                dtype=torch.int32, device=device,
-            ) + step
+                rank * reqs_per_rank,
+                (rank + 1) * reqs_per_rank,
+                dtype=torch.int32,
+                device=device,
+            )
+            + step
         )
 
     def _run_one_step():
@@ -312,9 +328,7 @@ class _CountingNcclBackend:
         return getattr(self._inner, name)
 
 
-def _test_nccl_single_allgather(
-    rank, world_size, device, group, *, pad_bs, n
-):
+def _test_nccl_single_allgather(rank, world_size, device, group, *, pad_bs, n):
     from tokenspeed.runtime.distributed.comm_backend import get_global_backend
     from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
 
@@ -335,11 +349,17 @@ def _test_nccl_single_allgather(
     tp = world_size
     reqs_per_rank = pad_bs // tp
     predict_local = torch.arange(
-        rank * reqs_per_rank * n, (rank + 1) * reqs_per_rank * n, dtype=torch.int32, device=device
+        rank * reqs_per_rank * n,
+        (rank + 1) * reqs_per_rank * n,
+        dtype=torch.int32,
+        device=device,
     ).view(reqs_per_rank, n)
     accept_index_local = (predict_local * 5 + 3).contiguous()
     accept_length_local = torch.arange(
-        rank * reqs_per_rank, (rank + 1) * reqs_per_rank, dtype=torch.int32, device=device
+        rank * reqs_per_rank,
+        (rank + 1) * reqs_per_rank,
+        dtype=torch.int32,
+        device=device,
     )
 
     predict_full, accept_index_full, accept_length_full = comm.gather_verify_outputs(
@@ -349,17 +369,15 @@ def _test_nccl_single_allgather(
         pad_bs=pad_bs,
     )
 
-    assert counter.all_gather_calls == 1, (
-        f"expected 1 all_gather call, got {counter.all_gather_calls}"
-    )
+    assert (
+        counter.all_gather_calls == 1
+    ), f"expected 1 all_gather call, got {counter.all_gather_calls}"
 
     expected_predict = torch.arange(
         0, pad_bs * n, dtype=torch.int32, device=device
     ).view(pad_bs, n)
     expected_accept_index = expected_predict * 5 + 3
-    expected_accept_length = torch.arange(
-        0, pad_bs, dtype=torch.int32, device=device
-    )
+    expected_accept_length = torch.arange(0, pad_bs, dtype=torch.int32, device=device)
     torch.testing.assert_close(predict_full, expected_predict)
     torch.testing.assert_close(accept_index_full, expected_accept_index)
     torch.testing.assert_close(accept_length_full, expected_accept_length)
@@ -402,11 +420,17 @@ def _test_onesided_matches_nccl(
     )
 
     predict_local = torch.arange(
-        rank * reqs_per_rank * n, (rank + 1) * reqs_per_rank * n, dtype=torch.int32, device=device
+        rank * reqs_per_rank * n,
+        (rank + 1) * reqs_per_rank * n,
+        dtype=torch.int32,
+        device=device,
     ).view(reqs_per_rank, n)
     accept_index_local = (predict_local * 3 + 7).contiguous()
     accept_length_local = torch.arange(
-        rank * reqs_per_rank, (rank + 1) * reqs_per_rank, dtype=torch.int32, device=device
+        rank * reqs_per_rank,
+        (rank + 1) * reqs_per_rank,
+        dtype=torch.int32,
+        device=device,
     )
 
     onesided_outputs = onesided_comm.gather_verify_outputs(

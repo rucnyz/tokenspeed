@@ -113,7 +113,9 @@ def _make_candidates(bs: int, n: int, vocab: int, *, device, seed: int):
     )
 
 
-def _seed_pool_scalars(backend, *, bs: int, temperature: float, top_k: int, top_p: float):
+def _seed_pool_scalars(
+    backend, *, bs: int, temperature: float, top_k: int, top_p: float
+):
     backend._temperature_pool[: bs + 1].fill_(temperature)
     backend._top_k_pool[: bs + 1].fill_(top_k)
     backend._top_p_pool[: bs + 1].fill_(top_p)
@@ -231,12 +233,11 @@ def _test_dp_chain_matches_legacy(
     req_pool_indices = torch.arange(bs, dtype=torch.int64, device=device)
 
     legacy_meta = _build_metadata(dp_sampling=False)
-    legacy_logits = processor._get_logits(
-        hidden_states.clone(), lm_head, legacy_meta
-    )
-    assert legacy_logits.shape == (bs * n, vocab), (
-        f"legacy logits {legacy_logits.shape}, expected {(bs*n, vocab)}"
-    )
+    legacy_logits = processor._get_logits(hidden_states.clone(), lm_head, legacy_meta)
+    assert legacy_logits.shape == (
+        bs * n,
+        vocab,
+    ), f"legacy logits {legacy_logits.shape}, expected {(bs*n, vocab)}"
 
     legacy_info = SamplingBatchInfo(
         is_all_greedy=is_all_greedy,
@@ -254,13 +255,12 @@ def _test_dp_chain_matches_legacy(
     legacy_accept_length = legacy_accept_length.clone()
 
     dp_meta = _build_metadata(dp_sampling=True)
-    dp_logits = processor._get_logits(
-        hidden_states.clone(), lm_head, dp_meta
-    )
+    dp_logits = processor._get_logits(hidden_states.clone(), lm_head, dp_meta)
     reqs_per_rank = pad_bs // tp_size
-    assert dp_logits.shape == (reqs_per_rank * n, vocab), (
-        f"dp logits {dp_logits.shape}, expected {(reqs_per_rank*n, vocab)}"
-    )
+    assert dp_logits.shape == (
+        reqs_per_rank * n,
+        vocab,
+    ), f"dp logits {dp_logits.shape}, expected {(reqs_per_rank*n, vocab)}"
 
     dp_info = SamplingBatchInfo(
         is_all_greedy=is_all_greedy,
@@ -275,11 +275,17 @@ def _test_dp_chain_matches_legacy(
 
     # Phantom rows consume neutral pool values and are not part of the result.
     torch.testing.assert_close(
-        dp_predict, legacy_predict, rtol=0, atol=0,
+        dp_predict,
+        legacy_predict,
+        rtol=0,
+        atol=0,
         msg="DP predict diverged from legacy",
     )
     torch.testing.assert_close(
-        dp_accept_length, legacy_accept_length, rtol=0, atol=0,
+        dp_accept_length,
+        legacy_accept_length,
+        rtol=0,
+        atol=0,
         msg="DP accept_length diverged from legacy",
     )
 

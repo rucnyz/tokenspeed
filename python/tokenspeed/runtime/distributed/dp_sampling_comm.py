@@ -64,9 +64,7 @@ def _env_override() -> DpSamplingBackend | None:
     if val in ("auto", "nccl", "onesided"):
         return val  # type: ignore[return-value]
     if val is not None:
-        raise ValueError(
-            f"{ENV_VAR}={val!r} must be one of 'auto'|'nccl'|'onesided'"
-        )
+        raise ValueError(f"{ENV_VAR}={val!r} must be one of 'auto'|'nccl'|'onesided'")
     return None
 
 
@@ -125,15 +123,15 @@ class DpSamplingComm:
         device: torch.device | str | None = None,
     ):
         assert tp_size >= 1, f"tp_size={tp_size}"
-        assert len(group) == tp_size, (
-            f"group {group} has {len(group)} ranks but tp_size={tp_size}"
-        )
-        assert max_pad_bs % tp_size == 0, (
-            f"max_pad_bs={max_pad_bs} must be divisible by tp_size={tp_size}"
-        )
-        assert vocab_size % tp_size == 0, (
-            f"vocab_size={vocab_size} must be divisible by tp_size={tp_size}"
-        )
+        assert (
+            len(group) == tp_size
+        ), f"group {group} has {len(group)} ranks but tp_size={tp_size}"
+        assert (
+            max_pad_bs % tp_size == 0
+        ), f"max_pad_bs={max_pad_bs} must be divisible by tp_size={tp_size}"
+        assert (
+            vocab_size % tp_size == 0
+        ), f"vocab_size={vocab_size} must be divisible by tp_size={tp_size}"
         assert num_tokens_per_req >= 1
 
         self._tp_size = tp_size
@@ -264,9 +262,10 @@ class DpSamplingComm:
         reqs_per_rank = pad_bs // self._tp_size
         n = self._num_tokens_per_req
 
-        assert tuple(predict_local.shape) == (reqs_per_rank, n), (
-            f"predict_local shape {tuple(predict_local.shape)} != ({reqs_per_rank}, {n})"
-        )
+        assert tuple(predict_local.shape) == (
+            reqs_per_rank,
+            n,
+        ), f"predict_local shape {tuple(predict_local.shape)} != ({reqs_per_rank}, {n})"
         assert tuple(accept_index_local.shape) == (reqs_per_rank, n), (
             f"accept_index_local shape {tuple(accept_index_local.shape)} "
             f"!= ({reqs_per_rank}, {n})"
@@ -312,11 +311,12 @@ class DpSamplingComm:
         return predict_full, accept_index_full, accept_length_full
 
     def _init_onesided(self) -> None:
-        from tokenspeed.runtime.distributed.process_group_manager import (
-            process_group_manager as pg_manager,
-        )
         from tokenspeed_kernel.ops.communication.dp_sampling import (
             create_dp_sampling_state,
+        )
+
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
         )
 
         self._state = create_dp_sampling_state(

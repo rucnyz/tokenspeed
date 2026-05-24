@@ -515,9 +515,7 @@ class TestCLIConfigCompat(unittest.TestCase):
         self.assertTrue(sa.dp_sampling)
 
     def test_dp_sampling_min_bs_arg(self):
-        args = self._parse_args(
-            ["--model", "test/model", "--dp-sampling-min-bs", "16"]
-        )
+        args = self._parse_args(["--model", "test/model", "--dp-sampling-min-bs", "16"])
         sa = self._from_cli_args_no_init(args)
         self.assertEqual(sa.dp_sampling_min_bs, 16)
 

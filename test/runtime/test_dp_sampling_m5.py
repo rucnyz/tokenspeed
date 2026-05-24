@@ -98,8 +98,7 @@ def test_skip_all_gather_logits_processors_carry_tp_metadata():
         for kwarg in ("tp_rank=", "tp_size=", "tp_group="):
             pattern = (
                 r"LogitsProcessor\([\s\S]{0,240}"
-                r"skip_all_gather=True[\s\S]{0,240}"
-                + re.escape(kwarg)
+                r"skip_all_gather=True[\s\S]{0,240}" + re.escape(kwarg)
             )
             assert re.search(pattern, source), f"{path}: missing {kwarg}"
 
