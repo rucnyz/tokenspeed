@@ -269,7 +269,7 @@ class ServerArgs:
     mapping: Mapping | None = None
 
     mla_chunk_multiplier: int = 4
-    mm_mode: str = "none"
+    mm_attention_backend: str | None = None
 
     # For PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: str = "null"
@@ -1711,6 +1711,20 @@ class ServerArgs:
             ),
         )
 
+        # Multimodal
+        mm_attention_backend_choices = [
+            "fa3",
+            "fa4",
+            "triton_attn",
+            "flashinfer_cudnn",
+        ]
+        parser.add_argument(
+            "--mm-attention-backend",
+            type=str,
+            choices=mm_attention_backend_choices,
+            default=ServerArgs.mm_attention_backend,
+            help="Set multimodal attention backend.",
+        )
         # Disaggregation
         parser.add_argument(
             "--disaggregation-mode",
@@ -1763,9 +1777,6 @@ class ServerArgs:
             default=None,
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
-
-        # Multi-modal inference mode
-        parser.add_argument("--mm-mode", type=str, default=ServerArgs.mm_mode)
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
