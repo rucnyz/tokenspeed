@@ -25,9 +25,6 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
-
-from tokenspeed.runtime.moe import eplb_logger
 
 
 @dataclass(frozen=True)
@@ -46,10 +43,6 @@ class TransferPlanEntry:
             self.dst_local_slot,
             self.logical_expert_id,
         )
-
-
-def _dist_ready() -> bool:
-    return dist.is_available() and dist.is_initialized()
 
 
 def _physical_owner(physical_id: int, num_local: int) -> tuple[int, int]:
@@ -76,11 +69,13 @@ class WeightRelocator:
         strategy: str = "host_first",
         eplb_pg=None,
     ):
+        if strategy != "host_first":
+            raise ValueError("EPLB weight relocation only supports host_first strategy")
         self.host_cache = host_cache
         self.layer_states = layer_states
         self.rank = int(rank)
         self.ep_size = int(ep_size)
-        self.strategy = strategy
+        self.strategy = "host_first"
         self.eplb_pg = eplb_pg
         self._ready_layers: deque[int] = deque()
 
@@ -189,44 +184,13 @@ class WeightRelocator:
         stream_context = self._stream_context(state)
         with stream_context:
             local_sources = self._snapshot_local_sources(params, plan)
-            recv_work = []
-            send_work = []
             for src_rank, src_local, dst_rank, dst_local, logical_id in plan:
-                if dst_rank == self.rank and src_rank == self.rank:
+                if dst_rank != self.rank:
+                    continue
+                if src_rank == self.rank:
                     self._copy_local(params, local_sources, src_local, dst_local)
-                elif dst_rank == self.rank:
-                    if self.strategy == "host_first":
-                        self._copy_from_host(params, layer_id, logical_id, dst_local)
-                    elif _dist_ready():
-                        recv_work.extend(
-                            self._recv_remote(
-                                params, src_rank, dst_local, layer_id, logical_id
-                            )
-                        )
-                    else:
-                        self._copy_from_host(params, layer_id, logical_id, dst_local)
-            if self.strategy == "p2p":
-                for src_rank, src_local, dst_rank, dst_local, logical_id in plan:
-                    if src_rank == self.rank and dst_rank != self.rank:
-                        if _dist_ready():
-                            send_work.extend(
-                                self._send_remote(
-                                    local_sources,
-                                    src_local,
-                                    dst_rank,
-                                    layer_id,
-                                    logical_id,
-                                )
-                            )
-                        else:
-                            eplb_logger.debug_rate(
-                                "relocator.remote_send_skipped layer=%s logical=%s",
-                                layer_id,
-                                logical_id,
-                                every=100,
-                            )
-            for item in recv_work + send_work:
-                item.wait()
+                else:
+                    self._copy_from_host(params, layer_id, logical_id, dst_local)
         if state is not None:
             state.relocate_done_event.record()
 
@@ -241,9 +205,7 @@ class WeightRelocator:
     def _snapshot_local_sources(self, params, plan):
         sources: dict[tuple[str, int], torch.Tensor] = {}
         for src_rank, src_local, dst_rank, *_ in plan:
-            if src_rank != self.rank:
-                continue
-            if dst_rank != self.rank and self.strategy != "p2p":
+            if src_rank != self.rank or dst_rank != self.rank:
                 continue
             for name, param in params.items():
                 key = (name, src_local)
@@ -265,52 +227,13 @@ class WeightRelocator:
             raise RuntimeError(
                 f"EPLB cannot relocate layer={layer_id} logical={logical_id}: "
                 "source expert is not in local/shared host cache; rebuild the "
-                "host_first shared cache or use --eplb-relocate-strategy p2p"
+                "host_first shared cache"
             )
         host_params = self.host_cache.get_expert_dim_params(layer_id, logical_id)
         for name, param in params.items():
             param.detach()[dst_local].copy_(
                 host_params[name].to(param.device, non_blocking=True), non_blocking=True
             )
-
-    def _send_remote(
-        self,
-        local_sources,
-        src_local: int,
-        dst_rank: int,
-        layer_id: int,
-        logical_id: int,
-    ) -> list[object]:
-        work = []
-        for param_name, src_slot in sorted(local_sources):
-            if int(src_slot) != int(src_local):
-                continue
-            tensor = local_sources[(param_name, src_slot)]
-            tag = self._tag(layer_id, logical_id, param_name)
-            work.append(
-                dist.isend(
-                    tensor.contiguous(), dst=int(dst_rank), group=self.eplb_pg, tag=tag
-                )
-            )
-        return work
-
-    def _recv_remote(
-        self, params, src_rank: int, dst_local: int, layer_id: int, logical_id: int
-    ) -> list[object]:
-        work = []
-        for name, param in sorted(params.items()):
-            dst_tensor = param.detach()[dst_local]
-            tag = self._tag(layer_id, logical_id, name)
-            work.append(
-                dist.irecv(dst_tensor, src=int(src_rank), group=self.eplb_pg, tag=tag)
-            )
-        return work
-
-    @staticmethod
-    def _tag(layer_id: int, logical_id: int, name: str) -> int:
-        return (
-            int(layer_id) * 1_000_003 + int(logical_id) * 97 + hash(name)
-        ) & 0x7FFFFFFF
 
     def _mark_layer_ready(self, layer_id: int) -> None:
         self._ready_layers.append(layer_id)

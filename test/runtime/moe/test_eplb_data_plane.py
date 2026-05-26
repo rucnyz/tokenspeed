@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -254,8 +255,7 @@ def test_host_first_snapshots_only_local_destinations():
     assert torch.equal(sources[("w", 0)], params["w"][0])
 
 
-def test_relocator_host_first_uses_shared_cache_without_p2p(monkeypatch):
-    from tokenspeed.runtime.moe import eplb_relocator
+def test_relocator_host_first_uses_shared_cache_for_remote_source():
     from tokenspeed.runtime.moe.eplb_relocator import WeightRelocator
 
     old = SimpleNamespace(physical_to_logical_map_cpu=torch.tensor([[0, 1, 2, 3]]))
@@ -278,13 +278,6 @@ def test_relocator_host_first_uses_shared_cache_without_p2p(monkeypatch):
             assert int(logical_id) == 2
             return shared_remote
 
-    def fail_p2p(*args, **kwargs):
-        raise AssertionError("host_first relocation must not use P2P")
-
-    monkeypatch.setattr(eplb_relocator, "_dist_ready", lambda: True)
-    monkeypatch.setattr(eplb_relocator.dist, "irecv", fail_p2p)
-    monkeypatch.setattr(eplb_relocator.dist, "isend", fail_p2p)
-
     relocator = WeightRelocator(
         FakeHostCache(),
         {},
@@ -298,60 +291,11 @@ def test_relocator_host_first_uses_shared_cache_without_p2p(monkeypatch):
     assert torch.equal(params["w"][0], shared_remote["w"])
 
 
-def test_relocator_posts_remote_recvs_before_sends(monkeypatch):
-    from tokenspeed.runtime.moe import eplb_relocator
+def test_relocator_rejects_unsupported_strategy():
     from tokenspeed.runtime.moe.eplb_relocator import WeightRelocator
 
-    old = SimpleNamespace(physical_to_logical_map_cpu=torch.tensor([[0, 1, 2, 3]]))
-    new = SimpleNamespace(physical_to_logical_map_cpu=torch.tensor([[2, 3, 0, 1]]))
-    params = {"w": torch.tensor([[10.0, 11.0], [20.0, 21.0]], dtype=torch.float32)}
-    events = []
-    sent = []
-
-    class FakeHostCache:
-        def layer_handle(self, layer_id):
-            return SimpleNamespace(num_local_experts=2)
-
-        def expert_dim_params(self, layer_id):
-            return params
-
-    class FakeWork:
-        def __init__(self, kind):
-            self.kind = kind
-
-        def wait(self):
-            events.append(("wait", self.kind))
-
-    def fake_irecv(tensor, src, group=None, tag=0):
-        events.append(("recv", int(src), int(tag)))
-        return FakeWork("recv")
-
-    def fake_isend(tensor, dst, group=None, tag=0):
-        events.append(("send", int(dst), int(tag)))
-        sent.append(tensor.detach().clone())
-        return FakeWork("send")
-
-    monkeypatch.setattr(eplb_relocator, "_dist_ready", lambda: True)
-    monkeypatch.setattr(eplb_relocator.dist, "irecv", fake_irecv)
-    monkeypatch.setattr(eplb_relocator.dist, "isend", fake_isend)
-
-    relocator = WeightRelocator(
-        FakeHostCache(),
-        {},
-        rank=1,
-        ep_size=2,
-        strategy="p2p",
-        eplb_pg=object(),
-    )
-    relocator.submit(old, new, [0])
-
-    remote_ops = [event[0] for event in events if event[0] in {"recv", "send"}]
-    assert remote_ops == ["recv", "recv", "send", "send"]
-    assert len(sent) == 2
-    assert torch.equal(sent[0], params["w"][0])
-    assert torch.equal(sent[1], params["w"][1])
-    wait_kinds = [event[1] for event in events if event[0] == "wait"]
-    assert wait_kinds == ["recv", "recv", "send", "send"]
+    with pytest.raises(ValueError, match="host_first"):
+        WeightRelocator(object(), {}, rank=0, ep_size=2, strategy="p2p")
 
 
 def test_runtime_collect_and_swap_emit_events():

@@ -364,8 +364,67 @@ def eplb_event_from_payload(payload: dict):
     return event
 
 
-def eplb_event_key(payload: dict) -> tuple[str, int]:
-    return payload["kind"], int(payload["op_id"])
+def eplb_event_key(payload: dict) -> int:
+    return int(payload["op_id"])
+
+
+def _eplb_event_mismatch_reason(op_id: int, kinds: Sequence[str]) -> str:
+    return f"rank event mismatch for op_id={op_id}: {', '.join(sorted(set(kinds)))}"
+
+
+def _merge_eplb_failure_payload(
+    op_id: int, failure_kind: str, payloads: Sequence[dict]
+) -> dict:
+    kinds = [str(payload["kind"]) for payload in payloads]
+    failure_payloads = [
+        payload for payload in payloads if str(payload["kind"]) == failure_kind
+    ]
+    payload = (
+        dict(failure_payloads[0])
+        if failure_payloads
+        else {
+            "kind": failure_kind,
+            "op_id": int(op_id),
+        }
+    )
+    payload["op_id"] = int(op_id)
+    reasons = [str(item.get("reason", "")) for item in failure_payloads]
+    if len(set(kinds)) > 1:
+        reasons.append(_eplb_event_mismatch_reason(op_id, kinds))
+    reasons = list(dict.fromkeys(reason for reason in reasons if reason))
+    if reasons:
+        payload["reason"] = "; ".join(reasons)
+    if failure_kind == "RelocateFailed" and "layer_id" not in payload:
+        for item in payloads:
+            layer_ids = item.get("layer_ids")
+            if layer_ids:
+                payload["layer_id"] = int(layer_ids[0])
+                break
+        else:
+            payload["layer_id"] = 0
+    return payload
+
+
+def _merge_eplb_event_payloads(op_id: int, payloads: Sequence[dict]) -> dict:
+    kinds = [str(payload["kind"]) for payload in payloads]
+    unique_kinds = set(kinds)
+    if "RelocateFailed" in unique_kinds:
+        return _merge_eplb_failure_payload(op_id, "RelocateFailed", payloads)
+    if "PlanFailed" in unique_kinds:
+        return _merge_eplb_failure_payload(op_id, "PlanFailed", payloads)
+    if len(unique_kinds) == 1:
+        return dict(payloads[0])
+    if unique_kinds <= {"StatsCollected", "StatsEmpty"}:
+        return {"kind": "StatsEmpty", "op_id": int(op_id)}
+    if unique_kinds <= {"PlanDone", "PlanIdentical"}:
+        return {
+            "kind": "PlanFailed",
+            "op_id": int(op_id),
+            "reason": _eplb_event_mismatch_reason(op_id, kinds),
+        }
+    if "RelocateDone" in unique_kinds:
+        return _merge_eplb_failure_payload(op_id, "RelocateFailed", payloads)
+    return dict(payloads[0])
 
 
 def pop_common_eplb_event_payloads(
@@ -385,14 +444,9 @@ def pop_common_eplb_event_payloads(
             return []
 
     ready_payloads = []
-    for key in sorted(common_keys, key=lambda item: (item[1], item[0])):
-        payload = dict(rank_maps[0][key])
-        if payload["kind"] in ("PlanFailed", "RelocateFailed"):
-            reasons = [rank_map[key].get("reason", "") for rank_map in rank_maps]
-            reasons = list(dict.fromkeys(reason for reason in reasons if reason))
-            if reasons:
-                payload["reason"] = "; ".join(reasons)
-        ready_payloads.append(payload)
+    for op_id in sorted(common_keys):
+        payloads = [rank_map[op_id] for rank_map in rank_maps]
+        ready_payloads.append(_merge_eplb_event_payloads(op_id, payloads))
     return ready_payloads
 
 

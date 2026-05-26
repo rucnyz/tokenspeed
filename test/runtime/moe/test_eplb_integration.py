@@ -71,6 +71,7 @@ def test_scheduler_utils_serializes_eplb_events_for_rank_sync():
 
     from tokenspeed.runtime.engine.scheduler_utils import (
         eplb_event_from_payload,
+        eplb_event_key,
         eplb_event_to_payload,
         pop_common_eplb_event_payloads,
     )
@@ -96,8 +97,29 @@ def test_scheduler_utils_serializes_eplb_events_for_rank_sync():
     assert rebuilt.plan_handle == 11
     assert list(rebuilt.layers_changed) == [5, 2]
 
+    assert eplb_event_key(payload) == 7
     assert pop_common_eplb_event_payloads([[payload], []]) == []
     assert pop_common_eplb_event_payloads([[payload], [dict(payload)]]) == [payload]
+
+    plan_failed = {"kind": "PlanFailed", "op_id": 7, "reason": "rank1 failed"}
+    ready = pop_common_eplb_event_payloads([[payload], [plan_failed]])
+    assert ready[0]["kind"] == "PlanFailed"
+    assert ready[0]["op_id"] == 7
+    assert "rank1 failed" in ready[0]["reason"]
+    assert "rank event mismatch" in ready[0]["reason"]
+
+    relocate_done = {"kind": "RelocateDone", "op_id": 8, "layer_ids": [2, 3]}
+    relocate_failed = {
+        "kind": "RelocateFailed",
+        "op_id": 8,
+        "layer_id": 3,
+        "reason": "copy failed",
+    }
+    ready = pop_common_eplb_event_payloads([[relocate_done], [relocate_failed]])
+    assert ready[0]["kind"] == "RelocateFailed"
+    assert ready[0]["op_id"] == 8
+    assert ready[0]["layer_id"] == 3
+    assert "copy failed" in ready[0]["reason"]
 
 
 def test_event_loop_commits_eplb_events_after_all_ep_ranks_report(monkeypatch):

@@ -164,7 +164,7 @@ class ServerArgs:
     eplb_planner_timeout_s: float = 1.0
     eplb_max_consecutive_failures: int = 3
     eplb_planner_mitigation: Literal["rollback", "reuse", "disable"] = "reuse"
-    eplb_relocate_strategy: Literal["host_first", "p2p"] = "host_first"
+    eplb_relocate_strategy: Literal["host_first"] = "host_first"
     eplb_persist_dir: str | None = None
     eplb_include_drafter: bool = False
 
@@ -1250,9 +1250,9 @@ class ServerArgs:
         parser.add_argument(
             "--eplb-relocate-strategy",
             type=str,
-            choices=["host_first", "p2p"],
+            choices=["host_first"],
             default=ServerArgs.eplb_relocate_strategy,
-            help="Weight relocation transport strategy for EPLB.",
+            help="Weight relocation transport strategy for EPLB. Only host_first is supported.",
         )
         parser.add_argument(
             "--eplb-persist-dir",
