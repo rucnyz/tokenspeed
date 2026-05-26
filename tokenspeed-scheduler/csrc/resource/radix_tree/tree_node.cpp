@@ -29,8 +29,12 @@
 #include "resource/types.h"
 namespace tokenspeed {
 
+std::atomic<TreeNode::seq_id_t> TreeNode::next_seq_id_{0};
+
 TreeNode::TreeNode(token_vec_t tokens, timestamp_t access_time)
-    : tokens_{std::move(tokens)}, last_access_time_{access_time} {}
+    : tokens_{std::move(tokens)},
+      last_access_time_{access_time},
+      seq_id_{next_seq_id_.fetch_add(1, std::memory_order_relaxed)} {}
 
 void TreeNode::AddChild(const token_vec_t& key, std::unique_ptr<TreeNode>&& child) {
     if (child == nullptr) [[unlikely]] {
@@ -138,6 +142,11 @@ std::optional<cache_op_id> TreeNode::CacheOpId() const {
 std::int32_t TreeNode::MambaSlotIndex() const {
     _assert(mamba_slot_ != nullptr, "MambaSlotIndex called on node without mamba");
     return mamba_slot_->Index();
+}
+
+std::int32_t TreeNode::MambaHostSlotIndex() const {
+    _assert(mamba_host_slot_ != nullptr, "MambaHostSlotIndex called on node without mamba host slot");
+    return mamba_host_slot_->Index();
 }
 
 }  // namespace tokenspeed
