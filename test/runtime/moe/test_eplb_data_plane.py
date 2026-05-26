@@ -332,6 +332,88 @@ def test_runtime_collect_and_swap_emit_events():
     assert type(events[-1]).__name__ == "SwapDone"
     assert metadata.updated == [(new_metadata, [0])]
     assert recorder.rebound is metadata
+    assert 20 not in runtime._plan_handles
+    assert 20 not in runtime._plan_handle_pending_layers
+
+
+def test_runtime_keeps_plan_handle_until_last_swap_slice():
+    from tokenspeed.runtime.moe.eplb_runtime import EplbRuntime
+
+    metadata = _FakeMetadata()
+    new_metadata = _FakeMetadata()
+    recorder = _FakeRecorder(torch.tensor([[1, 2]], dtype=torch.int32))
+    runtime = EplbRuntime(
+        server_args=SimpleNamespace(),
+        model_config=SimpleNamespace(),
+        initial_metadata=metadata,
+        recorder=recorder,
+        rank=0,
+        ep_size=1,
+    )
+    runtime._plan_handles[20] = new_metadata
+    runtime._plan_handle_pending_layers[20] = {0, 1}
+
+    EplbSwapOperation = type("EplbSwapOperation", (), {})
+    swap_op = EplbSwapOperation()
+    swap_op.op_id = 11
+    swap_op.plan_handle = 20
+    swap_op.layer_ids = [0]
+    runtime.handle(swap_op)
+    assert runtime._plan_handles[20] is new_metadata
+    assert runtime._plan_handle_pending_layers[20] == {1}
+
+    swap_op.op_id = 12
+    swap_op.layer_ids = [1]
+    runtime.handle(swap_op)
+    assert 20 not in runtime._plan_handles
+    assert 20 not in runtime._plan_handle_pending_layers
+
+
+def test_runtime_relocate_failure_releases_final_plan_slice():
+    import time
+
+    from tokenspeed.runtime.moe.eplb_runtime import EplbRuntime
+
+    metadata = _FakeMetadata()
+    new_metadata = _FakeMetadata()
+    recorder = _FakeRecorder(torch.tensor([[1, 2]], dtype=torch.int32))
+    runtime = EplbRuntime(
+        server_args=SimpleNamespace(),
+        model_config=SimpleNamespace(),
+        initial_metadata=metadata,
+        recorder=recorder,
+        rank=0,
+        ep_size=1,
+    )
+    runtime._plan_handles[20] = new_metadata
+    runtime._plan_handle_pending_layers[20] = {0}
+
+    class FakeRelocator:
+        def submit(self, old_metadata, planned_metadata, layer_ids):
+            raise RuntimeError("copy failed")
+
+    runtime._relocator = FakeRelocator()
+
+    EplbRelocateOperation = type("EplbRelocateOperation", (), {})
+    relocate_op = EplbRelocateOperation()
+    relocate_op.op_id = 12
+    relocate_op.plan_handle = 20
+    relocate_op.layer_ids = [0]
+    runtime.handle(relocate_op)
+
+    events = []
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        events = runtime.drain_events()
+        if events:
+            break
+        time.sleep(0.01)
+
+    assert len(events) == 1
+    assert type(events[0]).__name__ == "RelocateFailed"
+    assert events[0].op_id == 12
+    assert 20 not in runtime._plan_handles
+    assert 20 not in runtime._plan_handle_pending_layers
 
 
 def test_runtime_relocate_op_finishes_from_background_thread(caplog):

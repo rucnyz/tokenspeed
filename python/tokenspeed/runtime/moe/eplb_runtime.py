@@ -122,6 +122,7 @@ class EplbRuntime:
         self._event_queue: deque[object] = deque()
         self._stats_handles: dict[int, torch.Tensor] = {}
         self._plan_handles: dict[int, object] = {}
+        self._plan_handle_pending_layers: dict[int, set[int]] = {}
         self._planner_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="eplb"
         )
@@ -186,6 +187,33 @@ class EplbRuntime:
             strategy=getattr(self.server_args, "eplb_relocate_strategy", "host_first"),
             eplb_pg=self.eplb_pg,
         )
+
+    def _store_plan_handle(
+        self, plan_handle: int, metadata: object, layer_ids: list[int]
+    ) -> None:
+        plan_handle = int(plan_handle)
+        self._plan_handles[plan_handle] = metadata
+        self._plan_handle_pending_layers[plan_handle] = {
+            int(layer_id) for layer_id in layer_ids
+        }
+
+    def _drop_plan_handle(self, plan_handle: int) -> None:
+        plan_handle = int(plan_handle)
+        self._plan_handles.pop(plan_handle, None)
+        self._plan_handle_pending_layers.pop(plan_handle, None)
+
+    def _mark_plan_layers_terminal(
+        self, plan_handle: int, layer_ids: list[int]
+    ) -> None:
+        plan_handle = int(plan_handle)
+        pending_layers = self._plan_handle_pending_layers.get(plan_handle)
+        if pending_layers is None:
+            self._drop_plan_handle(plan_handle)
+            return
+        for layer_id in layer_ids:
+            pending_layers.discard(int(layer_id))
+        if not pending_layers:
+            self._drop_plan_handle(plan_handle)
 
     def _persist(self, kind: str, payload: dict) -> None:
         if self._persist_dir is None:
@@ -338,7 +366,7 @@ class EplbRuntime:
             self.model_config,
             result.physical_to_logical_map_cpu,
         )
-        self._plan_handles[op_id] = new_metadata
+        self._store_plan_handle(op_id, new_metadata, result.changed_layers)
         self._persist(
             "plan",
             {
@@ -415,6 +443,7 @@ class EplbRuntime:
                     wall_ms if wall_ms is not None else -1.0,
                     str(exc),
                 )
+                self._mark_plan_layers_terminal(plan_handle, layer_ids)
                 self._emit(
                     _make_event(
                         "RelocateFailed",
@@ -439,6 +468,7 @@ class EplbRuntime:
                         op_id, stats_handle, logical_count, result
                     )
                 except Exception as exc:
+                    self._drop_plan_handle(op_id)
                     result = _make_event(
                         "PlanFailed",
                         op_id=op_id,
@@ -462,6 +492,7 @@ class EplbRuntime:
             )
             return
         if self._relocator is None:
+            self._drop_plan_handle(plan_handle)
             self._emit(
                 _make_event(
                     "RelocateFailed",
@@ -525,6 +556,7 @@ class EplbRuntime:
                 layer_ids,
                 str(exc),
             )
+            self._mark_plan_layers_terminal(plan_handle, layer_ids)
             self._emit(
                 _make_event(
                     "RelocateFailed",
@@ -588,6 +620,7 @@ class EplbRuntime:
                 layer_ids,
                 blocked_us,
             )
+            self._mark_plan_layers_terminal(plan_handle, layer_ids)
             self._emit(
                 _make_event(
                     "SwapDone",
@@ -597,6 +630,7 @@ class EplbRuntime:
                 )
             )
         except Exception as exc:
+            self._drop_plan_handle(plan_handle)
             blocked_us = int((time.perf_counter() - start) * 1_000_000)
             eplb_logger.error(
                 "[EPLB Swap] phase=fail op_id=%s plan_handle=%s "
