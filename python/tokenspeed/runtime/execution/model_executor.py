@@ -290,17 +290,19 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
             )
 
-        from tokenspeed.runtime.sampling.backends.flashinfer import (
-            FlashInferSamplingBackend,
-        )
-
         processor = self.model_runner.model.logits_processor
+        lm_head = getattr(self.model_runner.model, "lm_head", None)
+        backend_supports_dp = bool(
+            getattr(self.sampling_backend, "_SUPPORTS_DP_VERIFY", False)
+        )
+        lm_head_supports_dp = processor.supports_dp_sampling_lm_head(lm_head)
         self.dp_sampling_min_bs = resolve_dp_sampling_min_bs(
             processor.tp_size, self.config.dp_sampling_min_bs
         )
         infra_supports_dp = (
             self.drafter is not None
-            and isinstance(self.sampling_backend, FlashInferSamplingBackend)
+            and backend_supports_dp
+            and lm_head_supports_dp
             and processor.tp_size > 1
             and processor.tp_group is not None
         )
@@ -319,8 +321,8 @@ class ModelExecutor:
                 "TOKENSPEED_DP_SAMPLING=on but Batch-DP spec-verify "
                 "preconditions are not met: "
                 f"drafter={self.drafter is not None}, "
-                f"flashinfer_backend="
-                f"{isinstance(self.sampling_backend, FlashInferSamplingBackend)}, "
+                f"backend_supports_dp_verify={backend_supports_dp}, "
+                f"lm_head_supports_dp={lm_head_supports_dp}, "
                 f"processor.tp_size={processor.tp_size}, "
                 f"processor.tp_group_set={processor.tp_group is not None}"
             )
@@ -332,13 +334,15 @@ class ModelExecutor:
             processor._dp_comm = self.sampling_backend._dp_comm
         logger.info(
             "Batch-DP spec-verify: mode=%s, infra_supports=%s, enabled=%s "
-            "min_bs=%s (drafter=%s, flashinfer=%s, tp_size=%s, tp_group=%s)",
+            "min_bs=%s (drafter=%s, backend_supports_dp=%s, "
+            "lm_head_supports_dp=%s, tp_size=%s, tp_group=%s)",
             dp_mode,
             infra_supports_dp,
             self.dp_sampling_enabled,
             self.dp_sampling_min_bs,
             self.drafter is not None,
-            isinstance(self.sampling_backend, FlashInferSamplingBackend),
+            backend_supports_dp,
+            lm_head_supports_dp,
             processor.tp_size,
             processor.tp_group is not None,
         )
@@ -1179,8 +1183,6 @@ class ModelExecutor:
                         else CaptureHiddenMode.NULL
                     ),
                     gather_ids=gather_ids,
-                    padded_static_len=-1,
-                    keep_full_logits=forward_mode.is_decode_or_idle(),
                     dp_sampling=False,
                 )
                 if self.config.data_parallel_size > 1:

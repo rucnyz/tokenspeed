@@ -106,10 +106,6 @@ class LogitsMetadata:
     global_num_tokens_for_logprob_cpu: torch.Tensor | None = None
     global_num_tokens_for_logprob_gpu: torch.Tensor | None = None
 
-    # for padding
-    padded_static_len: int = -1
-    last_index_offsets: torch.Tensor | None = None
-
     dp_sampling: bool = False
 
     @classmethod
@@ -123,8 +119,6 @@ class LogitsMetadata:
             capture_hidden_mode=ctx.capture_hidden_mode,
             gather_ids=ctx.gather_ids,
             extend_seq_lens=input_lengths,
-            padded_static_len=ctx.padded_static_len,
-            last_index_offsets=ctx.last_index_offsets,
             dp_sampling=ctx.dp_sampling,
         )
 
@@ -218,6 +212,10 @@ class LogitsProcessor(nn.Module):
 
         # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
         self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
+
+    @staticmethod
+    def supports_dp_sampling_lm_head(lm_head) -> bool:
+        return hasattr(lm_head, "weight")
 
     def forward(
         self,

@@ -1313,9 +1313,9 @@ class ServerArgs:
             type=str,
             choices=["auto", "nccl", "onesided"],
             default=ServerArgs.dp_sampling_backend,
-            help="Batch-DP collective backend. 'auto' prefers one-sided "
-            "NVLink when supported and falls back to NCCL. Override with "
-            "TOKENSPEED_DP_SAMPLING_BACKEND.",
+            help="Batch-DP collective backend. Defaults to 'auto', which uses "
+            "the one-sided NVLink kernel when supported and falls back to NCCL. "
+            "Override with TOKENSPEED_DP_SAMPLING_BACKEND.",
         )
         parser.add_argument(
             "--dp-sampling-min-bs",

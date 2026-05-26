@@ -117,7 +117,7 @@ class DpSamplingComm:
         max_pad_bs: int,
         num_tokens_per_req: int,
         vocab_size: int,
-        logits_dtype: torch.dtype,
+        logits_dtype: torch.dtype | None,
         backend: DpSamplingBackend = "auto",
         fallback_comm_backend: CommBackend | None = None,
         device: torch.device | str | None = None,
@@ -173,6 +173,9 @@ class DpSamplingComm:
         self._accept_length_full = torch.empty(
             max_pad_bs, dtype=torch.int32, device=self._device
         )
+        self._logprobs_full = torch.empty(
+            max_pad_bs, n, dtype=torch.float32, device=self._device
+        )
 
         if self._backend == "nccl":
             self._combined_local_nccl: torch.Tensor | None = torch.empty(
@@ -191,7 +194,7 @@ class DpSamplingComm:
             self._combined_local_nccl = None
             self._combined_full_nccl = None
 
-        if self._backend == "onesided":
+        if self._backend == "onesided" and self._logits_dtype is not None:
             self._init_onesided()
 
     @property
@@ -227,6 +230,7 @@ class DpSamplingComm:
         )
 
         if self._backend == "onesided":
+            self._ensure_onesided_state(local_logits.dtype)
             return self._swap_batch_vocab_onesided(local_logits, pad_bs=pad_bs)
 
         return _swap_batch_vocab_nccl(
@@ -310,7 +314,32 @@ class DpSamplingComm:
         accept_length_full.copy_(combined_full[:, 2 * n])
         return predict_full, accept_index_full, accept_length_full
 
+    def gather_verify_logprobs(
+        self,
+        logprobs_local: torch.Tensor,
+        *,
+        pad_bs: int,
+    ) -> torch.Tensor:
+        """Gather per-token scalar logprobs into full padded-batch order."""
+        assert pad_bs <= self._max_pad_bs
+        reqs_per_rank = pad_bs // self._tp_size
+        n = self._num_tokens_per_req
+        assert tuple(logprobs_local.shape) == (reqs_per_rank, n), (
+            f"logprobs_local shape {tuple(logprobs_local.shape)} "
+            f"!= ({reqs_per_rank}, {n})"
+        )
+        logprobs_full = self._logprobs_full[:pad_bs]
+        all_gather_into_tensor(
+            logprobs_full,
+            logprobs_local.contiguous(),
+            self._rank,
+            self._group,
+            backend=self._fallback_backend,
+        )
+        return logprobs_full
+
     def _init_onesided(self) -> None:
+        assert self._logits_dtype is not None
         from tokenspeed_kernel.ops.communication.dp_sampling import (
             create_dp_sampling_state,
         )
@@ -329,6 +358,16 @@ class DpSamplingComm:
             logits_dtype=self._logits_dtype,
             device=self._device,
         )
+
+    def _ensure_onesided_state(self, logits_dtype: torch.dtype) -> None:
+        if self._state is not None:
+            assert self._logits_dtype == logits_dtype, (
+                f"DP sampling logits dtype changed from {self._logits_dtype} "
+                f"to {logits_dtype}"
+            )
+            return
+        self._logits_dtype = logits_dtype
+        self._init_onesided()
 
     def _swap_batch_vocab_onesided(
         self, local_logits: torch.Tensor, *, pad_bs: int

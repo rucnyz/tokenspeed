@@ -20,6 +20,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -176,6 +177,13 @@ class TestCLIConfigCompat(unittest.TestCase):
     def test_max_num_seqs_arg(self):
         args = self._parse_args(["--model", "test/model", "--max-num-seqs", "256"])
         self.assertEqual(args.max_num_seqs, 256)
+
+    def test_dp_sampling_backend_defaults_to_auto(self):
+        args = self._parse_args(["--model", "test/model", "--dp-sampling"])
+        self.assertEqual(args.dp_sampling_backend, "auto")
+
+    def test_sampling_backend_config_defaults_dp_sampling_backend_to_auto(self):
+        self.assertEqual(SamplingBackendConfig().dp_sampling_backend, "auto")
 
     def test_max_prefill_tokens_arg(self):
         args = self._parse_args(

@@ -120,6 +120,7 @@ class SamplingBackend(ABC):
     # backends (greedy) leave it False and the whole prepare_step call is
     # a no-op.
     _HAS_POOL_STATE: bool = False
+    _SUPPORTS_DP_VERIFY: bool = False
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 

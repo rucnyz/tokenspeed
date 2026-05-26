@@ -209,6 +209,41 @@ def _test_gather_persistent_buffer_reuse(
     assert al1.data_ptr() == al2.data_ptr()
 
 
+def _test_gather_verify_logprobs_correctness(
+    rank, world_size, device, group, *, pad_bs, n
+):
+    tp = world_size
+    reqs_per_rank = pad_bs // tp
+
+    comm = _build_comm(
+        rank,
+        world_size,
+        group,
+        pad_bs=pad_bs,
+        n=n,
+        vocab=tp * 4,
+        dtype=torch.float32,
+        backend="nccl",
+    )
+
+    logprobs_local = (
+        torch.arange(
+            rank * reqs_per_rank * n,
+            (rank + 1) * reqs_per_rank * n,
+            dtype=torch.float32,
+            device=device,
+        ).view(reqs_per_rank, n)
+        / 100.0
+    )
+
+    logprobs_full = comm.gather_verify_logprobs(logprobs_local, pad_bs=pad_bs)
+    expected = (
+        torch.arange(0, pad_bs * n, dtype=torch.float32, device=device).view(pad_bs, n)
+        / 100.0
+    )
+    torch.testing.assert_close(logprobs_full, expected)
+
+
 def _test_swap_and_gather_cuda_graph_replay(
     rank, world_size, device, group, *, pad_bs, n, vocab, backend
 ):
@@ -521,6 +556,18 @@ class TestDpSamplingComm:
             pad_bs=8,
             n=2,
             backend=backend,
+        )
+
+    @pytest.mark.parametrize("world_size", WORLD_SIZES)
+    @pytest.mark.parametrize("pad_bs,n", [(8, 1), (8, 4), (12, 3)])
+    def test_gather_verify_logprobs_correctness(self, world_size, pad_bs, n):
+        if pad_bs % world_size != 0:
+            pytest.skip("pad_bs not divisible by tp")
+        _run(
+            world_size,
+            _test_gather_verify_logprobs_correctness,
+            pad_bs=pad_bs,
+            n=n,
         )
 
     @pytest.mark.parametrize("world_size", WORLD_SIZES)

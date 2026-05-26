@@ -106,7 +106,15 @@ def _seed_coins(backend, *, bs: int, n: int, seed: int):
     backend._final_coins_buf[:bs].uniform_(1e-6, 1.0, generator=g)
 
 
-def _build_backend(*, max_bs: int, max_n: int, vocab: int, device, group):
+def _build_backend(
+    *,
+    max_bs: int,
+    max_n: int,
+    vocab: int,
+    device,
+    group,
+    enable_output_logprobs: bool = False,
+):
     from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
     from tokenspeed.runtime.sampling.backends.flashinfer import (
         FlashInferSamplingBackend,
@@ -114,7 +122,7 @@ def _build_backend(*, max_bs: int, max_n: int, vocab: int, device, group):
 
     cfg = SamplingBackendConfig(
         enable_nan_detection=False,
-        enable_output_logprobs=False,
+        enable_output_logprobs=enable_output_logprobs,
         max_bs=max_bs,
         max_draft_tokens_per_req=max_n,
         max_req_pool_size=max(max_bs, 4),
@@ -139,6 +147,7 @@ def _test_verify_dp_matches_today(
     vocab: int,
     is_all_greedy: bool,
     dtype,
+    enable_output_logprobs: bool = False,
 ):
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 
@@ -152,6 +161,7 @@ def _test_verify_dp_matches_today(
         vocab=vocab,
         device=device,
         group=group,
+        enable_output_logprobs=enable_output_logprobs,
     )
     _seed_pool_scalars(backend, bs=bs, temperature=1.0, top_k=32, top_p=0.9)
 
@@ -185,6 +195,9 @@ def _test_verify_dp_matches_today(
     )
     predict_full = predict_full.clone()
     accept_length_full = accept_length_full.clone()
+    logprobs_full = (
+        full_batch_in.next_token_logprobs.clone() if enable_output_logprobs else None
+    )
 
     _seed_coins(backend, bs=bs, n=n, seed=2024)
     full_logits_padded = torch.nn.functional.pad(
@@ -199,6 +212,51 @@ def _test_verify_dp_matches_today(
 
     torch.testing.assert_close(predict_dp, predict_full, rtol=0, atol=0)
     torch.testing.assert_close(accept_length_dp, accept_length_full, rtol=0, atol=0)
+    if enable_output_logprobs:
+        torch.testing.assert_close(
+            dp_in.next_token_logprobs,
+            logprobs_full,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+
+def test_dp_vocab_mask_slices_by_request_shard():
+    from tokenspeed.runtime.sampling.backends.flashinfer import (
+        FlashInferSamplingBackend,
+    )
+
+    full_bs = 5
+    pad_bs = 6
+    n = 3
+    mask_words = 4
+    vocab_mask = torch.arange(full_bs * n * mask_words, dtype=torch.int32).view(
+        full_bs * n, mask_words
+    )
+
+    rank0 = FlashInferSamplingBackend._slice_dp_vocab_mask(
+        vocab_mask,
+        full_bs=full_bs,
+        pad_bs=pad_bs,
+        num_tokens_per_req=n,
+        shard=slice(0, 3),
+    )
+    torch.testing.assert_close(rank0, vocab_mask[: 3 * n], rtol=0, atol=0)
+
+    rank1 = FlashInferSamplingBackend._slice_dp_vocab_mask(
+        vocab_mask,
+        full_bs=full_bs,
+        pad_bs=pad_bs,
+        num_tokens_per_req=n,
+        shard=slice(3, 6),
+    )
+    expected_rank1 = torch.cat(
+        [
+            vocab_mask[3 * n :],
+            torch.full((n, mask_words), -1, dtype=torch.int32),
+        ]
+    )
+    torch.testing.assert_close(rank1, expected_rank1, rtol=0, atol=0)
 
 
 WORLD_SIZES = [
@@ -243,4 +301,18 @@ class TestFlashInferVerifyDP:
             vocab=256,
             is_all_greedy=True,
             dtype=torch.float32,
+        )
+
+    @pytest.mark.parametrize("world_size", [pytest.param(2, id="tp2")])
+    @pytest.mark.parametrize("bs,n", [pytest.param(9, 2, id="bs9_n2")])
+    def test_greedy_path_output_logprobs(self, world_size, bs, n):
+        _run(
+            world_size,
+            _test_verify_dp_matches_today,
+            bs=bs,
+            n=n,
+            vocab=256,
+            is_all_greedy=True,
+            dtype=torch.float32,
+            enable_output_logprobs=True,
         )

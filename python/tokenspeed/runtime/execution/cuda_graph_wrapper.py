@@ -344,7 +344,6 @@ class CudaGraphWrapper:
                 if self.drafter is not None
                 else CaptureHiddenMode.NULL
             ),
-            keep_full_logits=True,
             dp_sampling=dp_sampling,
         )
 

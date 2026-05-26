@@ -239,7 +239,9 @@ def create_dp_sampling_state(
     predict[max_pad_bs, N], accept_index[max_pad_bs, N], and
     accept_length[max_pad_bs].
     """
-    assert type(group) == dist.ProcessGroup, f"Expected ProcessGroup, got {type(group)}"
+    assert isinstance(
+        group, dist.ProcessGroup
+    ), f"Expected ProcessGroup, got {type(group)}"
     assert rank_in_group == dist.get_rank(group), (
         f"rank_in_group={rank_in_group} does not match process-group rank "
         f"{dist.get_rank(group)}"
