@@ -82,8 +82,10 @@ def _get_split_kv_and_workspace_size(
         split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
             B, q_len, max_active_blocks
         )
-        workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
-            H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
+        workspace_size = (
+            BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
+                H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
+            )
         )
     return split_kv, workspace_size
 
