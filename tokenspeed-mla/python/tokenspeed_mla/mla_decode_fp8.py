@@ -1798,9 +1798,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         max_splits = ceil_div(K, mma_qk_tiler_mn[1])
         blocks_per_batch = max(1, max_active_blocks // B // (S * m_ctas_per_tile))
         split_heur = min(max_splits, blocks_per_batch)
-        # {$nv-internal-release begin}
-        # Keep split selection in scalar form to avoid dynamic int_tuple make_tile issues.
-        # {$nv-internal-release end}
         k_waves = ceil_div(max_splits, split_heur)
         split_wave_aware = ceil_div(max_splits, k_waves)
         max_split_kv = 64 if m_ctas_per_tile == 1 else 32
@@ -1809,7 +1806,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
     @staticmethod
     def get_split_kv_simplified(B: int, S: int, max_active_blocks: int) -> int:
         blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
-        max_split_kv = 64
+        max_split_kv = 32
         return min(blocks_per_batch, max_split_kv)
 
     @cute.jit
@@ -1838,9 +1835,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             split_kv = block_split_kvs[blk_coord[2]]
 
         k_tile_total = cute.ceil_div(K, self.mma_qk_tiler[1])
-        # {$nv-internal-release begin}
-        # Keep tile counts in scalar form to avoid dynamic int_tuple make_tile issues.
-        # {$nv-internal-release end}
         k_tile_per_cta = cute.ceil_div(k_tile_total, split_kv)
         k_index = blk_coord[3] * k_tile_per_cta
         k_tile_count = max(0, min(k_tile_total, k_index + k_tile_per_cta) - k_index)
@@ -2074,9 +2068,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         v_params.tVCsVC = tVCsVC
 
         while k_tile_count > 0:
-            # {$nv-internal-release begin}
-            # Keep state values explicit for CuteDSL AST lowering.
-            # {$nv-internal-release end}
             load_v_producer_state = self.load_tma_v_one_k_tile(
                 common_params,
                 v_params,
@@ -3334,9 +3325,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 ),
             ),
         )
-        # {$nv-internal-release begin}
-        # Use the PISL path for the PV stage.
-        # {$nv-internal-release end}
         # change to PISL
         sP_wo_swizzle_iter = cute.recast_ptr(sP.iterator, swizzle_=None)
         swizzle_bits = (
@@ -3462,9 +3450,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)), self.acc_dtype
             )
         tmem_load_tiled_copy = tcgen05.make_tmem_copy(tmem_load_atom, tAcc)
-        # {$nv-internal-release begin}
-        # Use the known compute-thread count for tiled-copy slice selection.
-        # {$nv-internal-release end}
         tmem_load_thr_copy = tmem_load_tiled_copy.get_slice(
             common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
         )
@@ -4903,9 +4888,7 @@ def run(
         )
 
         if out_dtype in [cutlass.Float8E5M2, cutlass.Float8E4M3FN]:
-            # {$nv-internal-release begin}
             # Avoid cute.testing.convert here because it can bus-error in local and CI runs.
-            # {$nv-internal-release end}
             # convert o back to f32 for comparison
             o_fp32, o_fp32_torch = cutlass_torch.cute_tensor_like(
                 torch.empty(*o_torch.shape, dtype=torch.float32),

@@ -57,14 +57,34 @@ def _get_split_kv_and_workspace_size(
     H: int,
     kv_lora_rank: int,
     max_active_blocks: int,
+    max_seq_len: int,
+    torch_dtype: torch.dtype,
+    mma_qk_tiler_mn: tuple[int, int],
 ) -> Tuple[int, int]:
     """Cache split_kv and workspace_size since they are deterministic for the same params."""
-    split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
-        B, q_len, max_active_blocks
-    )
-    workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
-        H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
-    )
+    is_fp8 = torch_dtype == torch.float8_e4m3fn
+    if is_fp8 and mma_qk_tiler_mn[0] == 64:
+        # M64 launches one CTA per M tile. Reuse the FP8 kernel's wave-aware
+        # split heuristic so serving matches the standalone mla_decode_fp8.py
+        # benchmark path instead of under-splitting like the 2-CTA M128 path.
+        split_kv = BlackwellMultiHeadLatentAttentionForwardFP8.get_split_kv(
+            B,
+            q_len,
+            max_seq_len,
+            mma_qk_tiler_mn,
+            max_active_blocks,
+            1,
+        )
+        workspace_size = BlackwellMultiHeadLatentAttentionForwardFP8.get_workspace_size(
+            H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
+        )
+    else:
+        split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
+            B, q_len, max_active_blocks
+        )
+        workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
+            H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
+        )
     return split_kv, workspace_size
 
 
@@ -405,7 +425,14 @@ def tokenspeed_mla_decode(
     # Cached split_kv and workspace_size computation
     max_active_blocks = get_num_sm(query.device)
     split_kv, workspace_size = _get_split_kv_and_workspace_size(
-        B, q_len_eff, H_eff, kv_lora_rank, max_active_blocks
+        B,
+        q_len_eff,
+        H_eff,
+        kv_lora_rank,
+        max_active_blocks,
+        max_seq_len,
+        q_dtype,
+        mma_qk_tiler_mn,
     )
 
     # Prepare workspace: slice of contiguous 1D buffer is already contiguous
