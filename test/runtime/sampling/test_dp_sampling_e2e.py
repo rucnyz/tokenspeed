@@ -23,12 +23,29 @@
 from __future__ import annotations
 
 import socket
+import traceback
 from dataclasses import dataclass
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
+from tokenspeed.runtime.execution.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+)
+from tokenspeed.runtime.layers.logits_processor import (
+    LogitsMetadata,
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
+from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
+from tokenspeed.runtime.sampling.backends.flashinfer import FlashInferSamplingBackend
+from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 
 
 def _get_open_port() -> int:
@@ -49,10 +66,6 @@ def _worker_main(rank, world_size, port, test_fn, error_dict, args):
             world_size=world_size,
         )
 
-        from tokenspeed.runtime.distributed.process_group_manager import (
-            process_group_manager as pg_manager,
-        )
-
         group = tuple(range(world_size))
         pg_manager.init_process_group(group)
 
@@ -60,8 +73,6 @@ def _worker_main(rank, world_size, port, test_fn, error_dict, args):
 
         dist.destroy_process_group()
     except Exception:
-        import traceback
-
         error_dict[rank] = traceback.format_exc()
 
 
@@ -129,11 +140,6 @@ def _seed_coins(backend, *, bs: int, n: int, seed: int):
 
 
 def _build_backend(*, max_bs: int, max_n: int, vocab: int, device, group):
-    from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
-    from tokenspeed.runtime.sampling.backends.flashinfer import (
-        FlashInferSamplingBackend,
-    )
-
     cfg = SamplingBackendConfig(
         enable_nan_detection=False,
         enable_output_logprobs=False,
@@ -158,8 +164,6 @@ def _build_processor(
     tp_group: tuple[int, ...],
     n: int,
 ):
-    from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
-
     return LogitsProcessor(
         config=config,
         skip_all_gather=False,
@@ -172,12 +176,6 @@ def _build_processor(
 
 
 def _build_metadata(*, dp_sampling: bool):
-    from tokenspeed.runtime.execution.forward_batch_info import (
-        CaptureHiddenMode,
-        ForwardMode,
-    )
-    from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
-
     return LogitsMetadata(
         forward_mode=ForwardMode.DECODE,
         capture_hidden_mode=CaptureHiddenMode.NULL,
@@ -198,9 +196,6 @@ def _test_dp_chain_matches_legacy(
     is_all_greedy: bool,
     dtype,
 ):
-    from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
-    from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
-
     tp_size = world_size
     pad_bs = ((bs + tp_size - 1) // tp_size) * tp_size
     assert vocab % tp_size == 0, "vocab must be divisible by tp for the test"

@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
@@ -66,6 +67,31 @@ def test_dp_sampling_lm_head_capability_check():
     assert not LogitsProcessor.supports_dp_sampling_lm_head(
         SimpleNamespace(linear_method=object())
     )
+
+
+def test_configure_dp_sampling_validates_lm_head_before_runtime():
+    processor = LogitsProcessor(
+        SimpleNamespace(vocab_size=7, model_type="unit_test"),
+        tp_rank=0,
+        tp_size=4,
+        tp_group=(0, 1, 2, 3),
+    )
+
+    with pytest.raises(RuntimeError, match="standard LM head"):
+        processor.configure_dp_sampling(
+            lm_head=SimpleNamespace(linear_method=object()),
+            dp_num_tokens_per_req=6,
+            dp_comm=None,
+        )
+    assert not processor.dp_sampling_enabled
+
+    processor.configure_dp_sampling(
+        lm_head=SimpleNamespace(weight=torch.empty(7, 3)),
+        dp_num_tokens_per_req=6,
+        dp_comm=None,
+    )
+    assert processor.dp_sampling_enabled
+    assert processor.dp_num_tokens_per_req == 6
 
 
 def test_skip_all_gather_dp_sampling_slices_hidden_states_before_lm_head():

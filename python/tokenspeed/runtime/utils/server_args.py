@@ -190,7 +190,6 @@ class ServerArgs:
     drafter_attention_backend: str | None = None
     sampling_backend: str | None = None
     dp_sampling: bool = False
-    dp_sampling_backend: Literal["auto", "nccl", "onesided"] = "auto"
     dp_sampling_min_bs: int | None = None
     attention_use_fp4_indexer_cache: bool | None = None
     use_trtllm_ragged_deepseek_prefill: bool | None = None
@@ -1306,16 +1305,10 @@ class ServerArgs:
             "--dp-sampling",
             action="store_true",
             default=ServerArgs.dp_sampling,
-            help="Enable Batch-DP spec-verify sampling.",
-        )
-        parser.add_argument(
-            "--dp-sampling-backend",
-            type=str,
-            choices=["auto", "nccl", "onesided"],
-            default=ServerArgs.dp_sampling_backend,
-            help="Batch-DP collective backend. Defaults to 'auto', which uses "
-            "the one-sided NVLink kernel when supported and falls back to NCCL. "
-            "Override with TOKENSPEED_DP_SAMPLING_BACKEND.",
+            help=(
+                "Enable Batch-DP spec-verify sampling. Backend selection defaults "
+                "to auto; override with TOKENSPEED_DP_SAMPLING_BACKEND."
+            ),
         )
         parser.add_argument(
             "--dp-sampling-min-bs",

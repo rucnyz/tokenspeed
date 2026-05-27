@@ -1,11 +1,23 @@
 """Tests for ``DpSamplingComm``."""
 
 import socket
+import traceback
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+from tokenspeed.runtime.distributed.comm_backend import get_global_backend
+from tokenspeed.runtime.distributed.dp_sampling_comm import (
+    DpSamplingComm,
+    _onesided_available,
+    _resolve_backend,
+)
+from tokenspeed.runtime.distributed.dp_sampling_swap import swap_batch_vocab
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 
 
 def _get_open_port() -> int:
@@ -26,10 +38,6 @@ def _worker_main(rank, world_size, port, test_fn, error_dict, args):
             world_size=world_size,
         )
 
-        from tokenspeed.runtime.distributed.process_group_manager import (
-            process_group_manager as pg_manager,
-        )
-
         group = tuple(range(world_size))
         pg_manager.init_process_group(group)
 
@@ -37,8 +45,6 @@ def _worker_main(rank, world_size, port, test_fn, error_dict, args):
 
         dist.destroy_process_group()
     except Exception:
-        import traceback
-
         error_dict[rank] = traceback.format_exc()
 
 
@@ -59,16 +65,26 @@ def _run(world_size, test_fn, **args):
 
 def _onesided_available_for_test(group) -> bool:
     try:
-        from tokenspeed.runtime.distributed.dp_sampling_comm import _onesided_available
-
         return _onesided_available(group)
     except Exception:
         return False
 
 
-def _build_comm(rank, world_size, group, *, pad_bs, n, vocab, dtype, backend):
-    from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
+def test_env_override_controls_backend(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_DP_SAMPLING_BACKEND", "nccl")
 
+    assert _resolve_backend("auto", (0, 1)) == "nccl"
+    assert _resolve_backend("onesided", (0, 1)) == "nccl"
+
+
+def test_env_override_rejects_invalid_backend(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_DP_SAMPLING_BACKEND", "bogus")
+
+    with pytest.raises(ValueError, match="TOKENSPEED_DP_SAMPLING_BACKEND"):
+        _resolve_backend("auto", (0, 1))
+
+
+def _build_comm(rank, world_size, group, *, pad_bs, n, vocab, dtype, backend):
     return DpSamplingComm(
         tp_size=world_size,
         rank=rank,
@@ -90,8 +106,6 @@ def _ground_truth_full_logits(pad_bs, n, vocab, *, dtype, device):
 def _test_swap_parity_with_free_function(
     rank, world_size, device, group, *, pad_bs, n, vocab, dtype, backend
 ):
-    from tokenspeed.runtime.distributed.dp_sampling_swap import swap_batch_vocab
-
     tp = world_size
     v_local = vocab // tp
 
@@ -364,9 +378,6 @@ class _CountingNcclBackend:
 
 
 def _test_nccl_single_allgather(rank, world_size, device, group, *, pad_bs, n):
-    from tokenspeed.runtime.distributed.comm_backend import get_global_backend
-    from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
-
     counter = _CountingNcclBackend(get_global_backend())
 
     comm = DpSamplingComm(

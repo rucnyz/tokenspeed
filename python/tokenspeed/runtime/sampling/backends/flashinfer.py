@@ -24,6 +24,7 @@ import os
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
     fused_topk_topp_prepare,
@@ -48,6 +49,9 @@ from tokenspeed_kernel.torch_compile import get_compiler_backend
 _FUSED_TOPK_TOPP_AVAILABLE = current_platform().is_nvidia
 
 from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
     SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
@@ -121,12 +125,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             self._dp_max_pad_bs = ((config.max_bs + tp_size - 1) // tp_size) * tp_size
             self._dp_max_reqs_per_rank = self._dp_max_pad_bs // tp_size
 
-            from tokenspeed.runtime.distributed.process_group_manager import (
-                process_group_manager as pg_manager,
-            )
-
             self._dp_pg = pg_manager.get_process_group("nccl", tp_group)
-            import torch.distributed as dist
 
             self._dp_rank = dist.get_rank(group=self._dp_pg)
 
@@ -141,7 +140,6 @@ class FlashInferSamplingBackend(SamplingBackend):
                 num_tokens_per_req=config.max_draft_tokens_per_req,
                 vocab_size=v_aligned,
                 logits_dtype=None,
-                backend=config.dp_sampling_backend,
                 device=config.device,
             )
         else:

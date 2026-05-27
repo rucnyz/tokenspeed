@@ -106,8 +106,8 @@ def test_engine_only_flag_routes_to_engine():
 
 
 def test_dp_sampling_routes_to_engine():
-    r = _split(["--dp-sampling", "--dp-sampling-backend", "onesided"])
-    assert r.engine == ["--dp-sampling", "--dp-sampling-backend", "onesided"]
+    r = _split(["--dp-sampling"])
+    assert r.engine == ["--dp-sampling"]
     assert r.gateway == []
 
 

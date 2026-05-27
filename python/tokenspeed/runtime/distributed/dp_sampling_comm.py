@@ -49,7 +49,25 @@ from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
 from tokenspeed.runtime.distributed.dp_sampling_swap import (
     swap_batch_vocab as _swap_batch_vocab_nccl,
 )
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
+
+try:
+    from tokenspeed_kernel.ops.communication.dp_sampling import (
+        create_dp_sampling_state,
+        dp_sampling_gather,
+        dp_sampling_swap,
+    )
+    from tokenspeed_kernel.platform import current_platform
+    from torch.distributed import _symmetric_memory
+except Exception:
+    create_dp_sampling_state = None
+    current_platform = None
+    dp_sampling_gather = None
+    dp_sampling_swap = None
+    _symmetric_memory = None
 
 logger = get_colorful_logger(__name__)
 
@@ -71,12 +89,15 @@ def _env_override() -> DpSamplingBackend | None:
 def _onesided_available(group: Group) -> bool:
     if len(group) <= 1:
         return False
+    if (
+        create_dp_sampling_state is None
+        or current_platform is None
+        or _symmetric_memory is None
+    ):
+        return False
     try:
-        from tokenspeed_kernel.platform import current_platform
-
         if not current_platform().is_nvidia:
             return False
-        from torch.distributed import _symmetric_memory  # noqa: F401
 
         major, minor = torch.__version__.split("+", 1)[0].split(".")[:2]
         if (int(major), int(minor)) < (2, 10):
@@ -89,6 +110,7 @@ def _onesided_available(group: Group) -> bool:
 
 def _resolve_backend(requested: DpSamplingBackend, group: Group) -> _ResolvedBackend:
     env = _env_override()
+    requested_via_env = env is not None
     if env is not None:
         requested = env
 
@@ -96,10 +118,15 @@ def _resolve_backend(requested: DpSamplingBackend, group: Group) -> _ResolvedBac
         return "nccl"
     if requested == "onesided":
         if not _onesided_available(group):
+            fallback_msg = (
+                f"Set {ENV_VAR}=nccl or unset {ENV_VAR} to use auto fallback."
+                if requested_via_env
+                else f"Set {ENV_VAR}=nccl or use backend='auto' to fall back."
+            )
             raise RuntimeError(
-                f"dp_sampling_backend='onesided' requested but the one-sided "
+                f"Batch-DP sampling backend='onesided' requested but the one-sided "
                 f"NVLink kernel is not available for group {group}. "
-                f"Set {ENV_VAR}=nccl or backend='auto' to fall back."
+                f"{fallback_msg}"
             )
         return "onesided"
 
@@ -345,13 +372,7 @@ class DpSamplingComm:
 
     def _init_onesided(self) -> None:
         assert self._logits_dtype is not None
-        from tokenspeed_kernel.ops.communication.dp_sampling import (
-            create_dp_sampling_state,
-        )
-
-        from tokenspeed.runtime.distributed.process_group_manager import (
-            process_group_manager as pg_manager,
-        )
+        assert create_dp_sampling_state is not None
 
         self._state = create_dp_sampling_state(
             group=pg_manager.get_process_group("nccl", self._group),
@@ -377,9 +398,8 @@ class DpSamplingComm:
     def _swap_batch_vocab_onesided(
         self, local_logits: torch.Tensor, *, pad_bs: int
     ) -> torch.Tensor:
-        from tokenspeed_kernel.ops.communication.dp_sampling import dp_sampling_swap
-
         assert self._state is not None
+        assert dp_sampling_swap is not None
         return dp_sampling_swap(self._state, local_logits, pad_bs=pad_bs)
 
     def _gather_verify_outputs_onesided(
@@ -390,9 +410,8 @@ class DpSamplingComm:
         *,
         pad_bs: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        from tokenspeed_kernel.ops.communication.dp_sampling import dp_sampling_gather
-
         assert self._state is not None
+        assert dp_sampling_gather is not None
         return dp_sampling_gather(
             self._state,
             predict_local,

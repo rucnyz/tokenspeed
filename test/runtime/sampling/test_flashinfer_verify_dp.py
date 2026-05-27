@@ -21,11 +21,19 @@
 """FlashInfer verify parity for Batch-DP."""
 
 import socket
+import traceback
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
+from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
+from tokenspeed.runtime.sampling.backends.flashinfer import FlashInferSamplingBackend
+from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 
 
 def _get_open_port() -> int:
@@ -46,10 +54,6 @@ def _worker_main(rank, world_size, port, test_fn, error_dict, args):
             world_size=world_size,
         )
 
-        from tokenspeed.runtime.distributed.process_group_manager import (
-            process_group_manager as pg_manager,
-        )
-
         group = tuple(range(world_size))
         pg_manager.init_process_group(group)
 
@@ -57,8 +61,6 @@ def _worker_main(rank, world_size, port, test_fn, error_dict, args):
 
         dist.destroy_process_group()
     except Exception:
-        import traceback
-
         error_dict[rank] = traceback.format_exc()
 
 
@@ -115,11 +117,6 @@ def _build_backend(
     group,
     enable_output_logprobs: bool = False,
 ):
-    from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
-    from tokenspeed.runtime.sampling.backends.flashinfer import (
-        FlashInferSamplingBackend,
-    )
-
     cfg = SamplingBackendConfig(
         enable_nan_detection=False,
         enable_output_logprobs=enable_output_logprobs,
@@ -149,8 +146,6 @@ def _test_verify_dp_matches_today(
     dtype,
     enable_output_logprobs: bool = False,
 ):
-    from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
-
     tp_size = world_size
     pad_bs = ((bs + tp_size - 1) // tp_size) * tp_size
     reqs_per_rank = pad_bs // tp_size
@@ -222,10 +217,6 @@ def _test_verify_dp_matches_today(
 
 
 def test_dp_vocab_mask_slices_by_request_shard():
-    from tokenspeed.runtime.sampling.backends.flashinfer import (
-        FlashInferSamplingBackend,
-    )
-
     full_bs = 5
     pad_bs = 6
     n = 3

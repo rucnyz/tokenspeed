@@ -217,6 +217,26 @@ class LogitsProcessor(nn.Module):
     def supports_dp_sampling_lm_head(lm_head) -> bool:
         return hasattr(lm_head, "weight")
 
+    @staticmethod
+    def validate_dp_sampling_lm_head(lm_head) -> None:
+        if not LogitsProcessor.supports_dp_sampling_lm_head(lm_head):
+            raise RuntimeError(
+                "dp_sampling requires a standard LM head with .weight; "
+                "GGUF linear_method is not supported on this path"
+            )
+
+    def configure_dp_sampling(
+        self,
+        *,
+        lm_head,
+        dp_num_tokens_per_req: int,
+        dp_comm,
+    ) -> None:
+        self.validate_dp_sampling_lm_head(lm_head)
+        self.dp_sampling_enabled = True
+        self.dp_num_tokens_per_req = dp_num_tokens_per_req
+        self._dp_comm = dp_comm
+
     def forward(
         self,
         input_ids,
@@ -407,10 +427,6 @@ class LogitsProcessor(nn.Module):
         )
 
         if dp_sampling and self.skip_all_gather:
-            assert hasattr(lm_head, "weight"), (
-                "skip_all_gather+dp_sampling requires a standard LM head with "
-                ".weight; GGUF linear_method is not supported on this path"
-            )
             n = self.dp_num_tokens_per_req
             rows = hidden_states.shape[0]
             assert (
@@ -442,10 +458,6 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         if dp_sampling and not self.skip_all_gather:
-            assert hasattr(lm_head, "weight"), (
-                "dp_sampling requires a standard LM head with .weight; "
-                "GGUF linear_method is not supported on this path"
-            )
             n = self.dp_num_tokens_per_req
             rows = logits.shape[0]
             assert (

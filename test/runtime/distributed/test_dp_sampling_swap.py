@@ -1,11 +1,17 @@
 """Tests for ``swap_batch_vocab``."""
 
 import socket
+import traceback
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+from tokenspeed.runtime.distributed.dp_sampling_swap import swap_batch_vocab
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 
 
 def _get_open_port() -> int:
@@ -26,10 +32,6 @@ def _worker_main(rank, world_size, port, test_fn, error_dict, args):
             world_size=world_size,
         )
 
-        from tokenspeed.runtime.distributed.process_group_manager import (
-            process_group_manager as pg_manager,
-        )
-
         group = tuple(range(world_size))
         pg_manager.init_process_group(group)
 
@@ -37,8 +39,6 @@ def _worker_main(rank, world_size, port, test_fn, error_dict, args):
 
         dist.destroy_process_group()
     except Exception:
-        import traceback
-
         error_dict[rank] = traceback.format_exc()
 
 
@@ -66,8 +66,6 @@ def _ground_truth_full(pad_bs: int, n: int, vocab: int, *, dtype, device):
 def _test_swap_matches_reference(
     rank, world_size, device, group, *, pad_bs, n, vocab, dtype
 ):
-    from tokenspeed.runtime.distributed.dp_sampling_swap import swap_batch_vocab
-
     tp = world_size
     v_local = vocab // tp
     reqs_per_rank = pad_bs // tp
@@ -98,8 +96,6 @@ def _test_swap_matches_reference(
 def _test_swap_chain_safety(
     rank, world_size, device, group, *, pad_bs, n, vocab, dtype
 ):
-    from tokenspeed.runtime.distributed.dp_sampling_swap import swap_batch_vocab
-
     tp = world_size
     v_local = vocab // tp
     reqs_per_rank = pad_bs // tp

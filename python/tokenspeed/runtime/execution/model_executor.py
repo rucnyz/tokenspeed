@@ -329,9 +329,11 @@ class ModelExecutor:
 
         self.dp_sampling_enabled = infra_supports_dp and dp_mode in {"auto", "on"}
         if self.dp_sampling_enabled:
-            processor.dp_sampling_enabled = True
-            processor.dp_num_tokens_per_req = spec_num_tokens
-            processor._dp_comm = self.sampling_backend._dp_comm
+            processor.configure_dp_sampling(
+                lm_head=lm_head,
+                dp_num_tokens_per_req=spec_num_tokens,
+                dp_comm=self.sampling_backend._dp_comm,
+            )
         logger.info(
             "Batch-DP spec-verify: mode=%s, infra_supports=%s, enabled=%s "
             "min_bs=%s (drafter=%s, backend_supports_dp=%s, "
@@ -386,7 +388,6 @@ class ModelExecutor:
         self.log_step = 0
         self._seen_prefill_ids: set[str] = set()
         self._prev_decode_bs: int = 0
-        self._logged_dp_sampling_routes: set[tuple[int, int, bool, bool]] = set()
         self._sentinel_neg1 = torch.tensor(-1, device=self.device, dtype=torch.int64)
         # Decode stats — accumulated from synced results (no GPU sync needed)
         self.num_generated_tokens = 0
@@ -1194,29 +1195,13 @@ class ModelExecutor:
                     ctx.global_num_tokens = dp_global_num_tokens
                     ctx.global_bs = dp_global_bs
                     ctx.all_decode_or_idle = dp_all_decode_or_idle
-                (
-                    ctx.dp_sampling,
-                    route_uses_graph,
-                    route_effective_bs,
-                ) = self.forward_step.dp_sampling_route(bs, ctx)
+                ctx.dp_sampling, _, _ = self.forward_step.dp_sampling_route(bs, ctx)
                 if forward_mode.is_decode() and self.config.global_rank == 0:
-                    route_key = (
+                    logger.debug(
+                        "Batch-DP sampling: bs=%s enabled=%s",
                         bs,
-                        route_effective_bs,
-                        route_uses_graph,
                         ctx.dp_sampling,
                     )
-                    if route_key not in self._logged_dp_sampling_routes:
-                        self._logged_dp_sampling_routes.add(route_key)
-                        logger.info(
-                            "Batch-DP route: bs=%s effective_bs=%s "
-                            "use_graph=%s dp_sampling=%s min_bs=%s",
-                            bs,
-                            route_effective_bs,
-                            route_uses_graph,
-                            ctx.dp_sampling,
-                            self.dp_sampling_min_bs,
-                        )
 
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_info = self._build_sampling_info(

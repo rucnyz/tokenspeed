@@ -15,6 +15,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tokenspeed.runtime.distributed.comm_ops import all_to_all_single
+
 
 def get_open_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -156,8 +158,6 @@ def _test_all_gather_into_tensor(rank, world_size, device, group, ref_group):
 
 
 def _test_all_to_all_single(rank, world_size, device, group, ref_group):
-    from tokenspeed.runtime.distributed.comm_ops import all_to_all_single
-
     for sz in TEST_SIZES:
         for dtype in DTYPES:
             total = sz * world_size
