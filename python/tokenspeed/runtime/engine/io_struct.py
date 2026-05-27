@@ -694,6 +694,10 @@ class GetWeightsByNameReqOutput:
 @dataclass
 class ReleaseMemoryOccupationReqInput:
     tags: list[str] | None = None
+    # When True, copy model parameters and buffers into pinned host RAM
+    # before pause() so /resume_memory_occupation can restore them without
+    # re-reading the checkpoint from disk.
+    stage_to_cpu: bool = False
 
 
 @dataclass

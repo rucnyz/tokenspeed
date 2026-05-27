@@ -372,6 +372,15 @@ class EventLoop:
             ),
         )
 
+        from tokenspeed.runtime.engine.memory_occupation_manager import (
+            MemoryOccupationManager,
+        )
+
+        memory_occupation_manager = MemoryOccupationManager(
+            memory_saver=target.memory_saver_adapter,
+            model_runner=target,
+            draft_model_runner=draft,
+        )
         self.request_handler = RequestHandler(
             server_args=self.server_args,
             hf_eos_token_id=self.model_config.hf_eos_token_id,
@@ -381,6 +390,8 @@ class EventLoop:
             send_func=self.send_to_tokenizer,
             get_load_fn=self._get_load,
             architectures=self.model_config.hf_config.architectures,
+            memory_saver=target.memory_saver_adapter,
+            memory_occupation_manager=memory_occupation_manager,
         )
 
         self.output_processor = OutputProcesser(

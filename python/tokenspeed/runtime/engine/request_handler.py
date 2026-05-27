@@ -52,6 +52,7 @@ from tokenspeed.runtime.engine.io_struct import (
     SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
 )
+from tokenspeed.runtime.engine.memory_occupation_manager import MemoryOccupationManager
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import make_spec
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -87,12 +88,24 @@ class RequestHandler:
         get_load_fn=None,
         architectures: list[str] | None = None,
         memory_saver: TorchMemorySaverAdapter | None = None,
+        memory_occupation_manager: MemoryOccupationManager | None = None,
     ) -> None:
 
         self.forward_ct = 0
         self.server_args = server_args
         self.memory_saver = memory_saver or TorchMemorySaverAdapter.create(
             server_args.enable_memory_saver
+        )
+        # Falls back to a manager without a model reference, which means
+        # stage_to_cpu=True silently degrades to a plain pause (no staging,
+        # no error). The event loop is expected to supply a real manager
+        # with model_runner attached.
+        self.memory_occupation_manager = (
+            memory_occupation_manager
+            if memory_occupation_manager is not None
+            else MemoryOccupationManager(
+                memory_saver=self.memory_saver, model_runner=None
+            )
         )
 
         mapping = server_args.mapping
@@ -180,10 +193,13 @@ class RequestHandler:
                 # control request here so API callers still get a typed reply.
                 self.send_func.send_pyobj(FlushCacheReqOutput(success=True))
             elif isinstance(recv_req, ReleaseMemoryOccupationReqInput):
-                self.memory_saver.pause()
+                self.memory_occupation_manager.release(
+                    stage_to_cpu=recv_req.stage_to_cpu,
+                    tags=recv_req.tags,
+                )
                 self.send_func.send_pyobj(ReleaseMemoryOccupationReqOutput())
             elif isinstance(recv_req, ResumeMemoryOccupationReqInput):
-                self.memory_saver.resume()
+                self.memory_occupation_manager.resume(tags=recv_req.tags)
                 self.send_func.send_pyobj(ResumeMemoryOccupationReqOutput())
             elif isinstance(recv_req, GetInternalStateReq):
                 self.send_func.send_pyobj(GetInternalStateReqOutput(internal_state={}))

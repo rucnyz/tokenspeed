@@ -69,16 +69,24 @@ def create_app(async_llm: AsyncLLM, server_args: ServerArgs) -> FastAPI:
 
     @app.post("/release_memory_occupation")
     async def release_memory_occupation(request: dict | None = None):
-        """Offload model weights, KV cache, and CUDA graphs to CPU via torch_memory_saver.
+        """Release GPU memory occupied by tensors inside torch_memory_saver regions.
 
         Requires the server to have been started with ``--enable-memory-saver``.
 
-        Optional JSON body: ``{"tags": ["weights", "kv_cache"]}``
+        Optional JSON body:
+          - ``tags``: subset of regions to release (currently no-op; future use)
+          - ``stage_to_cpu``: when True, copy model parameters + buffers to
+            pinned host RAM before release so /resume_memory_occupation can
+            restore them without re-reading the checkpoint from disk. Costs
+            ~model_size bytes of host RAM for the duration of the release.
         """
         from tokenspeed.runtime.engine.io_struct import ReleaseMemoryOccupationReqInput
 
-        tags = (request or {}).get("tags") if request else None
-        obj = ReleaseMemoryOccupationReqInput(tags=tags)
+        body = request or {}
+        obj = ReleaseMemoryOccupationReqInput(
+            tags=body.get("tags"),
+            stage_to_cpu=bool(body.get("stage_to_cpu", False)),
+        )
         await async_llm.release_memory_occupation(obj)
         return ORJSONResponse({"success": True})
 
