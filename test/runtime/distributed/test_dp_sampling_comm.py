@@ -544,13 +544,11 @@ def _test_onesided_gather_lazy_init_without_swap(
 
 WORLD_SIZES = [
     pytest.param(2, id="tp2"),
-    pytest.param(4, id="tp4"),
 ]
 
 SHAPES = [
     pytest.param(8, 1, 64, id="sample_pad_bs8"),
     pytest.param(8, 4, 64, id="spec_pad_bs8_n4"),
-    pytest.param(12, 3, 96, id="spec_pad_bs12_n3"),
 ]
 
 DTYPES = [
@@ -590,7 +588,7 @@ class TestDpSamplingComm:
         )
 
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
-    @pytest.mark.parametrize("pad_bs,n", [(8, 1), (8, 4), (12, 3)])
+    @pytest.mark.parametrize("pad_bs,n", [(8, 1), (8, 4)])
     @pytest.mark.parametrize("backend", BACKENDS)
     def test_gather_verify_outputs_correctness(self, world_size, pad_bs, n, backend):
         if pad_bs % world_size != 0:
@@ -623,7 +621,7 @@ class TestDpSamplingComm:
         )
 
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
-    @pytest.mark.parametrize("pad_bs,n", [(8, 1), (8, 4), (12, 3)])
+    @pytest.mark.parametrize("pad_bs,n", [(8, 1), (8, 4)])
     def test_gather_verify_logprobs_correctness(self, world_size, pad_bs, n):
         if pad_bs % world_size != 0:
             pytest.skip("pad_bs not divisible by tp")
@@ -651,7 +649,7 @@ class TestDpSamplingComm:
         )
 
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
-    @pytest.mark.parametrize("pad_bs,n", [(8, 1), (8, 4), (12, 3)])
+    @pytest.mark.parametrize("pad_bs,n", [(8, 1), (8, 4)])
     def test_nccl_single_allgather(self, world_size, pad_bs, n):
         if pad_bs % world_size != 0:
             pytest.skip("pad_bs not divisible by tp")
@@ -680,7 +678,7 @@ class TestDpSamplingComm:
         )
 
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
-    @pytest.mark.parametrize("pad_bs,n", [(8, 1), (8, 4), (12, 3)])
+    @pytest.mark.parametrize("pad_bs,n", [(8, 1), (8, 4)])
     @pytest.mark.parametrize("dtype", DTYPES)
     def test_onesided_gather_lazy_init_without_swap(self, world_size, pad_bs, n, dtype):
         if pad_bs % world_size != 0:

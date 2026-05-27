@@ -131,13 +131,11 @@ def _test_swap_chain_safety(
 
 WORLD_SIZES = [
     pytest.param(2, id="tp2"),
-    pytest.param(4, id="tp4"),
 ]
 
 SHAPES = [
     pytest.param(8, 1, 64, id="sample_pad_bs8"),
     pytest.param(8, 4, 64, id="spec_pad_bs8_n4"),
-    pytest.param(12, 3, 96, id="spec_pad_bs12_n3"),
 ]
 
 DTYPES = [

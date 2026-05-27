@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import re
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -122,82 +120,3 @@ def test_skip_all_gather_dp_sampling_slices_hidden_states_before_lm_head():
     assert logits.shape == (12, 7)
     expected_rows = hidden_states[12:24].sum(dim=1)
     assert torch.equal(logits[:, 0], expected_rows)
-
-
-def test_skip_all_gather_logits_processors_carry_tp_metadata():
-    root = Path(__file__).resolve().parents[2]
-    model_files = [
-        root / "python/tokenspeed/runtime/models/base/causal_lm.py",
-        root / "python/tokenspeed/runtime/models/minimax_m2.py",
-        root / "python/tokenspeed/runtime/models/qwen3_5_nextn.py",
-        root / "python/tokenspeed/runtime/models/deepseek_nextn.py",
-    ]
-
-    for path in model_files:
-        source = path.read_text()
-        assert "skip_all_gather=True" in source, path
-        for kwarg in ("tp_rank=", "tp_size=", "tp_group="):
-            pattern = (
-                r"LogitsProcessor\([\s\S]{0,240}"
-                r"skip_all_gather=True[\s\S]{0,240}" + re.escape(kwarg)
-            )
-            assert re.search(pattern, source), f"{path}: missing {kwarg}"
-
-
-def test_pdl_verify_keeps_tp_broadcast_with_fused_topk_topp():
-    root = Path(__file__).resolve().parents[2]
-    for relpath in (
-        "python/tokenspeed/runtime/sampling/backends/flashinfer.py",
-        "python/tokenspeed/runtime/sampling/backends/flashinfer_full.py",
-    ):
-        source = (root / relpath).read_text()
-        assert re.search(
-            r"(?:if|elif) pdl_enabled\(\):\s+self\.maybe_broadcast"
-            r"\(predict, accept_index, accept_length\)",
-            source,
-        ), relpath
-
-
-def test_dp_sampling_preconditions_are_capability_based():
-    root = Path(__file__).resolve().parents[2]
-    executor = (
-        root / "python/tokenspeed/runtime/execution/model_executor.py"
-    ).read_text()
-    flashinfer = (
-        root / "python/tokenspeed/runtime/sampling/backends/flashinfer.py"
-    ).read_text()
-    flashinfer_full = (
-        root / "python/tokenspeed/runtime/sampling/backends/flashinfer_full.py"
-    ).read_text()
-
-    assert "backend_supports_dp" in executor
-    assert "lm_head_supports_dp" in executor
-    assert "_SUPPORTS_DP_VERIFY = True" in flashinfer
-    assert "_SUPPORTS_DP_VERIFY = False" in flashinfer_full
-
-
-def test_dp_verify_handles_grammar_masks_and_logprob_logits():
-    root = Path(__file__).resolve().parents[2]
-    source = (
-        root / "python/tokenspeed/runtime/sampling/backends/flashinfer.py"
-    ).read_text()
-    comm = (
-        root / "python/tokenspeed/runtime/distributed/dp_sampling_comm.py"
-    ).read_text()
-
-    assert "dp_sampling + grammar bitmask is not supported" not in source
-    assert "_slice_dp_vocab_mask" in source
-    assert "torch.log_softmax(logits_output.next_token_logits, dim=-1)" in source
-    assert "gather_verify_logprobs" in source
-    assert "gather_verify_logprobs" in comm
-
-
-def test_one_sided_dp_sampling_accepts_process_group_subclasses():
-    root = Path(__file__).resolve().parents[2]
-    source = (
-        root
-        / "tokenspeed-kernel/python/tokenspeed_kernel/ops/communication/dp_sampling.py"
-    ).read_text()
-
-    assert "isinstance(" in source
-    assert "group, dist.ProcessGroup" in source

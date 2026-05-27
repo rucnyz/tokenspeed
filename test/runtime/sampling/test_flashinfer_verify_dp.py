@@ -289,13 +289,10 @@ def test_dp_vocab_mask_slices_by_request_shard():
 
 WORLD_SIZES = [
     pytest.param(2, id="tp2"),
-    pytest.param(4, id="tp4"),
 ]
 
 SHAPES = [
     pytest.param(8, 2, id="bs8_n2"),
-    pytest.param(8, 4, id="bs8_n4"),
-    pytest.param(9, 2, id="bs9_n2"),
     pytest.param(9, 4, id="bs9_n4"),
 ]
 

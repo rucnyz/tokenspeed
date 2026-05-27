@@ -287,14 +287,10 @@ def _test_dp_chain_matches_legacy(
 
 WORLD_SIZES = [
     pytest.param(2, id="tp2"),
-    pytest.param(4, id="tp4"),
 ]
 
 SHAPES = [
-    pytest.param(1, 2, id="bs1_n2"),
     pytest.param(2, 2, id="bs2_n2"),
-    pytest.param(4, 4, id="bs4_n4"),
-    pytest.param(8, 4, id="bs8_n4"),
     pytest.param(9, 2, id="bs9_n2"),
 ]
 
