@@ -28,21 +28,22 @@ def select_mla_decode_tilers(
     seq_len_q: int,
     *,
     is_fp8: bool,
+    compute_capability: tuple[int, int] | None = None,
 ) -> tuple[tuple[int, int], tuple[int, int]]:
     """Select decode MMA tile shapes from runtime head/q_len configuration.
 
     FP16/BF16 path currently supports only M=128 kernels.
-    FP8 path supports an additional M=64 kernel family, which is preferred when
-    the problem is small enough to keep the M tile well utilized.
+    FP8 path supports an additional M=64 kernel family on SM100 for the tuned
+    H=16, S_q=4 decode shape.
     """
     default_qk = (128, 128)
     default_pv = (128, 256)
     if not is_fp8:
         return default_qk, default_pv
 
-    # Prefer M=64 for small FP8 decode shapes, including H=64 cases requested by
-    # runtime tuning. This subsumes the earlier H=16, S_q=4 special-case.
-    if num_heads * seq_len_q <= 64:
+    is_sm100 = compute_capability == (10, 0)
+
+    if num_heads == 16 and seq_len_q == 4 and is_sm100:
         return (64, 128), (64, 256)
     return default_qk, default_pv
 

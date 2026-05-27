@@ -101,11 +101,15 @@ def _check_can_implement(
     is_persistent: bool,
     is_var_seq: bool,
     is_var_split_kv: bool,
+    compute_capability: tuple[int, int],
 ) -> None:
     """Check if the kernel supports the given configuration (cached)."""
     is_fp8 = torch_dtype == torch.float8_e4m3fn
     mma_qk_tiler_mn, mma_pv_tiler_mn = select_mla_decode_tilers(
-        num_heads, seq_len_q, is_fp8=is_fp8
+        num_heads,
+        seq_len_q,
+        is_fp8=is_fp8,
+        compute_capability=compute_capability,
     )
     KernelClass = (
         BlackwellMultiHeadLatentAttentionForwardFP8
@@ -155,6 +159,7 @@ def _get_compiled_mla_kernel(
     num_heads: int = 128,
     seq_len_q: int = 1,
     use_pdl: bool = False,
+    compute_capability: tuple[int, int] = (0, 0),
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
@@ -166,7 +171,10 @@ def _get_compiled_mla_kernel(
     """
     is_fp8 = torch_dtype == torch.float8_e4m3fn
     mma_qk_tiler_mn, mma_pv_tiler_mn = select_mla_decode_tilers(
-        num_heads, seq_len_q, is_fp8=is_fp8
+        num_heads,
+        seq_len_q,
+        is_fp8=is_fp8,
+        compute_capability=compute_capability,
     )
     # 2 CTAs for M=128 path; 1 CTA for M=64 path.
     cluster_shape_mnk = (2, 1, 1) if mma_qk_tiler_mn[0] == 128 else (1, 1, 1)
@@ -414,7 +422,13 @@ def tokenspeed_mla_decode(
     if max_seq_len <= 0:
         raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
     is_fp8 = q_dtype == torch.float8_e4m3fn
-    mma_qk_tiler_mn, _ = select_mla_decode_tilers(H, q_len, is_fp8=is_fp8)
+    compute_capability = torch.cuda.get_device_capability(query.device)
+    mma_qk_tiler_mn, _ = select_mla_decode_tilers(
+        H,
+        q_len,
+        is_fp8=is_fp8,
+        compute_capability=compute_capability,
+    )
     # Fold only by a factor that exactly divides q_len; otherwise leave q_len
     # on the scheduler dimension.
     mma_m_tile = mma_qk_tiler_mn[0]
@@ -482,6 +496,7 @@ def tokenspeed_mla_decode(
         is_persistent=is_persistent,
         is_var_seq=is_var_seq,
         is_var_split_kv=is_var_split_kv,
+        compute_capability=compute_capability,
     )
 
     # Get compiled kernel (cached after first compile)
@@ -502,6 +517,7 @@ def tokenspeed_mla_decode(
         num_heads=H,
         seq_len_q=q_len,
         use_pdl=enable_pdl,
+        compute_capability=compute_capability,
     )
 
     # TVM FFI env stream must be set to PyTorch's current stream so the kernel
