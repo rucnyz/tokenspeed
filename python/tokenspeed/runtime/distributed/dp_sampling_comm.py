@@ -209,6 +209,11 @@ class DpSamplingComm:
     def max_pad_bs(self) -> int:
         return self._max_pad_bs
 
+    def prepare_verify_outputs(self, logits_dtype: torch.dtype) -> None:
+        """Initialize one-sided state for verify-only DP sampling routes."""
+        if self._backend == "onesided":
+            self._ensure_onesided_state(logits_dtype)
+
     def swap_batch_vocab(
         self,
         local_logits: torch.Tensor,

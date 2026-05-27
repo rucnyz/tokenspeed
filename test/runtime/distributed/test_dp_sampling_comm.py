@@ -478,6 +478,59 @@ def _test_onesided_matches_nccl(
         torch.testing.assert_close(actual, expected)
 
 
+def _test_onesided_gather_lazy_init_without_swap(
+    rank, world_size, device, group, *, pad_bs, n, dtype
+):
+    tp = world_size
+    reqs_per_rank = pad_bs // tp
+
+    nccl_comm = _build_comm(
+        rank,
+        world_size,
+        group,
+        pad_bs=pad_bs,
+        n=n,
+        vocab=tp * 4,
+        dtype=dtype,
+        backend="nccl",
+    )
+    onesided_comm = _build_comm(
+        rank,
+        world_size,
+        group,
+        pad_bs=pad_bs,
+        n=n,
+        vocab=tp * 4,
+        dtype=None,
+        backend="onesided",
+    )
+    assert onesided_comm.fast_path_enabled
+
+    predict_local = torch.arange(
+        rank * reqs_per_rank * n,
+        (rank + 1) * reqs_per_rank * n,
+        dtype=torch.int32,
+        device=device,
+    ).view(reqs_per_rank, n)
+    accept_index_local = (predict_local * 7 + 11).contiguous()
+    accept_length_local = torch.arange(
+        rank * reqs_per_rank,
+        (rank + 1) * reqs_per_rank,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    onesided_comm.prepare_verify_outputs(dtype)
+    onesided_outputs = onesided_comm.gather_verify_outputs(
+        predict_local, accept_index_local, accept_length_local, pad_bs=pad_bs
+    )
+    nccl_outputs = nccl_comm.gather_verify_outputs(
+        predict_local, accept_index_local, accept_length_local, pad_bs=pad_bs
+    )
+    for actual, expected in zip(onesided_outputs, nccl_outputs, strict=True):
+        torch.testing.assert_close(actual, expected)
+
+
 WORLD_SIZES = [
     pytest.param(2, id="tp2"),
     pytest.param(4, id="tp4"),
@@ -612,5 +665,21 @@ class TestDpSamplingComm:
             pad_bs=pad_bs,
             n=n,
             vocab=vocab,
+            dtype=dtype,
+        )
+
+    @pytest.mark.parametrize("world_size", WORLD_SIZES)
+    @pytest.mark.parametrize("pad_bs,n", [(8, 1), (8, 4), (12, 3)])
+    @pytest.mark.parametrize("dtype", DTYPES)
+    def test_onesided_gather_lazy_init_without_swap(self, world_size, pad_bs, n, dtype):
+        if pad_bs % world_size != 0:
+            pytest.skip("pad_bs not divisible by tp")
+        if not _onesided_available_for_test(tuple(range(world_size))):
+            pytest.skip("one-sided dp-sampling backend is not available")
+        _run(
+            world_size,
+            _test_onesided_gather_lazy_init_without_swap,
+            pad_bs=pad_bs,
+            n=n,
             dtype=dtype,
         )

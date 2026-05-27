@@ -524,6 +524,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         if sampling_info.dp_sampling:
             n = num_tokens_per_req
             assert self._dp_comm is not None
+            self._dp_comm.prepare_verify_outputs(logits_output.next_token_logits.dtype)
             (
                 predict_full,
                 accept_index_full,
