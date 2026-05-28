@@ -178,7 +178,7 @@ WalkResult RadixTree::WalkDownUtilMismatch(token_slice aligned_tokens, TreeNode:
         child->Touch(access_time);
 
         update_tier(device_alive, result.match.device, child, child->OnDevice());
-        update_tier(host_alive, result.match.host, child, child->OnHost());
+        //update_tier(host_alive, result.match.host, child, child->OnHost());
 
         current = child;
         result.terminal = child;

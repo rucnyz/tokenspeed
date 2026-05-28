@@ -648,9 +648,9 @@ class EventLoop:
         # runs before any ``wait_until`` in attention, so nothing else
         # orders writeback's reads against the new writes. Cheap when
         # write_stream is idle.
-        host_exec = getattr(self.memory_executor, "host_exec", None)
-        if host_exec is not None:
-            self.model_executor.execution_stream.wait_stream(host_exec.write_stream)
+        # host_exec = getattr(self.memory_executor, "host_exec", None)
+        # if host_exec is not None:
+        #     self.model_executor.execution_stream.wait_stream(host_exec.write_stream)
 
     def _flush_mamba_retract_states(self, forward_op) -> None:
         """Copy draft->working mamba states when retract occurred (no forward scheduled)."""

@@ -67,11 +67,12 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     std::vector<TreeNode*> loadback_diff;
 
     const std::int32_t device_matched = match_result.device.DepthInPage();
-    const std::int32_t host_matched = match_result.host.DepthInPage();
+    //const std::int32_t host_matched = match_result.host.DepthInPage();
+    const std::int32_t host_matched = 0;
     if (disable_l2_cache) {
         unscheduled = request->PrefillSize() - device_matched * config_.page_size;
     } else {
-        loadback_diff = match_result.NodesWithout<ResourceType::Device>();
+        //loadback_diff = match_result.NodesWithout<ResourceType::Device>();
         if (host_matched > device_matched) {
             loadback_tokens = config_.page_size * (host_matched - device_matched);
         }

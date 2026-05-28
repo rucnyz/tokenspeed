@@ -253,13 +253,13 @@ def _kv_transfer_all_layer_kernel(
                     k_cache_src_ptr + src_offsets,
                     mask=mask,
                     other=0,
-                    cache_modifier=".cg",
+                    #cache_modifier=".cg",
                 )
                 v_src = tl.load(
                     v_cache_src_ptr + src_offsets,
                     mask=mask,
                     other=0,
-                    cache_modifier=".cg",
+                    #cache_modifier=".cg",
                 )
                 tl.store(
                     k_cache_dst_ptr + dst_offsets,
