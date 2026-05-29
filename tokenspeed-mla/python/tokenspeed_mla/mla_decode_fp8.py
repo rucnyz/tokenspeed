@@ -4396,10 +4396,9 @@ def run(
     :raises RuntimeError: If GPU is unavailable for computation
     """
 
-    if num_heads == 16 and seq_len_q == 4:
+    if num_heads * seq_len_q <= 64:
         mma_qk_tiler_mn = (64, 128)
-        if mma_pv_tiler_mn[0] != 64 or mma_pv_tiler_mn[1] not in (128, 256):
-            mma_pv_tiler_mn = (64, 256)
+        mma_pv_tiler_mn = (64, 256)
 
     print("Running Blackwell MLA test with:")
     print(f"  batch_size: {batch_size}")

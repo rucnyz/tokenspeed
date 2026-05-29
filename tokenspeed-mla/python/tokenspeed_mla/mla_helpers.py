@@ -43,7 +43,7 @@ def select_mla_decode_tilers(
 
     is_sm100 = compute_capability == (10, 0)
 
-    if num_heads == 16 and seq_len_q == 4 and is_sm100:
+    if num_heads * seq_len_q <= 64 and is_sm100:
         return (64, 128), (64, 256)
     return default_qk, default_pv
 
