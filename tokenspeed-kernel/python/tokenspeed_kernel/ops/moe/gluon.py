@@ -45,6 +45,36 @@ _GLUON_DISABLED_ENV = (
     os.environ.get("TOKENSPEED_MOE_GLUON", "").strip().lower() in _GLUON_DISABLE_VALUES
 )
 
+# Default-on; A/B knob to disable the W direct prefetch (1 iter ahead)
+# in the W_VIA_VGPR pipeline. Useful for measuring the prefetch's
+# isolated impact vs the same kernel without prefetch.
+_W_PREFETCH_DEFAULT = (
+    os.environ.get("TOKENSPEED_MOE_GLUON_W_PREFETCH", "1").strip().lower()
+    not in _GLUON_DISABLE_VALUES
+)
+
+
+# AMD ``waves_per_eu`` launch hint (waves per SIMD = occupancy cap).
+# Unset by default (compiler picks based on VGPR usage). With NW=4
+# every CTA contributes 1 wave/SIMD, so ``waves_per_eu=N`` caps
+# occupancy to N CTAs per CU. Lower values free per-CTA TCP/VMEM-FIFO
+# budget at the cost of less HBM-latency parallelism. Set via env to
+# explore the buffer_load TCP backpressure axis.
+def _parse_waves_per_eu():
+    val = os.environ.get("TOKENSPEED_MOE_GLUON_WAVES_PER_EU", "").strip()
+    if not val:
+        return None
+    try:
+        n = int(val)
+    except ValueError:
+        return None
+    if n <= 0:
+        return None
+    return n
+
+
+_WAVES_PER_EU = _parse_waves_per_eu()
+
 
 def _as_int32(t):
     if t is None or t.dtype == torch.int32:
@@ -87,6 +117,35 @@ def composition(cls):
 # ---------------------------------------------------------------------------
 
 _DEFAULT_NUM_BUFFERS = 2
+
+
+def _default_num_buffers(K: int, block_k: int) -> int:
+    """K-iter-aware default for the LDS prefetch ring depth.
+
+    The pipeline pre-loop fires ``NB-1`` K-iters worth of async copies
+    before entering the main loop, then each main iter fires +1 and
+    waits for the oldest to drain (``async_wait(NB-1)``). This implies
+    ``K_iters = ceil(K, BLOCK_K) >= NB`` -- below that the pre-loop
+    issues past the K boundary and the kernel reads garbage / faults.
+
+    Production decode/prefill dispatch+combine on gpt-oss-120b have
+    ``K_iters = 12`` (K=2880, BK=256) so any reasonable NB fits;
+    bench unit tests with K=128 BK=128 (K_iters=1) need NB=2.
+    """
+    K_iters = max(1, (K + block_k - 1) // block_k)
+    # Bump default to 3 when there are enough K-iters to fill the
+    # extra pipeline slot. Empirically (sweep on gpt-oss-120b decode
+    # H=I=2880 BS=1..32 fp8 W_VIA_VGPR + scale_swizzle): NB=3 helps
+    # dispatch BS=16 (-1.5%) / BS=32 (-3.8%) and combine BS=1 (-10.8%);
+    # is neutral or +1-5% on combine BS=4..32 (vgpr 151 -> 218, occ
+    # 3 -> 2 on combine -- the larger M values are saturated CTAs
+    # where occupancy matters more than per-iter pipeline). Net is
+    # ~tied or slightly +ve aggregated across BS, with a clear win
+    # at BS=1 (the bs=1 cuda graph capture batch).
+    if K_iters >= 3:
+        return 3
+    return 2
+
 
 _CDNA4_NUM_CUS = 256
 _PERSISTENT_OVERSUBSCRIBE = 2
@@ -432,6 +491,10 @@ class MoEConfig:
     # into VGPRs. Only MoEPipelinedProgram honours this; sliceN/sliceMN
     # ignore it.
     W_VIA_VGPR: gl.constexpr
+    # When True (and ``W_VIA_VGPR``), pipeline issues iter k+1's W
+    # direct buffer_load BEFORE iter k's ``async_wait``. Default True;
+    # set ``TOKENSPEED_MOE_GLUON_W_PREFETCH=0`` to disable for A/B.
+    W_PREFETCH: gl.constexpr
     NUM_BUFFERS: gl.constexpr
 
     SCALE_BLOCK: gl.constexpr
@@ -490,6 +553,7 @@ class MoEConfig:
         USE_GATHER=False,
         NUM_WARPS=4,
         W_VIA_VGPR=False,
+        W_PREFETCH=True,
     ):
         if SCALE_LOAD_MODE not in _SCALE_LOAD_MODES:
             raise ValueError(
@@ -502,6 +566,7 @@ class MoEConfig:
         self.NUM_BUFFERS = gl.constexpr(NUM_BUFFERS)
         self.W_TRANSPOSE = gl.constexpr(W_TRANSPOSE)
         self.W_VIA_VGPR = gl.constexpr(W_VIA_VGPR)
+        self.W_PREFETCH = gl.constexpr(W_PREFETCH)
         self.WITH_X_MX_SCALE = gl.constexpr(WITH_X_MX_SCALE)
         self.WITH_W_MX_SCALE = gl.constexpr(WITH_W_MX_SCALE)
         self.SCALE_LOAD_MODE = gl.constexpr(SCALE_LOAD_MODE)
@@ -1137,6 +1202,14 @@ class MoEPipelinedProgram:
         )
 
     @gluon.jit
+    def _issue_w_vgpr(self, mfma_idx):
+        cfg = self.cfg
+        return self.w_desc.issue_global_load_to_vgpr(
+            mfma_idx,
+            cfg.dot_layout_w,
+        )
+
+    @gluon.jit
     def _load_xw(self, mfma_idx):
         cfg = self.cfg
         x = self.x_desc.issue_local_load(
@@ -1145,13 +1218,7 @@ class MoEPipelinedProgram:
             cfg.dot_layout_x,
         )
         if cfg.W_VIA_VGPR:
-            # HBM->VGPR direct (no LDS staging). Caller must have
-            # preshuffled W; otherwise gl.convert_layout below stages
-            # through LDS (correct numerics, no perf win).
-            w = self.w_desc.issue_global_load_to_vgpr(
-                mfma_idx,
-                cfg.dot_layout_w,
-            )
+            w = self._issue_w_vgpr(mfma_idx)
         else:
             w = self.w_desc.issue_local_load(
                 mfma_idx,
@@ -1160,6 +1227,61 @@ class MoEPipelinedProgram:
                 do_permute=cfg.W_TRANSPOSE,
             )
         return x, w
+
+    @gluon.jit
+    def _load_x_scales(self, mfma_idx):
+        cfg = self.cfg
+        x = self.x_desc.issue_local_load(
+            mfma_idx,
+            self.x_buffer,
+            cfg.dot_layout_x,
+        )
+
+        BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
+        if cfg.USE_MFMA_SCALED:
+            if cfg.WITH_X_MX_SCALE:
+                if cfg.SCALE_VIA_LDS:
+                    scale_x = self.x_scale_desc.issue_local_load_unswizzle(
+                        mfma_idx,
+                        self.x_scale_buffer,
+                        cfg.layout_x_scale,
+                        cfg.BLOCK_M_PRESHUFFLED,
+                        cfg.BLOCK_M,
+                        BLOCK_K_SCALE,
+                    )
+                else:
+                    scale_x = _load_scale_tile_via_gl_load(self.x_scale_desc, mfma_idx)
+            else:
+                scale_x = gl.full(
+                    [cfg.BLOCK_M, BLOCK_K_SCALE],
+                    127,
+                    gl.uint8,
+                    layout=cfg.layout_x_scale,
+                )
+            if cfg.WITH_W_MX_SCALE:
+                if cfg.SCALE_VIA_LDS:
+                    scale_w = self.w_scale_desc.issue_local_load_unswizzle(
+                        mfma_idx,
+                        self.w_scale_buffer,
+                        cfg.layout_w_scale,
+                        cfg.BLOCK_N_PRESHUFFLED,
+                        cfg.BLOCK_N,
+                        BLOCK_K_SCALE,
+                    )
+                else:
+                    scale_w = _load_scale_tile_via_gl_load(self.w_scale_desc, mfma_idx)
+            else:
+                scale_w = gl.full(
+                    [cfg.BLOCK_N, BLOCK_K_SCALE],
+                    127,
+                    gl.uint8,
+                    layout=cfg.layout_w_scale,
+                )
+        else:
+            scale_x: gl.constexpr = 0
+            scale_w: gl.constexpr = 0
+
+        return x, scale_x, scale_w
 
     @gluon.jit
     def issue_local_loads(self, mfma_idx):
@@ -1230,70 +1352,62 @@ class MoEPipelinedProgram:
         )
         K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
 
-        if EVEN_K:
-            # All iters in-bounds, no mask needed.
-            for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
-                load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
+        W_PREFETCH: gl.constexpr = cfg.W_VIA_VGPR and cfg.W_PREFETCH
 
-            main_iters = K_iters - (cfg.NUM_BUFFERS - 1)
-            gl.assume(main_iters >= 0)
+        for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
 
-            for i in range(0, main_iters):
-                load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
-                self.async_wait(cfg.NUM_BUFFERS - 1)
+        if W_PREFETCH:
+            w_curr = self._issue_w_vgpr(0)
 
+        # EVEN_K: K_iters - (NUM_BUFFERS-1) all-unmasked main iters.
+        # !EVEN_K: one less unmasked iter; the last is the masked tail below.
+        main_iters = K_iters - (cfg.NUM_BUFFERS - 1 if EVEN_K else cfg.NUM_BUFFERS)
+        gl.assume(main_iters >= 0)
+
+        for i in range(0, main_iters):
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
+            self.async_wait(cfg.NUM_BUFFERS - 1)
+
+            if W_PREFETCH:
+                x, scale_x, scale_w = self._load_x_scales(mfma_idx)
+                accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
+                w_curr = self._issue_w_vgpr(mfma_idx + 1)
+            else:
                 x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
-                mfma_idx += 1
-
                 accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
+            mfma_idx += 1
 
-            for i in gl.static_range(cfg.NUM_BUFFERS - 1):
-                self.async_wait(cfg.NUM_BUFFERS - 2 - i)
-                x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
-                mfma_idx += 1
-                accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
-        else:
-            # Peel last K-iter as masked; main loop stays unmasked.
-            # Folding the mask in-loop regresses small-tile shapes
-            # (BN=128 / BM<=64) where the MFMA chain is short. Precond
-            # ``K_iters >= NUM_BUFFERS`` enforced by the launcher.
-            for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
-                load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
-
-            main_iters = K_iters - cfg.NUM_BUFFERS
-            gl.assume(main_iters >= 0)
-
-            for i in range(0, main_iters):
-                load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
-                self.async_wait(cfg.NUM_BUFFERS - 1)
-
-                x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
-                mfma_idx += 1
-
-                accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
-
-            # Masked tail iter.
+        if not EVEN_K:
+            # Masked tail iter (one more iter still has W to prefetch).
             load_idx = self.issue_global_loads(load_idx, USE_MASK=1)
             self.async_wait(cfg.NUM_BUFFERS - 1)
-            x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
-            mfma_idx += 1
-            accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
-
-            for i in gl.static_range(cfg.NUM_BUFFERS - 1):
-                self.async_wait(cfg.NUM_BUFFERS - 2 - i)
+            if W_PREFETCH:
+                x, scale_x, scale_w = self._load_x_scales(mfma_idx)
+                accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
+                w_curr = self._issue_w_vgpr(mfma_idx + 1)
+            else:
                 x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
-                mfma_idx += 1
                 accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
+            mfma_idx += 1
+
+        # Epilogue: drain remaining in-flight buffers; no new global loads.
+        for i in gl.static_range(cfg.NUM_BUFFERS - 1):
+            self.async_wait(cfg.NUM_BUFFERS - 2 - i)
+            if W_PREFETCH:
+                x, scale_x, scale_w = self._load_x_scales(mfma_idx)
+                accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
+                if i < cfg.NUM_BUFFERS - 2:
+                    w_curr = self._issue_w_vgpr(mfma_idx + 1)
+            else:
+                x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
+                accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
+            mfma_idx += 1
 
         return accumulator
 
     @gluon.jit
     def warp_pipeline(self, loop_k):
-        """``pipeline`` with ``gl.amd.warp_pipeline_stage`` markers so
-        LLVM interleaves LDS-load and MFMA across iters on different
-        warps. Requires ``NUM_BUFFERS >= 3`` (avoid LDS slot race) and
-        ``cdiv(K, BLOCK_K) >= NUM_BUFFERS`` (prologue depth).
-        """
         cfg = self.cfg
         gl.static_assert(
             cfg.NUM_BUFFERS >= 3,
@@ -2200,6 +2314,7 @@ def _pipelined_moe_tile_compute(
     USE_SLICE_N: gl.constexpr = False,
     HAS_FP8_QUANT_OUT: gl.constexpr = False,
     W_VIA_VGPR: gl.constexpr = False,
+    W_PREFETCH: gl.constexpr = True,
 ):
     expert_id = compact_idx
 
@@ -2245,6 +2360,7 @@ def _pipelined_moe_tile_compute(
         USE_GATHER,
         NUM_WARPS,
         W_VIA_VGPR=W_VIA_VGPR,
+        W_PREFETCH=W_PREFETCH,
     )
 
     BLOCK_K_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
@@ -3094,16 +3210,8 @@ def _pipelined_moe_kernel_scaled(
     GROUP_M: gl.constexpr = 1,
     XCD_SWIZZLE: gl.constexpr = 1,
     W_VIA_VGPR: gl.constexpr = False,
+    W_PREFETCH: gl.constexpr = True,
 ):
-    """Persistent / block-schedule MoE GEMM (single scaled-MFMA flavour).
-
-    Each CTA walks ``range(program_id(0), NUM_TILES, num_programs(0))``;
-    per-tile ``(compact_idx, block_in_expert, pid_n)`` comes from
-    ``block_schedule_ptr`` (``USE_BLOCK_SCHEDULE=True``, production)
-    or direct XCD/GROUP_M swizzle of ``tile_idx``. Padded tiles in
-    schedule mode are guarded by ``if do_tile`` (gluon-JIT can't
-    lower ``Continue``; scf.if-else-empty has the same cost).
-    """
     if GRID_N > 0:
         grid_n: gl.constexpr = GRID_N
         tiles_per_expert: gl.constexpr = BLOCKS_PER_EXPERT * GRID_N
@@ -3206,6 +3314,7 @@ def _pipelined_moe_kernel_scaled(
                 USE_SLICE_N=USE_SLICE_N,
                 HAS_FP8_QUANT_OUT=HAS_FP8_QUANT_OUT,
                 W_VIA_VGPR=W_VIA_VGPR,
+                W_PREFETCH=W_PREFETCH,
             )
 
 
@@ -3721,11 +3830,25 @@ def _launch_kernel(
         USE_SLICE_N=use_slice_n,
         HAS_FP8_QUANT_OUT=has_fp8_quant_out,
         W_VIA_VGPR=w_preshuffle,
+        W_PREFETCH=_W_PREFETCH_DEFAULT,
         GRID_N=grid_n,
         GROUP_M=group_m,
         XCD_SWIZZLE=xcd_swizzle,
         num_warps=num_warps,
     )
+
+    # ``waves_per_eu`` AMD launch hint: forces the compiler to allocate
+    # registers so AT MOST this many waves run per SIMD. With NW=4 each
+    # CTA uses 1 wave/SIMD; ``waves_per_eu=N`` therefore caps occupancy
+    # to N CTAs/CU. Lower values free per-CTA TCP / VMEM-FIFO budget
+    # (the per-CU resources are shared across all resident waves), at
+    # the cost of fewer parallel waves to hide HBM latency. The
+    # W_VIA_VGPR + W_PREFETCH path benefits from this trade-off because
+    # most HBM latency is already hidden by the 1-iter-ahead W issue;
+    # the residual bottleneck is buffer_load TCP backpressure, which
+    # scales linearly with co-resident CTAs.
+    if _WAVES_PER_EU is not None:
+        common_kwargs["waves_per_eu"] = _WAVES_PER_EU
 
     # Schedule path is the production specialization; rocprof name
     # is ``_pipelined_moe_kernel_scaled_block_schedule`` in that case.
@@ -4016,7 +4139,9 @@ def gluon_mxfp_dispatch_swiglu(
     block_n = block_n or bn
     block_k = block_k or bk
     num_warps = num_warps or nw
-    num_buffers = num_buffers if num_buffers is not None else _DEFAULT_NUM_BUFFERS
+    num_buffers = (
+        num_buffers if num_buffers is not None else _default_num_buffers(K, block_k)
+    )
     use_warp_pipeline = (
         bool(use_warp_pipeline) if use_warp_pipeline is not None else False
     )
@@ -4125,7 +4250,9 @@ def gluon_mxfp_combine(
     block_n = block_n or bn
     block_k = block_k or bk
     num_warps = num_warps or nw
-    num_buffers = num_buffers if num_buffers is not None else _DEFAULT_NUM_BUFFERS
+    num_buffers = (
+        num_buffers if num_buffers is not None else _default_num_buffers(K, block_k)
+    )
     use_warp_pipeline = (
         bool(use_warp_pipeline) if use_warp_pipeline is not None else False
     )
