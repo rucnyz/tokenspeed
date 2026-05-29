@@ -57,7 +57,7 @@ from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
 
 try:
-    from tokenspeed_kernel.ops.communication.dp_sampling import (
+    from tokenspeed_kernel.ops.communication.triton import (
         create_dp_sampling_state,
         dp_sampling_gather,
         dp_sampling_swap,
