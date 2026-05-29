@@ -317,8 +317,6 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         del layer.w13_weight
         del layer.w2_weight
 
-        # AMD bpreshuffle: stamp gluon dot-layout W on the wrapped tensors so
-        # the dispatch / combine GEMMs can take the W_VIA_VGPR fast path.
         if self._is_w4a8_fp8:
             _attach_gluon_bpreshuffle(layer)
 
