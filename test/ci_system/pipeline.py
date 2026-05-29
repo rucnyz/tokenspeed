@@ -31,6 +31,13 @@ except ImportError as exc:  # pragma: no cover
 
 SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
 SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug"}
+# Lower sort key = dispatched earlier. GitHub Actions starts matrix jobs in
+# include-list order, so `high` entries reach runner pools first when several
+# jobs contend for the same label (typical case: heavy 4gpu evals beating a
+# 1gpu unit-test for the same b300 box).
+SUPPORTED_PRIORITIES = ("high", "normal", "low")
+DEFAULT_PRIORITY = "normal"
+_PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
 STALE_PROCESS_PATTERNS = [
     r"ts serve",
@@ -107,6 +114,37 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 raise ValueError(
                     f"{path}: runner.env[{label!r}] must be a string mapping"
                 )
+    if "priority" in data:
+        priority = data["priority"]
+        if isinstance(priority, str):
+            if priority not in SUPPORTED_PRIORITIES:
+                raise ValueError(
+                    f"{path}: priority must be one of "
+                    f"{sorted(SUPPORTED_PRIORITIES)}; got {priority!r}"
+                )
+        elif isinstance(priority, dict):
+            unknown_labels = sorted(set(priority) - set(labels))
+            if unknown_labels:
+                raise ValueError(
+                    f"{path}: priority contains unknown labels: {unknown_labels}"
+                )
+            bad_values = sorted(
+                {
+                    value
+                    for value in priority.values()
+                    if value not in SUPPORTED_PRIORITIES
+                }
+            )
+            if bad_values:
+                raise ValueError(
+                    f"{path}: priority values must each be one of "
+                    f"{sorted(SUPPORTED_PRIORITIES)}; got {bad_values}"
+                )
+        else:
+            raise ValueError(
+                f"{path}: priority must be a string or a per-label mapping; "
+                f"got {type(priority).__name__}"
+            )
 
 
 def normalize_task(path: Path, repo_root: Path) -> Dict[str, Any]:
@@ -139,21 +177,48 @@ def find_task_files(root: Path) -> List[Path]:
     return sorted(root.rglob("*.yaml"))
 
 
+def resolve_priority_for_label(priority: Any, label: str) -> str:
+    """Pick the effective priority for ``label`` from the task's ``priority``.
+
+    - Missing / ``None`` -> ``DEFAULT_PRIORITY``.
+    - String -> applies to every label.
+    - Mapping -> only the listed labels are overridden; everything else
+      stays at ``DEFAULT_PRIORITY``. ``validate_task`` is the source of
+      truth for accepted keys and values.
+    """
+    if priority is None:
+        return DEFAULT_PRIORITY
+    if isinstance(priority, str):
+        return priority
+    if isinstance(priority, dict):
+        return priority.get(label, DEFAULT_PRIORITY)
+    return DEFAULT_PRIORITY
+
+
 def build_matrix(root: Path, repo_root: Path, trigger: str | None) -> Dict[str, Any]:
     include = []
     for path in find_task_files(root):
         task = normalize_task(path, repo_root)
         if trigger and trigger not in task["triggers"]:
             continue
-        for label in resolve_runner_labels(task["runner"]["labels"]):
+        priority = task.get("priority")
+        for label in task["runner"]["labels"]:
+            # `priority` keys are the labels as written in YAML, so look
+            # up before `resolve_runner_label` rewrites b200 to b200v2.
+            effective = resolve_priority_for_label(priority, label)
             include.append(
                 {
                     "name": task["name"],
                     "type": task["type"],
                     "config": task["_source_path"],
-                    "runner": label,
+                    "runner": resolve_runner_label(label),
+                    "priority": effective,
                 }
             )
+    # Stable sort: tasks at the same priority keep their file-path / label
+    # order, so tasks that omit `priority` see no change from the previous
+    # behaviour.
+    include.sort(key=lambda entry: _PRIORITY_ORDER[entry["priority"]])
     return {"include": include}
 
 
@@ -587,7 +652,7 @@ def extract_evalscope_score(report_table: str) -> float | None:
         cells = [cell.strip() for cell in stripped.strip(separator).split(separator)]
         if not cells:
             continue
-        if any(set(cell) <= {"=", "-"} for cell in cells if cell):
+        if all(set(cell) <= {"=", "-"} for cell in cells if cell):
             continue
         normalized = [cell.lower() for cell in cells]
         if "score" in normalized:
@@ -643,8 +708,15 @@ def parse_eval_score_threshold(threshold: Any) -> tuple[float, float | None]:
     if isinstance(threshold, list) and len(threshold) == 2:
         return float(threshold[0]), float(threshold[1])
     raise ValueError(
-        "eval.score_threshold must be a number or a two-item [min, max] range"
+        "eval.score_threshold must be a number, a two-item [min, max] range, "
+        "or a mapping of runner label to one of those values"
     )
+
+
+def resolve_score_threshold_for_runner(threshold: Any, runner: str) -> Any:
+    if isinstance(threshold, dict):
+        return threshold.get(runner)
+    return threshold
 
 
 def format_eval_score_threshold(min_score: float, max_score: float | None) -> str:
@@ -657,12 +729,20 @@ def check_eval_score_threshold(
     task: Dict[str, Any],
     command_results: List[Dict[str, Any]],
     stages_run: List[str],
+    runner: str,
 ) -> Dict[str, Any] | None:
     threshold = task.get("score_threshold")
     if threshold is None:
         threshold = task.get("eval", {}).get("score_threshold")
     if threshold is None:
         print("[eval-score] no score_threshold configured", flush=True)
+        return None
+    threshold = resolve_score_threshold_for_runner(threshold, runner)
+    if threshold is None:
+        print(
+            "[eval-score] no score_threshold configured for runner " f"{runner!r}",
+            flush=True,
+        )
         return None
     if "eval" not in stages_run:
         print(
@@ -799,6 +879,8 @@ def check_perf_reference(
     passed = not failures
     status = "passed" if passed else "failed"
     print(f"[perf-ref] threshold={threshold:g}, status={status}", flush=True)
+    for line in format_perf_reference_table(checks):
+        print(f"[perf-ref]   {line}", flush=True)
     for line in failures:
         print(f"[perf-ref]   {line}", flush=True)
     return {
@@ -807,6 +889,77 @@ def check_perf_reference(
         "checks": checks,
         "failures": failures,
     }
+
+
+def _ratio_pct(actual: float, ref: float) -> str:
+    """Format actual/ref as a percentage, e.g. ``105.5%``."""
+    if ref == 0:
+        return "n/a"
+    return f"{actual / ref * 100:.1f}%"
+
+
+def format_perf_reference_table(checks: List[Dict[str, Any]]) -> List[str]:
+    """Render the per-concurrency actual-vs-reference comparison as a
+    monospace text table. Each metric shows four columns: ``actual``, the
+    raw ``ref`` (un-thresholded), the ``floor`` (``ref * perf_threshold`` —
+    the value an actual must clear to pass), and ``actual/ref`` (the raw
+    percentage against ref, ``perf_threshold`` is NOT applied). Returns a
+    list of lines without any prefix so the caller can decorate (e.g.
+    ``[perf-ref]`` for stdout). Empty when ``checks`` has no entries."""
+    if not checks:
+        return []
+    header = (
+        f"{'Conc':>4}  "
+        f"{'Lat actual':>10} {'Lat ref':>9} {'Lat floor':>10} {'Lat actual/ref':>14}  "
+        f"{'Thru actual':>12} {'Thru ref':>10} {'Thru floor':>11} {'Thru actual/ref':>15}"
+    )
+    rule = "-" * len(header)
+    lines = [header, rule]
+    for entry in checks:
+        lat = entry.get("Latency (tps/user)") or {}
+        thru = entry.get("Throughput (tps/gpu)") or {}
+        lines.append(
+            f"{entry['conc']:>4}  "
+            f"{lat.get('actual', 0):>10.2f} "
+            f"{lat.get('ref', 0):>9.2f} "
+            f"{lat.get('floor', 0):>10.2f} "
+            f"{_ratio_pct(lat.get('actual', 0), lat.get('ref', 0)):>14}  "
+            f"{thru.get('actual', 0):>12.2f} "
+            f"{thru.get('ref', 0):>10.2f} "
+            f"{thru.get('floor', 0):>11.2f} "
+            f"{_ratio_pct(thru.get('actual', 0), thru.get('ref', 0)):>15}"
+        )
+    return lines
+
+
+def format_perf_reference_markdown_table(checks: List[Dict[str, Any]]) -> List[str]:
+    """Markdown-table variant of ``format_perf_reference_table`` for the
+    GitHub Step Summary. Same four columns per metric: ``actual``, raw
+    ``ref``, the threshold-adjusted ``floor``, and ``actual/ref`` (raw
+    percentage against ref). Empty when ``checks`` has no entries."""
+    if not checks:
+        return []
+    lines = [
+        "| Conc | Lat actual | Lat ref | Lat floor | Lat actual/ref "
+        "| Thru actual | Thru ref | Thru floor | Thru actual/ref |",
+        "|-----:|-----------:|--------:|----------:|---------------:"
+        "|------------:|---------:|-----------:|----------------:|",
+    ]
+    for entry in checks:
+        lat = entry.get("Latency (tps/user)") or {}
+        thru = entry.get("Throughput (tps/gpu)") or {}
+        lines.append(
+            f"| {entry['conc']} "
+            f"| {lat.get('actual', 0):.2f} "
+            f"| {lat.get('ref', 0):.2f} "
+            f"| {lat.get('floor', 0):.2f} "
+            f"| {_ratio_pct(lat.get('actual', 0), lat.get('ref', 0))} "
+            f"| {thru.get('actual', 0):.2f} "
+            f"| {thru.get('ref', 0):.2f} "
+            f"| {thru.get('floor', 0):.2f} "
+            f"| {_ratio_pct(thru.get('actual', 0), thru.get('ref', 0))} |"
+        )
+    return lines
 
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -874,6 +1027,9 @@ def build_step_summary_lines(result: Dict[str, Any]) -> List[str]:
             f"(threshold `{check['threshold']:g}`, "
             f"{len(check['checks'])} concurrency levels)"
         )
+        md_table = format_perf_reference_markdown_table(check["checks"])
+        if md_table:
+            lines.extend(["", *md_table, ""])
         if not check["passed"]:
             lines.extend([f"  - {failure}" for failure in check["failures"]])
     if result.get("eval_accept_rate"):
@@ -982,10 +1138,13 @@ def start_server(
     )
 
 
-def wrap_command_with_log(command: str, log_path: Path) -> str:
+def wrap_command_with_log(
+    command: str, log_path: Path, *, login_shell: bool = True
+) -> str:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     wrapped = f"{{ {command}; }} 2>&1 | tee -a {shlex.quote(str(log_path))}"
-    return f"bash -lc {shlex.quote(wrapped)}"
+    flag = "-lc" if login_shell else "-c"
+    return f"bash {flag} {shlex.quote(wrapped)}"
 
 
 def stop_server(process: subprocess.Popen[str] | None) -> None:
@@ -1156,7 +1315,9 @@ def execute_task(
                 if pgm is not None:
                     server_process = pgm.start(
                         wrap_command_with_log(
-                            stage_payload["command"], server_log_path
+                            stage_payload["command"],
+                            server_log_path,
+                            login_shell=False,
                         ),
                         cwd=repo_root,
                         env=runner_env,
@@ -1196,7 +1357,9 @@ def execute_task(
         eval_accept_rate = summarize_eval_accept_rate(
             task, command_results, stages_run, server_log_path
         )
-        eval_score_check = check_eval_score_threshold(task, command_results, stages_run)
+        eval_score_check = check_eval_score_threshold(
+            task, command_results, stages_run, runner
+        )
         if eval_score_check is not None and not eval_score_check["passed"]:
             raise RuntimeError(
                 f"eval score {eval_score_check['score']:g} does not satisfy "

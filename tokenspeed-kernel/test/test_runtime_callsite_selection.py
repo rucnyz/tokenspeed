@@ -31,6 +31,7 @@ import pytest
 
 # GEMM
 import tokenspeed_kernel.numerics.reference.gemm
+import tokenspeed_kernel.numerics.reference.moe as _moe_reference
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.deep_gemm
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
@@ -41,12 +42,12 @@ import tokenspeed_kernel.ops.moe as _moe_pkg
 import tokenspeed_kernel.ops.moe.cuda
 import tokenspeed_kernel.ops.moe.deepep
 import tokenspeed_kernel.ops.moe.flashinfer
-import tokenspeed_kernel.ops.moe.reference
 import tokenspeed_kernel.ops.moe.triton
 import tokenspeed_kernel.ops.moe.triton_kernels
 import torch
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import FormatSignature
 
 # -- Pre-import so they can be reloaded into the fresh registry. --
 
@@ -57,7 +58,7 @@ from tokenspeed_kernel.selection import select_kernel
 
 _RELOAD_MODULES = [
     # MoE
-    tokenspeed_kernel.ops.moe.reference,
+    _moe_reference,
     tokenspeed_kernel.ops.moe.cuda,
     tokenspeed_kernel.ops.moe.triton,
     tokenspeed_kernel.ops.moe.triton_kernels,
@@ -143,8 +144,10 @@ def _extract_features(node: ast.AST) -> Optional[set[str]]:
     return None
 
 
-# A ``CallSite`` tuple: (family, mode, dtype|None, features|None, traits, expected_name, location)
-CallSite = tuple[str, str, Optional[torch.dtype], Optional[set], dict, str, str]
+# A ``CallSite`` tuple: (family, mode, dtype|None, features|None, traits, weight_format, expected_name, location)
+CallSite = tuple[
+    str, str, Optional[torch.dtype], Optional[set], dict, Optional[str], str, str
+]
 
 
 def _collect_call_sites(search_dir: Path) -> list[CallSite]:
@@ -204,9 +207,6 @@ def _collect_call_sites(search_dir: Path) -> list[CallSite]:
                 features = _extract_features(feat_node)
 
             # -- traits --
-            # For moe_* the traits come from the ``traits=`` kwarg.
-            # For mm() there is no ``traits=`` kwarg; instead ``quant=``
-            # is the key selection-relevant parameter.
             traits: dict[str, Any] = {}
             traits_node = kwargs.get("traits")
             if traits_node is not None:
@@ -214,18 +214,29 @@ def _collect_call_sites(search_dir: Path) -> list[CallSite]:
                 if parsed is not None:
                     traits = parsed
 
-            if family == "gemm":
-                quant_node = kwargs.get("quant")
-                if quant_node is not None:
-                    qval, qok = _try_literal(quant_node)
-                    if qok and isinstance(qval, str):
-                        traits["quant"] = qval
+            weight_format: Optional[str] = None
+            weight_format_node = kwargs.get("weight_format")
+            if weight_format_node is not None:
+                value, ok = _try_literal(weight_format_node)
+                if ok and isinstance(value, str):
+                    weight_format = value
 
             lineno = getattr(node, "lineno", 0)
             rel = py_path.relative_to(search_dir.parent.parent.parent)
             location = f"{rel}:{lineno}"
 
-            sites.append((family, mode, dtype, features, traits, expected, location))
+            sites.append(
+                (
+                    family,
+                    mode,
+                    dtype,
+                    features,
+                    traits,
+                    weight_format,
+                    expected,
+                    location,
+                )
+            )
 
     return sites
 
@@ -251,6 +262,7 @@ _MANUAL_CALL_SITES: list[CallSite] = [
         torch.bfloat16,
         {"dispatch_sorted"},
         {},
+        None,
         "triton_moe_fused_experts",
         "manual:triton_common/experts",
     ),
@@ -261,6 +273,7 @@ _MANUAL_CALL_SITES: list[CallSite] = [
         torch.bfloat16,
         None,
         {"num_tokens": 128, "comm_strategy": None},
+        None,
         "triton_moe_sum_reduce",
         "manual:triton_common/combine_large",
     ),
@@ -270,6 +283,7 @@ _MANUAL_CALL_SITES: list[CallSite] = [
         torch.bfloat16,
         None,
         {"num_tokens": 8, "comm_strategy": None},
+        None,
         "torch_compile_moe_sum_reduce",
         "manual:triton_common/combine_small",
     ),
@@ -288,25 +302,59 @@ _DTYPE_PREFERENCE = [
 ]
 
 
-def _infer_dtype(expected_name: str) -> torch.dtype:
-    """Pick a compatible dtype from the kernel's registered spec.
+def _all_storage_dtypes(spec) -> frozenset[torch.dtype]:
+    return frozenset(
+        tensor_format.storage_dtype
+        for signature in spec.format_signatures
+        for _role, tensor_format in signature.roles
+    )
 
-    Prefers common dtypes over exotic ones (e.g. ``float4_e2m1fn_x2``)
-    to avoid hitting platform capability gaps in tests.
-    """
+
+def _format_signature_for_any_role(spec, dtype: torch.dtype) -> FormatSignature | None:
+    matches = tuple(
+        signature
+        for signature in sorted(spec.format_signatures, key=str)
+        if any(
+            tensor_format.storage_dtype == dtype
+            for _role, tensor_format in signature.roles
+        )
+    )
+    if len(matches) > 1:
+        pytest.skip(f"Kernel {spec.name!r} has multiple signatures for {dtype}")
+    return matches[0] if matches else None
+
+
+def _infer_dtype(expected_name: str) -> torch.dtype:
     spec = KernelRegistry.get().get_by_name(expected_name)
-    if spec is not None and spec.dtypes:
+    if spec is not None:
+        storage_dtypes = _all_storage_dtypes(spec)
         for dt in _DTYPE_PREFERENCE:
-            if dt in spec.dtypes:
+            if dt in storage_dtypes:
                 return dt
-        return next(iter(spec.dtypes))
+        if storage_dtypes:
+            return next(iter(storage_dtypes))
     return torch.bfloat16
+
+
+def _infer_format_signature(
+    family: str,
+    mode: str,
+    dtype: torch.dtype,
+    weight_format: Optional[str],
+    spec,
+) -> FormatSignature:
+    if family == "moe" and mode == "fused":
+        return _moe_pkg._moe_fused_format_signature(dtype, weight_format or "bf16")
+    signature = _format_signature_for_any_role(spec, dtype)
+    if signature is None:
+        pytest.skip(f"Kernel {spec.name!r} has no signature for {dtype}")
+    return signature
 
 
 def _site_id(site: CallSite) -> str:
     """Generate a readable test-id from a call-site tuple."""
-    expected = site[5]
-    location = site[6]
+    expected = site[6]
+    location = site[7]
     return f"{expected}@{location}"
 
 
@@ -322,11 +370,15 @@ def _site_id(site: CallSite) -> str:
 )
 @pytest.mark.parametrize(
     "platform_name",
-    ["h100_platform", "b200_platform"],
+    [
+        "h100_platform",
+        "b200_platform",
+        "mi350_platform",
+    ],
 )
 def test_kernel_selection(site, platform_name, request):
     platform = request.getfixturevalue(platform_name)
-    family, mode, raw_dtype, features, traits, expected, location = site
+    family, mode, raw_dtype, features, traits, weight_format, expected, location = site
 
     reg = KernelRegistry.get()
     spec = reg.get_by_name(expected)
@@ -339,11 +391,12 @@ def test_kernel_selection(site, platform_name, request):
         )
 
     dtype = raw_dtype or _infer_dtype(expected)
+    signature = _infer_format_signature(family, mode, dtype, weight_format, spec)
 
     result = select_kernel(
         family,
         mode,
-        dtype,
+        signature,
         features=frozenset(features) if features else None,
         traits=traits,
         platform=platform,
@@ -351,5 +404,5 @@ def test_kernel_selection(site, platform_name, request):
     assert result.name == expected, (
         f"Expected '{expected}' but got '{result.name}' "
         f"at {location} on {platform.device_name} "
-        f"for {family}.{mode}(dtype={dtype}, features={features}, traits={traits})"
+        f"for {family}.{mode}(signature={signature}, features={features}, traits={traits})"
     )

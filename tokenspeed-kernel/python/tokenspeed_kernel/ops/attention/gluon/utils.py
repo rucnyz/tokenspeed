@@ -18,16 +18,32 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
+from __future__ import annotations
 
-with redirect_triton_to_tokenspeed_triton():
-    import triton_kernels  # noqa: F401
-    import triton_kernels.matmul  # noqa: F401
-    import triton_kernels.matmul_details  # noqa: F401
-    import triton_kernels.matmul_details.opt_flags  # noqa: F401
-    import triton_kernels.numerics  # noqa: F401
-    import triton_kernels.swiglu  # noqa: F401
-    import triton_kernels.tensor  # noqa: F401
-    import triton_kernels.tensor_details  # noqa: F401
-    import triton_kernels.tensor_details.layout  # noqa: F401
-    import triton_kernels.topk  # noqa: F401
+from tokenspeed_kernel._triton import gl, gluon, tl
+
+_INV_LN2_VALUE = 1.4426950408889634
+_INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
+
+
+@gluon.jit
+def maximum(a, b, propagate_nan: gl.constexpr = tl.PropagateNan.ALL):
+    return gl.maximum(a, b, propagate_nan=propagate_nan)
+
+
+@gluon.jit
+def max(input, axis=None, keep_dims=False):
+    return gl.reduce(input, axis, maximum, keep_dims=keep_dims)
+
+
+@gluon.aggregate
+class InputStrides:
+    stride_t: gl.constexpr
+    stride_h: gl.constexpr
+    stride_d: gl.constexpr
+
+    @gluon.jit
+    def offsets(self, token, head, dim):
+        return (token * self.stride_t + head * self.stride_h + dim * self.stride_d).to(
+            gl.int32
+        )

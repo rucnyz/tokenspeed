@@ -14,27 +14,19 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-
-"""Triton FP8 quantize / cast kernel.
-
-Drop-in replacement for ``x.to(torch.float8_e4m3fn)`` (or ``e5m2``) with
-optional per-tensor scale. Designed for the per-layer cast call sites in MLA
-prefill (deepseek_v3.py:1001/1005), where torch's default cast under-saturates
-HBM and the existing ``static_quant_fp8`` kernel is even slower because of its
-contiguous-input requirement and one-row-per-program tiling.
-"""
-
 from typing import Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 
 @triton.jit
 def _fp8_quantize_kernel(
     x_ptr,
     out_ptr,
-    scale_inv,
+    scale,
     M,
     N,
     x_row_stride,
@@ -43,6 +35,8 @@ def _fp8_quantize_kernel(
     EVEN_N: tl.constexpr,
     FP8_DTYPE: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+    HAS_SCALE_TENSOR: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -63,7 +57,12 @@ def _fp8_quantize_kernel(
     x_off = m_idx[:, None] * x_row_stride + n_idx[None, :]
     x = tl.load(x_ptr + x_off, mask=load_mask)
 
-    x_fp8 = (x.to(tl.float32) * scale_inv).to(FP8_DTYPE)
+    x = x.to(tl.float32)
+    if HAS_SCALE:
+        if HAS_SCALE_TENSOR:
+            scale = tl.load(scale)
+        x = x * (1.0 / scale)
+    x_fp8 = x.to(FP8_DTYPE)
 
     out_off = m_idx[:, None] * out_row_stride + n_idx[None, :]
     tl.store(out_ptr + out_off, x_fp8, mask=load_mask)
@@ -102,22 +101,22 @@ def _flatten_to_2d(x: torch.Tensor):
 
 def fp8_quantize(
     x: torch.Tensor,
-    scale_inv: float = 1.0,
+    scale: float | torch.Tensor | None = None,
     out: Optional[torch.Tensor] = None,
     fp8_dtype: torch.dtype = torch.float8_e4m3fn,
     enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Cast a BF16/FP16 tensor to FP8 with an optional per-tensor scale.
 
-    Computes ``out = saturate((x * scale_inv) -> fp8)`` element-wise. When
-    ``scale_inv == 1.0`` the multiply is dropped at compile time (pure cast).
+    Computes ``out = saturate((x / scale) -> fp8)`` element-wise when scale is
+    provided. When scale is omitted, this is a pure FP8 cast.
 
     Args:
         x: BF16 or FP16 tensor. Must have stride(-1) == 1; leading dims must
            pack uniformly onto the row stride (true for contiguous tensors and
            for last-dim slice views like ``kv[..., qk_nope:]``).
-        scale_inv: scalar multiplier applied before the cast (i.e. ``1/scale``).
-           Passed as a plain kernel arg — no GMEM load.
+        scale: optional scalar divisor applied before the cast. Python values
+           are passed as plain kernel args; scalar tensors are loaded on device.
         out: optional pre-allocated FP8 output. Same shape as ``x``. If not
            provided, allocated as contiguous.
         fp8_dtype: ``torch.float8_e4m3fn`` (default), ``torch.float8_e5m2`` or
@@ -137,6 +136,11 @@ def fp8_quantize(
         torch.float8_e5m2,
         torch.float8_e4m3fnuz,
     ), f"fp8_quantize unsupported fp8 dtype: {fp8_dtype}"
+    has_scale = scale is not None
+    has_scale_tensor = isinstance(scale, torch.Tensor)
+    if has_scale_tensor:
+        assert scale.numel() == 1, "scale tensor must be scalar"
+        scale = scale.contiguous()
 
     M, N, x_row_stride = _flatten_to_2d(x)
 
@@ -181,7 +185,7 @@ def fp8_quantize(
     _fp8_quantize_kernel[grid](
         x,
         out,
-        scale_inv,
+        1.0 if scale is None else scale,
         M,
         N,
         x_row_stride,
@@ -190,9 +194,33 @@ def fp8_quantize(
         EVEN_N=even_n,
         FP8_DTYPE=fp8_dtype_const,
         BLOCK_M=block_m,
+        HAS_SCALE=has_scale,
+        HAS_SCALE_TENSOR=has_scale_tensor,
         ENABLE_PDL=enable_pdl,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kwargs,
     )
     return out
+
+
+@register_kernel(
+    "quantization",
+    "fp8",
+    name="triton_quantize_fp8",
+    solution="triton",
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={"has_scale": frozenset({True, False})},
+    priority=Priority.PORTABLE,
+)
+def triton_quantize_fp8(
+    x: torch.Tensor,
+    scale: float | torch.Tensor | None = None,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    return fp8_quantize(x, scale=scale, enable_pdl=enable_pdl)
+
+
+__all__ = [
+    "fp8_quantize",
+]

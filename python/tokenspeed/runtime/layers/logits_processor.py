@@ -73,6 +73,7 @@ class LogitsProcessorOutput:
 class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+    gather_ids: torch.Tensor | None = None
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -104,10 +105,6 @@ class LogitsMetadata:
     global_num_tokens_for_logprob_cpu: torch.Tensor | None = None
     global_num_tokens_for_logprob_gpu: torch.Tensor | None = None
 
-    # for padding
-    padded_static_len: int = -1
-    last_index_offsets: torch.Tensor | None = None
-
     @classmethod
     def from_forward_context(
         cls,
@@ -117,9 +114,8 @@ class LogitsMetadata:
         return cls(
             forward_mode=ctx.forward_mode,
             capture_hidden_mode=ctx.capture_hidden_mode,
+            gather_ids=ctx.gather_ids,
             extend_seq_lens=input_lengths,
-            padded_static_len=ctx.padded_static_len,
-            last_index_offsets=ctx.last_index_offsets,
         )
 
 
@@ -212,32 +208,19 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: torch.Tensor | None = None,
     ) -> LogitsProcessorOutput:
         # Get the last hidden states and last logits for the next token prediction
-        if (
-            logits_metadata.forward_mode.is_decode_or_idle()
-            or logits_metadata.forward_mode.is_target_verify()
-        ):
-            pruned_states = hidden_states
-            if aux_hidden_states is not None:
-                aux_pruned_states = [hidden for hidden in aux_hidden_states]
-            sample_indices = None
-            input_logprob_indices = None
-        elif (
-            logits_metadata.forward_mode.is_extend()
-            and not logits_metadata.extend_return_logprob
-        ):
-            # Prefill without input logprobs.
-            if logits_metadata.padded_static_len < 0:
-                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+        if not logits_metadata.extend_return_logprob:
+            gather_ids = logits_metadata.gather_ids
+            # Shapes align iff midlayer already pruned to one row per request
+            # (draft first-step reduce). Other paths emit [N, H] with N > bs.
+            if gather_ids is None or gather_ids.shape[0] == hidden_states.shape[0]:
+                pruned_states = hidden_states
+                if aux_hidden_states is not None:
+                    aux_pruned_states = list(aux_hidden_states)
             else:
-                # If padding_static length is 5 and extended_seq_lens is [2, 3],
-                # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
-                # and this retrieves t01 and t12, which are the valid last tokens
-                last_index = (
-                    logits_metadata.last_index_offsets + logits_metadata.extend_seq_lens
-                )
-            pruned_states = hidden_states[last_index]
-            if aux_hidden_states is not None:
-                aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
+                pruned_states = hidden_states[gather_ids]
+                if aux_hidden_states is not None:
+                    aux_pruned_states = [h[gather_ids] for h in aux_hidden_states]
+
             sample_indices = None
             input_logprob_indices = None
         else:
@@ -430,7 +413,7 @@ class LogitsProcessor(nn.Module):
                 .view(logits.size(0), -1)
             )
 
-        logits = logits[:, : self.config.vocab_size].float()
+        logits = logits[:, : self.config.vocab_size].contiguous()
 
         if self.final_logit_softcapping:
             fused_softcap_generic(logits, self.final_logit_softcapping)
@@ -499,6 +482,7 @@ class LogitsProcessor(nn.Module):
         Returns:
             torch.Tensor: logprobs from logits
         """
+        last_logits = last_logits.float()
         # Scale logits if temperature scaling is enabled
         if logits_metadata.temp_scaled_logprobs:
             last_logits = last_logits / logits_metadata.temperature
@@ -532,14 +516,13 @@ def fused_softcap_kernel(
     mask = offsets < n_elements
 
     # Load values
-    x = tl.load(full_logits_ptr + offsets, mask=mask)
+    x = tl.load(full_logits_ptr + offsets, mask=mask).to(tl.float32)
 
     # Perform operations in-place
     x = x / softcapping_value
 
-    # Manual tanh implementation using exp
-    exp2x = tl.exp(2 * x)
-    x = (exp2x - 1) / (exp2x + 1)
+    # Stable tanh form; the exp ratio overflows to inf/inf for large logits.
+    x = 2 * tl.sigmoid(2 * x) - 1
 
     x = x * softcapping_value
 

@@ -50,7 +50,8 @@ class ForwardContext:
     forward_mode: ForwardMode | None
     req_to_page: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
-    padded_static_len: int = -1
+    # Spec decode draft head's first step prunes to one live row per request.
+    draft_first_step_reduce: bool = False
 
     # --- dp attention ---
     global_num_tokens: list[int] | None = None
@@ -58,5 +59,4 @@ class ForwardContext:
     all_decode_or_idle: bool = False
 
     # --- logits processor ---
-    keep_full_logits: bool = False
-    last_index_offsets: torch.Tensor | None = None
+    gather_ids: torch.Tensor | None = None

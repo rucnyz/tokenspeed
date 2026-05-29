@@ -24,11 +24,23 @@ from __future__ import annotations
 import os
 from typing import Any
 
-import tokenspeed_kernel.thirdparty.triton_kernels  # noqa: F401  (side effect)
 import torch
-from tokenspeed_kernel._triton import tl, triton  # noqa: F401  (kept for parity)
+from tokenspeed_kernel._triton import (  # noqa: F401  (kept for parity)
+    redirect_triton_to_tokenspeed_triton,
+    tl,
+    triton,
+)
+
+# Trigger the redirect that aliases ``triton`` -> ``tokenspeed_triton`` for
+# upstream ``triton_kernels`` imports below. This must run before any
+# ``triton_kernels.*`` imports.
+with redirect_triton_to_tokenspeed_triton():
+    import triton_kernels.matmul  # noqa: F401
+    import triton_kernels.tensor  # noqa: F401
+
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_triton.experimental import gluon
 from tokenspeed_triton.experimental.gluon import language as gl
 from tokenspeed_triton.language.core import _aggregate as aggregate
@@ -4633,7 +4645,9 @@ def _kernel_priority() -> int:
 
 _common = dict(
     solution="triton",
-    dtypes={torch.bfloat16, torch.float16, torch.uint8},
+    signatures=format_signatures(
+        "x", "dense", {torch.bfloat16, torch.float16, torch.uint8}
+    ),
     capability=CapabilityRequirement(
         vendors=frozenset({"amd"}),
         min_arch_version=ArchVersion(9, 5),

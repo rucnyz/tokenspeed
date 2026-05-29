@@ -29,6 +29,7 @@ Uses CuTe DSL JIT-compiled kernels for MLA decode and prefill on Blackwell SM100
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -100,6 +101,7 @@ class CuteDSLMLAPrefillMetadata:
 
 @dataclass
 class CuteDSLMLADecodeMetadata:
+    num_extends: int = 0
     block_kv_indices: torch.Tensor | None = None
     max_seq_len_k: int | None = None
     seq_lens_k: torch.Tensor | None = None
@@ -213,7 +215,7 @@ class CuteDSLMLABackend(AttentionBackend):
     def init_forward_metadata(
         self,
         bs: int,
-        num_tokens: int,
+        num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -222,47 +224,62 @@ class CuteDSLMLABackend(AttentionBackend):
         spec_info=None,
         **kwargs,
     ):
-        if (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
-        ):
-            self._init_decode_metadata(
-                bs, req_pool_indices, seq_lens, forward_mode, req_to_page, spec_info
-            )
-        else:
+        if forward_mode.is_extend_or_mixed():
             self._init_prefill_metadata(
-                seq_lens,
-                req_pool_indices=req_pool_indices,
+                seq_lens[:num_extends],
+                req_pool_indices=req_pool_indices[:num_extends],
                 req_to_page=req_to_page,
                 extend_prefix_lens=kwargs.pop("extend_prefix_lens"),
                 extend_prefix_lens_cpu=kwargs.pop("extend_prefix_lens_cpu"),
                 extend_seq_lens=kwargs.pop("extend_seq_lens"),
                 extend_seq_lens_cpu=kwargs.pop("extend_seq_lens_cpu"),
             )
+        # Drafter steps 1..N are pure DECODE on full bs regardless of target
+        # mode, so under is_draft we also fill decode_metadata under EXTEND
+        # so the multi-step loop has metadata. The wrapper pre-writes
+        # draft_seq_lens before calling here so `seq_lens` aliases the
+        # drafter's live buffer.
+        if (
+            forward_mode.is_decode()
+            or forward_mode.is_mixed()
+            or (forward_mode.is_extend() and self.is_draft)
+        ):
+            self._init_decode_metadata(
+                bs,
+                num_extends,
+                req_pool_indices,
+                seq_lens,
+                req_to_page,
+            )
+
+    @contextmanager
+    def override_num_extends(self, num_extends: int):
+        assert self.forward_decode_metadata is not None
+        prev = self.forward_decode_metadata.num_extends
+        self.forward_decode_metadata.num_extends = num_extends
+        try:
+            yield
+        finally:
+            self.forward_decode_metadata.num_extends = prev
 
     def _init_decode_metadata(
         self,
         bs: int,
+        num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
         req_to_page: torch.Tensor,
-        spec_info=None,
     ):
         max_blocks = self._calc_padded_blocks(self.max_context_len)
-
         block_kv_indices = self._create_block_kv_indices(
             bs, max_blocks, req_pool_indices, seq_lens, req_to_page
         )
 
-        assert (
-            seq_lens.dtype == torch.int32
-        ), f"seq_lens must be int32, got {seq_lens.dtype}"
         self.forward_decode_metadata = CuteDSLMLADecodeMetadata(
             block_kv_indices=block_kv_indices,
             max_seq_len_k=self.max_context_len,
             seq_lens_k=seq_lens,
+            num_extends=num_extends,
         )
 
     def _init_prefill_metadata(
@@ -348,29 +365,24 @@ class CuteDSLMLABackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
     ):
-        if (
-            not forward_mode.is_decode_or_idle()
-            and not forward_mode.is_target_verify()
-            and not forward_mode.is_draft_extend()
-        ):
+        if forward_mode.is_extend_or_mixed():
             raise NotImplementedError(
                 f"tokenspeed_mla CUDA graph capture not supported for {forward_mode}"
             )
 
-        metadata = CuteDSLMLADecodeMetadata()
         max_blocks = self._calc_padded_blocks(self.max_context_len)
         block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks]
 
-        metadata.block_kv_indices = block_kv_indices
-        metadata.max_seq_len_k = self.max_context_len
-        # seq_lens_k aliases seq_lens_buf (set in init_cuda_graph_state).
-        metadata.seq_lens_k = self.cuda_graph_seq_lens_buf[:bs]
-
+        metadata = CuteDSLMLADecodeMetadata(
+            block_kv_indices=block_kv_indices,
+            max_seq_len_k=self.max_context_len,
+            seq_lens_k=self.cuda_graph_seq_lens_buf[:bs],
+            num_extends=0,
+        )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -383,11 +395,7 @@ class CuteDSLMLABackend(AttentionBackend):
         req_to_page: torch.Tensor = None,
         **kwargs,
     ):
-        if forward_mode is not None and (
-            not forward_mode.is_decode_or_idle()
-            and not forward_mode.is_target_verify()
-            and not forward_mode.is_draft_extend()
-        ):
+        if forward_mode is not None and forward_mode.is_extend_or_mixed():
             raise NotImplementedError(
                 f"tokenspeed_mla CUDA graph replay not supported for {forward_mode}"
             )
@@ -420,6 +428,7 @@ class CuteDSLMLABackend(AttentionBackend):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
+        bs: int,
         save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
@@ -433,8 +442,10 @@ class CuteDSLMLABackend(AttentionBackend):
                 k[..., self.kv_lora_rank :],
             )
 
-        # Prepare query: [T, 1, H, head_dim]
-        query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
+        metadata = self.forward_decode_metadata
+        num_extends = metadata.num_extends
+        q_len_per_req = q.shape[0] // bs
+        query = q.view(bs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)
 
         softmax_scale = layer.scaling
         if self.data_type == torch.float8_e4m3fn:
@@ -451,8 +462,6 @@ class CuteDSLMLABackend(AttentionBackend):
         if self.data_type != k_cache.dtype:
             k_cache = k_cache.to(self.data_type)
         kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim)
-
-        metadata = self.forward_decode_metadata
 
         if not CuteDSLMLABackend._logged_decode:
             logger.info(
@@ -472,8 +481,8 @@ class CuteDSLMLABackend(AttentionBackend):
             workspace_buffer=self.cutedsl_workspace,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=metadata.block_kv_indices,
-            seq_lens=metadata.seq_lens_k,
+            block_tables=metadata.block_kv_indices[num_extends:],
+            seq_lens=metadata.seq_lens_k[num_extends:],
             max_seq_len=metadata.max_seq_len_k,
             softmax_scale=softmax_scale,
             enable_pdl=pdl_enabled(),
@@ -482,55 +491,6 @@ class CuteDSLMLABackend(AttentionBackend):
         return raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     # ---- Forward: Extend/Prefill ----
-
-    def forward_extend(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: PagedAttention,
-        out_cache_loc: torch.Tensor,
-        token_to_kv_pool,
-        save_kv_cache: bool = True,
-        forward_mode: ForwardMode = None,
-        **kwargs,
-    ):
-        if forward_mode is not None and forward_mode.is_target_verify():
-            return self._forward_target_verify(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                save_kv_cache,
-            )
-
-        # draft_extend: few tokens per request. Route through _forward_target_verify
-        # so q is reshaped as [bs, num_draft_tokens, H, D] to match page_table batch
-        # dim; forward_decode's `.unsqueeze(1)` path assumes a single token per row
-        # and breaks the tokenspeed_mla_decode shape-consistency check.
-        if forward_mode is not None and forward_mode.is_draft_extend():
-            return self._forward_target_verify(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                save_kv_cache,
-            )
-
-        # Regular prefill: use CuteDSL FMHA kernel
-        return self._forward_cutedsl_prefill(
-            q,
-            k,
-            v,
-            layer,
-            out_cache_loc,
-            token_to_kv_pool,
-            save_kv_cache,
-        )
 
     def forward_extend_chunked(
         self,
@@ -547,6 +507,7 @@ class CuteDSLMLABackend(AttentionBackend):
         seq_lens,
         batch_size,
         causal,
+        out: torch.Tensor | None = None,
     ):
         if causal:
             step_counter = getattr(self, "step_counter", None)
@@ -564,6 +525,10 @@ class CuteDSLMLABackend(AttentionBackend):
             k = k.to(torch.float8_e4m3fn)
             v = v.to(torch.float8_e4m3fn)
 
+        if not CuteDSLMLABackend._logged_prefill:
+            logger.info("CuteDSL MLA prefill kernel invoked (tokenspeed_mla_prefill)")
+            CuteDSLMLABackend._logged_prefill = True
+
         result = tokenspeed_mla_prefill(
             query=q,
             key=k,
@@ -578,6 +543,7 @@ class CuteDSLMLABackend(AttentionBackend):
             cum_seq_lens_q=cum_seq_lens_q,
             max_seq_len_q=max_q_len,
             enable_pdl=pdl_enabled(),
+            out=out,
         )
 
         if isinstance(result, tuple):
@@ -589,118 +555,6 @@ class CuteDSLMLABackend(AttentionBackend):
             out = out.to(self.q_data_type)
 
         return out, lse
-
-    def _forward_target_verify(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: PagedAttention,
-        out_cache_loc: torch.Tensor,
-        token_to_kv_pool,
-        save_kv_cache: bool = True,
-    ) -> torch.Tensor:
-        """Handle target_verify: multi-token query against paged KV (context + draft)."""
-        # q is whole Q [T, H, head_dim]; k is whole latent [T, 1, head_dim].
-        if save_kv_cache:
-            assert k is not None
-            token_to_kv_pool.set_mla_kv_buffer(
-                layer,
-                out_cache_loc,
-                k[..., : self.kv_lora_rank],
-                k[..., self.kv_lora_rank :],
-            )
-
-        bs = self.forward_decode_metadata.seq_lens_k.shape[0]
-        query = q.to(self.data_type).view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-
-        # KV cache: 3D for CuteDSL
-        k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
-        if self.data_type != k_cache.dtype:
-            k_cache = k_cache.to(self.data_type)
-        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim)
-
-        if self.data_type == torch.float8_e4m3fn:
-            k_scale = (
-                layer.k_scale_float
-                if getattr(layer, "k_scale_float", None) is not None
-                else 1.0
-            )
-        else:
-            k_scale = 1.0
-        softmax_scale = k_scale * layer.scaling
-
-        metadata = self.forward_decode_metadata
-        max_seq_len = metadata.max_seq_len_k
-
-        self.cutedsl_workspace = get_cutedsl_workspace_buffer(
-            query.device, layer.tp_q_head_num, self.kv_lora_rank, query.shape[1]
-        )
-
-        raw_out = tokenspeed_mla_decode(
-            query=query,
-            kv_cache=kv_cache,
-            workspace_buffer=self.cutedsl_workspace,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=metadata.block_kv_indices,
-            seq_lens=metadata.seq_lens_k,
-            max_seq_len=max_seq_len,
-            softmax_scale=softmax_scale,
-            enable_pdl=pdl_enabled(),
-        )
-
-        return raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-    def _forward_cutedsl_prefill(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: PagedAttention,
-        out_cache_loc: torch.Tensor,
-        token_to_kv_pool,
-        save_kv_cache: bool = True,
-    ):
-        """MLA prefill using CuteDSL FMHA kernel.
-
-        q is whole Q [T, H, head_dim]; k is whole latent [T, 1, head_dim].
-        Currently unreachable (the live non-absorb prefill path goes through
-        `forward_normal_chunked_kv_core` → `forward_extend_chunked`, not this
-        entry point), but the KV write uses the MLA-correct API so it stays honest.
-        """
-        if not CuteDSLMLABackend._logged_prefill:
-            logger.info("CuteDSL MLA prefill kernel invoked (tokenspeed_mla_prefill)")
-            CuteDSLMLABackend._logged_prefill = True
-
-        if save_kv_cache:
-            token_to_kv_pool.set_mla_kv_buffer(
-                layer,
-                out_cache_loc,
-                k[..., : self.kv_lora_rank],
-                k[..., self.kv_lora_rank :],
-            )
-
-        q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-        k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
-        v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
-
-        metadata = self.forward_prefill_metadata
-
-        out = tokenspeed_mla_prefill(
-            query=q,
-            key=k,
-            value=v,
-            seq_lens=metadata.seq_lens,
-            cum_seq_lens=metadata.cum_seq_lens,
-            max_seq_len=metadata.max_seq_len,
-            batch_size=metadata.seq_lens.shape[0],
-            softmax_scale=layer.scaling,
-            is_causal=True,
-            enable_pdl=pdl_enabled(),
-        )
-
-        return out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
 register_backend("tokenspeed_mla", {AttentionArch.MLA}, CuteDSLMLABackend)

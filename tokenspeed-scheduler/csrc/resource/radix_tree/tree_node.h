@@ -21,6 +21,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +33,7 @@
 #include <vector>
 
 #include "resource/radix_tree/mamba_slot.h"
+#include "resource/radix_tree/paged_cache_snapshot.h"
 #include "resource/radix_tree/tree_resource.h"
 #include "resource/types.h"
 
@@ -52,6 +54,11 @@ class TreeNode {
 public:
     using children_map_t = std::unordered_map<token_vec_t, std::unique_ptr<TreeNode>, TokenVecHash>;
     using timestamp_t = std::chrono::steady_clock::time_point;
+    // Monotonically increasing identifier assigned at construction. Used as a
+    // deterministic tiebreaker in eviction orderings whose primary key (Time())
+    // can repeat. Pointer values are not usable as a tiebreaker because they
+    // are randomized per-process and would diverge across TP ranks.
+    using seq_id_t = std::int64_t;
 
     explicit TreeNode(token_vec_t tokens = {}, timestamp_t access_time = std::chrono::steady_clock::now());
     ~TreeNode() = default;
@@ -76,6 +83,7 @@ public:
     const std::size_t NumChildren() const { return children_.size(); }
     const children_map_t& Children() const { return children_; }
     timestamp_t Time() const { return last_access_time_; }
+    seq_id_t SeqId() const { return seq_id_; }
 
     template <ResourceType RType>
     void AttachResource(std::unique_ptr<NodeResource<RType>>&& resource) {
@@ -102,9 +110,18 @@ public:
     const HostResource& Host() const { return *host_resource_; }
 
     bool HasMamba() const { return mamba_slot_ != nullptr; }
+    bool HasMambaOnHost() const { return mamba_host_slot_ != nullptr; }
     std::int32_t MambaSlotIndex() const;
+    std::int32_t MambaHostSlotIndex() const;
     void AttachMamba(std::unique_ptr<MambaSlot> slot) { mamba_slot_ = std::move(slot); }
+    void AttachMambaHost(std::unique_ptr<MambaSlot> slot) { mamba_host_slot_ = std::move(slot); }
     std::unique_ptr<MambaSlot> DetachMamba() { return std::move(mamba_slot_); }
+    std::unique_ptr<MambaSlot> DetachMambaHost() { return std::move(mamba_host_slot_); }
+
+    // Paged-cache snapshot adjunct. Completeness is now per-family on the
+    // snapshot itself (see `PagedCacheSnapshot::IsCompleteFor`).
+    bool HasPagedCacheSnapshot() const { return paged_cache_snapshot_ != nullptr; }
+    const PagedCacheSnapshot* GetPagedCacheSnapshot() const { return paged_cache_snapshot_.get(); }
 
     std::optional<cache_op_id> CacheOpId() const;
 
@@ -118,6 +135,14 @@ public:
     void SplitSelfInto(TreeNode& prefix, std::size_t prefix_pages, std::int32_t page_size);
 
 private:
+    // Private so all attach/detach routes through HybridPrefixCache and keeps
+    // its `paged_cache_snapshot_nodes_` membership set in sync.
+    friend class HybridPrefixCache;
+    void AttachPagedCacheSnapshot(std::unique_ptr<PagedCacheSnapshot> snapshot);
+    std::unique_ptr<PagedCacheSnapshot> DetachPagedCacheSnapshot();
+    PagedCacheSnapshot* GetPagedCacheSnapshotMut() { return paged_cache_snapshot_.get(); }
+
+private:
     TreeNode* parent_{};
     children_map_t children_{};
     token_vec_t tokens_{};
@@ -125,10 +150,15 @@ private:
     std::vector<std::string> page_hashes_{};
     std::vector<std::uint64_t> block_hashes_{};
     timestamp_t last_access_time_{std::chrono::steady_clock::now()};
+    seq_id_t seq_id_{};
     bool storage_persisted_{false};
     std::unique_ptr<DeviceResource> device_resource_{};
     std::unique_ptr<HostResource> host_resource_{};
     std::unique_ptr<MambaSlot> mamba_slot_{};
+    std::unique_ptr<MambaSlot> mamba_host_slot_{};
+    std::unique_ptr<PagedCacheSnapshot> paged_cache_snapshot_{};
+
+    static std::atomic<seq_id_t> next_seq_id_;
 };
 
 template <ResourceType RType>
