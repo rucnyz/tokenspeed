@@ -225,7 +225,7 @@ class Mxfp4Fp8TritonKernelBackend(Mxfp4TritonKernelBackend):
                 lhs_data=InFlexData(dtype=fp8_dtype, scale=w13_in_scale),
                 rhs_data=w13_flex,
             ),
-            w_mx_scale=w13_scale,
+            b_mx_scale=w13_scale,
             b_microblock_size=MXFP_BLOCK_SIZE,
             out_dtype=out_dtype,
         )
@@ -234,7 +234,7 @@ class Mxfp4Fp8TritonKernelBackend(Mxfp4TritonKernelBackend):
                 lhs_data=InFlexData(dtype=fp8_dtype, scale=w2_in_scale),
                 rhs_data=w2_flex,
             ),
-            w_mx_scale=w2_scale,
+            b_mx_scale=w2_scale,
             b_microblock_size=MXFP_BLOCK_SIZE,
             out_dtype=out_dtype,
         )

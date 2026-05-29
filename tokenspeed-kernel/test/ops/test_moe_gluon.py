@@ -669,7 +669,7 @@ def test_dispatch_mxfp_forwards_out_quant_scale_to_swiglu():
     a_scale = torch.tensor([0.7], dtype=torch.float32, device=device)
     pc = PrecisionConfig(
         flex_ctx=FlexCtx(lhs_data=InFlexData(dtype=torch.float8_e4m3fn, scale=a_scale)),
-        w_mx_scale=w_scale,
+        b_mx_scale=w_scale,
         b_microblock_size=32,
         out_dtype=torch.bfloat16,
     )
