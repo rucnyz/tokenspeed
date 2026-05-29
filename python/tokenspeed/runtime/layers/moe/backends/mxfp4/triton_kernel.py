@@ -55,12 +55,6 @@ _is_blackwell = current_platform().is_blackwell
 _is_hopper = current_platform().is_hopper
 _is_amd = current_platform().is_amd
 
-# BLOCK_N used by the gluon dispatch+combine kernel. The combine GEMM's W and
-# its e8m0 W-scale must be padded to a multiple of this along the N axis so
-# that ``shuffle_weight_for_gluon_dot_layout`` (W_VIA_VGPR) can drop the
-# n-mask. Trim back to the logical N in the high-level launcher.
-_GLUON_COMBINE_BLOCK_N = 128
-
 
 def swizzle_mxfp4(quant_tensor, scale, num_warps):
     """Weight swizzle for mxfp4 MoE, used for OAI mxfp4 kernel."""
@@ -100,14 +94,6 @@ def swizzle_mxfp4(quant_tensor, scale, num_warps):
 
 
 def _pad_w2_to_block_n(layer: nn.Module, block_n: int) -> None:
-    """Pad ``w2_weight`` and ``w2_weight_scale`` so the N axis is a multiple
-    of ``block_n``.
-
-    The gluon dispatch+combine kernel's ``W_VIA_VGPR`` path drops the n-mask
-    and therefore requires N to be ``block_n``-aligned. The original logical
-    N is stamped on ``layer._w2_logical_n`` so the launcher can trim outputs
-    back to the user-visible shape.
-    """
     original_n = int(layer.w2_weight.shape[-2])
     layer._w2_logical_n = original_n
 
@@ -132,8 +118,6 @@ def _pad_w2_to_block_n(layer: nn.Module, block_n: int) -> None:
         ],
         dim=-2,
     )
-    # 127 = e8m0 identity (scale == 1.0); padding with the identity scale
-    # keeps the zero-padded W rows numerically inert.
     w2_s_padded = torch.cat(
         [
             w2_s,
@@ -151,16 +135,6 @@ def _pad_w2_to_block_n(layer: nn.Module, block_n: int) -> None:
 
 
 def _attach_gluon_bpreshuffle(layer: nn.Module) -> None:
-    """Stamp the gluon BPreshuffle layout on the wrapped W tensors.
-
-    ``shuffle_weight_for_gluon_dot_layout`` permutes the raw uint8 W into
-    the V_VGPR-friendly layout consumed by ``_pipelined_moe_kernel_scaled``
-    when ``is_shuffled_for_gluon_dot=True``. The shuffled view is attached
-    to the raw tensor as ``_gluon_shuffled`` so ``_extract_gluon_raw_w`` can
-    pick it up at dispatch time. For the combine GEMM, ``_w2_logical_n`` is
-    re-stamped on the shuffled tensor so the launcher can trim outputs back
-    to the original N.
-    """
     if not _is_amd:
         return
 
@@ -278,6 +252,7 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         # Pre-pad w2 along N before swizzle so the gluon W_VIA_VGPR path can
         # drop its n-mask. Only relevant on AMD where bpreshuffle is wired up.
         if self._is_w4a8_fp8 and _is_amd:
+            _GLUON_COMBINE_BLOCK_N = 128
             _pad_w2_to_block_n(layer, _GLUON_COMBINE_BLOCK_N)
 
         num_warps = 8
