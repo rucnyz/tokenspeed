@@ -47,13 +47,10 @@ from tokenspeed.runtime.layers.attention.linear.index import (
     set_total_chunks_hint_uniform,
 )
 
-_USE_BLADE_GDN = os.environ.get("BLADE_GDN", "0") == "1"
-_USE_FUSED_BLADE_GDN = os.environ.get("FUSED_BLADE_GDN", "0") == "1"
+_USE_TINY_GDN_DRR = os.environ.get("TINY_GDN_DRR", "0") == "1"
 _USE_FLASHINFER_GDN = os.environ.get("FLASHINFER_GDN", "0") == "1"
-if _USE_BLADE_GDN or _USE_FUSED_BLADE_GDN:
+if _USE_TINY_GDN_DRR:
     import tiny_gdn
-
-    _blade_gdn_workspace = None
 
 if _USE_FLASHINFER_GDN:
     try:
@@ -937,63 +934,8 @@ class MambaAttnBackend(AttentionBackend):
         key = key.view(1, seq_len, num_heads, head_k_dim)
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
-        global _blade_gdn_workspace
-        # Four branches: FUSED_BLADE_GDN > BLADE_GDN > FLASHINFER_GDN > default triton
-        if _USE_FUSED_BLADE_GDN:
-            # ---- blade_gdn fused_gating_recur: single kernel, no gating pre-compute ---- 
-            if _blade_gdn_workspace is None:
-                _blade_gdn_workspace = torch.zeros(
-                    (1000,), dtype=torch.int32, device=query.device
-                )
-
-            # 4D format: [batch=seq_len, S=1, H, D]
-            q_4d = query.transpose(0, 1)   # [1, seq_len, H, D] -> [seq_len, 1, H, D]
-            k_4d = key.transpose(0, 1)     # [seq_len, 1, H, D]
-            v_4d = value.transpose(0, 1)   # [seq_len, 1, HV, DV]
-
-            blade_output = torch.empty_like(v_4d)  # [seq_len, 1, HV, DV]
-
-            tiny_gdn.gdn_main_recur_fused_gating(
-                q_4d, k_4d, v_4d, A_log, a, dt_bias, b,
-                blade_output, ssm_states, ssm_states, _blade_gdn_workspace,
-                scale=None,
-                req_ids=cache_indices,
-                use_qk_l2_norm=True,
-            )
-
-            core_attn_out = blade_output.transpose(0, 1)  # [1, seq_len, HV, DV]
-
-        elif _USE_BLADE_GDN:
-            # ---- blade_gdn two-kernel: fused_gdn_gating + gdn_main_recur ----
-            if _blade_gdn_workspace is None:
-                _blade_gdn_workspace = torch.zeros(
-                    (1000,), dtype=torch.int32, device=query.device
-                )
-
-            # Fused gating + beta computation (one triton kernel launch)
-            # g: [1, seq_len, HV] fp32 log-space, beta: [1, seq_len, HV] sigmoid(b)
-            g, beta_out = fused_gdn_gating(A_log, a, dt_bias, b=b)
-
-            # 4D format: [batch=seq_len, S=1, H, D]
-            q_4d = query.transpose(0, 1)
-            k_4d = key.transpose(0, 1)
-            v_4d = value.transpose(0, 1)
-            g_4d = g.transpose(0, 1)
-            beta_4d = beta_out.transpose(0, 1)
-
-            blade_output = torch.empty_like(v_4d)
-
-            tiny_gdn.gdn_main_recur(
-                q_4d, k_4d, v_4d, g_4d, beta_4d, blade_output,
-                ssm_states, ssm_states, _blade_gdn_workspace,
-                scale=None,
-                req_ids=cache_indices,
-                use_qk_l2_norm=True,
-            )
-
-            core_attn_out = blade_output.transpose(0, 1)
-
-        elif _USE_FLASHINFER_GDN:
+        # Three branches: FLASHINFER_GDN > TINY_GDN_DRR > default triton
+        if _USE_FLASHINFER_GDN:
             # ---- flashinfer decode (CUDA CuTe kernel) ----
             batch_size = cache_indices.shape[0]
             num_v_heads = value.shape[2]
@@ -1040,22 +982,51 @@ class MambaAttnBackend(AttentionBackend):
             core_attn_out = output_fi.view(1, batch_size, num_v_heads, head_v_dim)
 
         else:
-            # ---- Default: tokenspeed triton recurrent kernel ----
-            core_attn_out = fused_sigmoid_gating_delta_rule_update(
-                A_log=A_log,
-                dt_bias=dt_bias,
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                initial_state_source=ssm_states,
-                initial_state_indices=cache_indices,
-                cu_seqlens=query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-            )
+            if _USE_TINY_GDN_DRR:
+                # ---- tiny_gdn DRR (CUTLASS): triton-aligned wrapper ----
+                # decode is single-step (S=1) per request, no varlen.
+                batch_size = cache_indices.shape[0]
+                num_v_heads = value.shape[2]
+                q_4d = query.view(batch_size, 1, num_heads, head_k_dim)
+                k_4d = key.view(batch_size, 1, num_heads, head_k_dim)
+                v_4d = value.view(batch_size, 1, num_v_heads, head_v_dim)
+                a_2d = a.view(batch_size * 1, num_v_heads)
+                b_2d = b.view(batch_size * 1, num_v_heads)
+                core_attn_out = tiny_gdn.fused_sigmoid_gating_delta_rule_update(
+                    A_log=A_log,
+                    a=a_2d,
+                    dt_bias=dt_bias,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    q=q_4d,
+                    k=k_4d,
+                    v=v_4d,
+                    b=b_2d,
+                    initial_state_source=ssm_states,
+                    initial_state_indices=cache_indices,
+                    scale=None,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                core_attn_out = core_attn_out.view(
+                    1, batch_size, num_v_heads, head_v_dim
+                )
+            else:
+                # ---- Default: tokenspeed triton recurrent kernel ----
+                core_attn_out = fused_sigmoid_gating_delta_rule_update(
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    q=query,
+                    k=key,
+                    v=value,
+                    a=a,
+                    b=b,
+                    initial_state_source=ssm_states,
+                    initial_state_indices=cache_indices,
+                    cu_seqlens=query_start_loc,
+                    use_qk_l2norm_in_kernel=True,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                )
 
         return core_attn_out
 
@@ -1184,57 +1155,41 @@ class MambaAttnBackend(AttentionBackend):
             draft_token_num = kwargs.get(
                 "draft_token_num", self.speculative_num_draft_tokens
             )
-            global _blade_gdn_workspace
-            if _USE_FUSED_BLADE_GDN:
-                # ---- blade_gdn fused gating MTP: single kernel ----
-                if _blade_gdn_workspace is None:
-                    _blade_gdn_workspace = torch.zeros(
-                        (1000,), dtype=torch.int32, device=query.device
-                    )
-                # 3D layout: rearrange("1 l h d -> l h d")
-                q_3d = query.squeeze(0)   # [seq_len, H, D]
-                k_3d = key.squeeze(0)
-                v_3d = value.squeeze(0)
-                core_attn_out = torch.empty(
-                    value.shape, dtype=value.dtype, device=value.device
-                )  # [1, seq_len, HV, DV]
-                tiny_gdn.gdn_main_recur_fused_gating(
-                    q_3d, k_3d, v_3d, A_log, a, dt_bias, b,
-                    core_attn_out, ssm_states, ssm_states, _blade_gdn_workspace,
+            if _USE_TINY_GDN_DRR:
+                # ---- tiny_gdn DRR (CUTLASS) MTP target-verify ----
+                # Kernel handles output_state_indices == -1 via in-kernel skip
+                # (added by the bounds-check patch in the SM100 recur kernels),
+                # so we can hand the pool + per-step slot table directly to
+                # tiny_gdn — no Python-side scatter needed.
+                batch_size = actual_seq_len // draft_token_num
+                HV = num_value_heads
+                K_dim = head_k_dim
+                V_dim = head_v_dim
+                q_4d = query.view(batch_size, draft_token_num, num_heads, K_dim)
+                k_4d = key.view(batch_size, draft_token_num, num_heads, K_dim)
+                v_4d = value.view(batch_size, draft_token_num, HV, V_dim)
+                a_2d = a.view(batch_size * draft_token_num, HV)
+                b_2d = b.view(batch_size * draft_token_num, HV)
+                core_attn_out = tiny_gdn.fused_sigmoid_gating_delta_rule_update(
+                    A_log=A_log,
+                    a=a_2d,
+                    dt_bias=dt_bias,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    q=q_4d,
+                    k=k_4d,
+                    v=v_4d,
+                    b=b_2d,
+                    initial_state_source=ssm_states,
+                    initial_state_indices=cache_indices,
                     scale=None,
-                    req_ids=cache_indices,
-                    token_verify_ids=kwargs.get("num_accepted_tokens"),
-                    query_start_loc=query_start_loc,
-                    use_qk_l2_norm=True,
+                    use_qk_l2norm_in_kernel=True,
+                    disable_state_update=True,
+                    output_state_indices=self.forward_metadata.mamba_output_indices,
                 )
-
-            elif _USE_BLADE_GDN:
-                # ---- blade_gdn two-kernel MTP: fused_gdn_gating + gdn_main_recur ----
-                if _blade_gdn_workspace is None:
-                    _blade_gdn_workspace = torch.zeros(
-                        (1000,), dtype=torch.int32, device=query.device
-                    )
-                # Compute gating
-                g, beta_out = fused_gdn_gating(A_log, a, dt_bias, b=b)
-                # 3D layout: rearrange("1 l h d -> l h d")
-                q_3d = query.squeeze(0)
-                k_3d = key.squeeze(0)
-                v_3d = value.squeeze(0)
-                g_2d = g.squeeze(0)       # [seq_len, HV]
-                beta_2d = beta_out.squeeze(0)
-                core_attn_out = torch.empty(
-                    value.shape, dtype=value.dtype, device=value.device
+                core_attn_out = core_attn_out.view(
+                    1, batch_size * draft_token_num, HV, V_dim
                 )
-                tiny_gdn.gdn_main_recur(
-                    q_3d, k_3d, v_3d, g_2d, beta_2d, core_attn_out,
-                    ssm_states, ssm_states, _blade_gdn_workspace,
-                    scale=None,
-                    req_ids=cache_indices,
-                    token_verify_ids=kwargs.get("num_accepted_tokens"),
-                    query_start_loc=query_start_loc,
-                    use_qk_l2_norm=True,
-                )
-
             else:
                 core_attn_out = fused_sigmoid_gating_delta_rule_update(
                     A_log=A_log,
