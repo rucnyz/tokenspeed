@@ -60,6 +60,7 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 logger = get_colorful_logger(__name__)
@@ -660,6 +661,23 @@ class ModelExecutor:
             dp_sampling=dp_sampling,
         )
 
+    def _build_logits_layout_plan(
+        self,
+        *,
+        dp_sampling: bool,
+        real_bs: int,
+        bucket_bs: int,
+    ) -> LogitsLayoutPlan | None:
+        if self.sampling_backend is None:
+            return None
+        return self.sampling_backend.build_logits_layout_plan(
+            dp_sampling=dp_sampling,
+            real_bs=real_bs,
+            bucket_bs=bucket_bs,
+            tp_size=self.model_runner.model.logits_processor.tp_size,
+            num_tokens_per_req=self.config.output_length,
+        )
+
     def accumulate_decode_stats(self, results: ModelExecutionResult, bs: int):
         """Accumulate decode stats from already-synced results. No GPU sync."""
         self.num_generated_tokens += int(results.output_lengths.sum().item())
@@ -966,14 +984,11 @@ class ModelExecutor:
         ctx.dp_sampling, _use_graph, bucket_bs = self.forward_step.dp_sampling_route(
             0, ctx
         )
-        if self.sampling_backend is not None:
-            ctx.logits_layout_plan = self.sampling_backend.build_logits_layout_plan(
-                dp_sampling=ctx.dp_sampling,
-                real_bs=0,
-                bucket_bs=bucket_bs,
-                tp_size=self.model_runner.model.logits_processor.tp_size,
-                num_tokens_per_req=self.config.output_length,
-            )
+        ctx.logits_layout_plan = self._build_logits_layout_plan(
+            dp_sampling=ctx.dp_sampling,
+            real_bs=0,
+            bucket_bs=bucket_bs,
+        )
 
         sampling_info = SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
@@ -1338,12 +1353,10 @@ class ModelExecutor:
                 ctx.dp_sampling, _use_graph, bucket_bs = (
                     self.forward_step.dp_sampling_route(bs, ctx)
                 )
-                ctx.logits_layout_plan = self.sampling_backend.build_logits_layout_plan(
+                ctx.logits_layout_plan = self._build_logits_layout_plan(
                     dp_sampling=ctx.dp_sampling,
                     real_bs=bs,
                     bucket_bs=bucket_bs,
-                    tp_size=self.model_runner.model.logits_processor.tp_size,
-                    num_tokens_per_req=self.config.output_length,
                 )
                 if forward_mode.is_decode() and self.config.global_rank == 0:
                     logger.debug(
