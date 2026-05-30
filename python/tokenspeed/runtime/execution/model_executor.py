@@ -67,6 +67,18 @@ logger = get_colorful_logger(__name__)
 _DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle}
 
 
+def dp_sampling_comm_vocab_size(
+    *,
+    lm_head_rows: int,
+    tp_size: int,
+    skip_all_gather: bool,
+) -> int:
+    vocab_size = int(lm_head_rows)
+    if not skip_all_gather:
+        vocab_size *= int(tp_size)
+    return ((vocab_size + int(tp_size) - 1) // int(tp_size)) * int(tp_size)
+
+
 @dataclass
 class ModelExecutorConfig:
     """
@@ -329,8 +341,10 @@ class ModelExecutor:
                     f"dp_sampling LM head weight must be at least 1D, "
                     f"got {weight.ndim}D"
                 )
-            dp_vocab_size = int(weight.shape[0]) * (
-                1 if processor.skip_all_gather else processor.tp_size
+            dp_vocab_size = dp_sampling_comm_vocab_size(
+                lm_head_rows=int(weight.shape[0]),
+                tp_size=processor.tp_size,
+                skip_all_gather=processor.skip_all_gather,
             )
             configure_dp_vocab = getattr(
                 self.sampling_backend, "configure_dp_sampling_vocab_size", None

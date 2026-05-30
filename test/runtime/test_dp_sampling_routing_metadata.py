@@ -12,6 +12,7 @@ from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     should_use_dp_sampling_for_bucket,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.model_executor import dp_sampling_comm_vocab_size
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
 
@@ -217,6 +218,28 @@ def test_configure_dp_sampling_sets_state():
     )
     assert processor.dp_sampling_enabled
     assert processor.dp_num_tokens_per_req == 6
+
+
+def test_dp_sampling_comm_vocab_size_pads_replicated_lm_head_vocab():
+    assert (
+        dp_sampling_comm_vocab_size(
+            lm_head_rows=7,
+            tp_size=4,
+            skip_all_gather=True,
+        )
+        == 8
+    )
+
+
+def test_dp_sampling_comm_vocab_size_keeps_sharded_lm_head_tp_divisible():
+    assert (
+        dp_sampling_comm_vocab_size(
+            lm_head_rows=2,
+            tp_size=4,
+            skip_all_gather=False,
+        )
+        == 8
+    )
 
 
 def test_skip_all_gather_dp_sampling_slices_hidden_states_before_lm_head():
