@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -12,6 +13,9 @@ from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     should_use_dp_sampling_for_bucket,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.model_executor import (
+    validate_dp_sampling_lm_head_vocab,
+)
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
 
@@ -217,6 +221,17 @@ def test_configure_dp_sampling_sets_state():
     )
     assert processor.dp_sampling_enabled
     assert processor.dp_num_tokens_per_req == 6
+
+
+def test_dp_sampling_skip_all_gather_rejects_sharded_lm_head_vocab():
+    with pytest.raises(RuntimeError, match="replicated/full-vocab LM head"):
+        validate_dp_sampling_lm_head_vocab(
+            lm_head_rows=4,
+            vocab_size=7,
+            tp_size=2,
+            skip_all_gather=True,
+            tie_word_embeddings=True,
+        )
 
 
 def test_skip_all_gather_dp_sampling_slices_hidden_states_before_lm_head():

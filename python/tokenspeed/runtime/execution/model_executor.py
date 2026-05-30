@@ -79,6 +79,25 @@ def dp_sampling_comm_vocab_size(
     return ((vocab_size + int(tp_size) - 1) // int(tp_size)) * int(tp_size)
 
 
+def validate_dp_sampling_lm_head_vocab(
+    *,
+    lm_head_rows: int,
+    vocab_size: int,
+    tp_size: int,
+    skip_all_gather: bool,
+    tie_word_embeddings: bool,
+) -> None:
+    if skip_all_gather and int(lm_head_rows) < int(vocab_size):
+        raise RuntimeError(
+            "Batch-DP sampling with skip_all_gather requires a replicated/"
+            "full-vocab LM head. Got a sharded LM head with "
+            f"lm_head_rows={lm_head_rows}, vocab_size={vocab_size}, "
+            f"tp_size={tp_size}, tie_word_embeddings={tie_word_embeddings}. "
+            "Disable --dp-sampling or use a model path that resolves a "
+            "replicated LM head."
+        )
+
+
 @dataclass
 class ModelExecutorConfig:
     """
@@ -341,8 +360,18 @@ class ModelExecutor:
                     f"dp_sampling LM head weight must be at least 1D, "
                     f"got {weight.ndim}D"
                 )
+            lm_head_rows = int(weight.shape[0])
+            validate_dp_sampling_lm_head_vocab(
+                lm_head_rows=lm_head_rows,
+                vocab_size=self.config.vocab_size,
+                tp_size=processor.tp_size,
+                skip_all_gather=processor.skip_all_gather,
+                tie_word_embeddings=bool(
+                    getattr(processor.config, "tie_word_embeddings", False)
+                ),
+            )
             dp_vocab_size = dp_sampling_comm_vocab_size(
-                lm_head_rows=int(weight.shape[0]),
+                lm_head_rows=lm_head_rows,
                 tp_size=processor.tp_size,
                 skip_all_gather=processor.skip_all_gather,
             )
