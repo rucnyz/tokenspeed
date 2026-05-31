@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-exec tokenspeed-serve \
+exec ts serve \
     --model nvidia/Kimi-K2.5-NVFP4 \
     --data-parallel-size 8 \
     --moe-tp-size 8 \
@@ -25,6 +25,6 @@ exec tokenspeed-serve \
     --speculative-draft-model-quantization unquant \
     --drafter-attention-backend trtllm_mla \
     --enable-cache-report \
-    --host localhost \
+    --host 127.0.0.1 \
     --port 8000 \
-    --dist-init-addr localhost:4000
+    --dist-init-addr 127.0.0.1:4000

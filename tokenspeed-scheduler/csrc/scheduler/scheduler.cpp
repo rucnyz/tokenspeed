@@ -20,11 +20,14 @@
 
 #include "scheduler/scheduler.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <iterator>
+#include <map>
 #include <memory>
+#include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -40,6 +43,7 @@
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
+#include "resource/radix_tree/radix_tree.h"
 #include "resource/radix_tree/tree_node.h"
 #include "scheduler/execution_event.h"
 #include "scheduler/operations/cache.h"
@@ -54,7 +58,8 @@ Scheduler::Scheduler(SchedulerConfig config)
     : config_{std::move(config)},
       device_allocator_{config_.page_size, config_.device_allocator.total_pages},
       host_allocator_{config_.page_size, config_.host_allocator.total_pages},
-      kv_prefix_cache_{&device_allocator_, &host_allocator_, config_.enable_l3_storage},
+      mamba_allocator_{},
+      kv_prefix_cache_{&device_allocator_, &host_allocator_, config_.enable_l3_storage, config_.disable_prefix_cache},
       req_pool_allocator_{config_.max_batch_size} {
     if (auto* env = std::getenv("SPDLOG_LEVEL")) {
         std::string level_str{env};
@@ -62,16 +67,75 @@ Scheduler::Scheduler(SchedulerConfig config)
         spdlog::set_level(level);
     }
 
-    const std::int32_t num_mamba_slots =
-        config_.enable_mamba ? config_.mamba_pool_total_chunks : config_.num_mamba_slots;
-    if (num_mamba_slots > 0) {
-        mamba_allocator_.emplace(num_mamba_slots);
-        if (config_.role != Role::kD) {
-            hybrid_prefix_cache_.emplace(kv_prefix_cache_, &*mamba_allocator_, config_.mamba_cache_chunk_size);
-            kv_prefix_cache_.GetDeviceManager().SetEvictionCallback(
-                [this](TreeNode* node) { hybrid_prefix_cache_->OnKVEvict(node); });
+    if (config_.enable_kv_cache_events) {
+        kv_prefix_cache_.SetKvEventSink([this](KvCacheEvent event) { kv_events_.push_back(std::move(event)); });
+    }
+    const bool has_mamba_pool = config_.enable_mamba && config_.mamba_pool_total_chunks > 0;
+    if (has_mamba_pool) {
+        mamba_allocator_.emplace(config_.mamba_pool_total_chunks);
+    }
+    const bool has_mamba_l2_pool = has_mamba_pool && config_.enable_mamba_l2 && config_.mamba_l2_host_slots > 0;
+    if (has_mamba_l2_pool) {
+        mamba_host_allocator_.emplace(config_.mamba_l2_host_slots);
+    }
+
+    // Construct HybridPrefixCache when any adjunct/paged-cache feature is configured.
+    // Role::kD skips Mamba but still participates in paged-cache transport.
+    const bool has_mamba_adjunct = has_mamba_pool && config_.role != Role::kD;
+    const bool has_prefix_cache_adjunct = config_.prefix_cache_adjunct.has_value();
+    const bool has_paged_cache_groups = !config_.paged_cache_groups.empty();
+    if (has_mamba_adjunct || has_prefix_cache_adjunct || has_paged_cache_groups) {
+        MambaChunkAllocator* mamba_ptr = has_mamba_adjunct ? &*mamba_allocator_ : nullptr;
+        MambaHostAllocator* mamba_host_ptr = has_mamba_l2_pool ? &*mamba_host_allocator_ : nullptr;
+        hybrid_prefix_cache_.emplace(kv_prefix_cache_, mamba_ptr, config_.mamba_cache_chunk_size, mamba_host_ptr);
+        kv_prefix_cache_.GetDeviceManager().SetEvictionCallback(
+            [this](TreeNode* node) { hybrid_prefix_cache_->OnKVEvict(node); });
+        kv_prefix_cache_.GetHostManager().SetEvictionCallback(
+            [this](TreeNode* node) { hybrid_prefix_cache_->OnKVHostEvict(node); });
+
+        for (const auto& cfg : config_.paged_cache_groups) {
+            PagedCacheGroupConfig copy = cfg;
+            copy.Validate();
+            hybrid_prefix_cache_->RegisterPagedCacheGroup(std::make_unique<PagedCacheGroupAllocator>(std::move(copy)));
+        }
+
+        if (has_prefix_cache_adjunct) {
+            const auto& spec = *config_.prefix_cache_adjunct;
+            if (spec.required_groups.empty()) {
+                throw std::invalid_argument("Scheduler: prefix_cache_adjunct.required_groups must be non-empty");
+            }
+            // HybridPrefixCache derives history alignment from the registered
+            // group configs; we still build the sliding-window map here.
+            std::unordered_map<std::string, std::int32_t> sliding_window_per_group;
+            for (const auto& gid : spec.required_groups) {
+                const PagedCacheGroupConfig* cfg = nullptr;
+                for (const auto& g : config_.paged_cache_groups) {
+                    if (g.group_id == gid) {
+                        cfg = &g;
+                        break;
+                    }
+                }
+                if (cfg == nullptr) {
+                    throw std::invalid_argument("Scheduler: prefix_cache_adjunct required group_id '" + gid +
+                                                "' not found in paged_cache_groups");
+                }
+                if (cfg->retention == PagedCacheGroupConfig::Retention::SlidingWindow) {
+                    if (!cfg->sliding_window_tokens.has_value() || *cfg->sliding_window_tokens <= 0) {
+                        throw std::invalid_argument("Scheduler: prefix_cache_adjunct sliding group '" + gid +
+                                                    "' must declare positive sliding_window_tokens");
+                    }
+                    sliding_window_per_group.emplace(gid, *cfg->sliding_window_tokens);
+                }
+            }
+            hybrid_prefix_cache_->EnablePagedCacheAdjunct(spec.required_groups, std::move(sliding_window_per_group));
         }
     }
+}
+
+std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
+    std::vector<KvCacheEvent> events;
+    events.swap(kv_events_);
+    return events;
 }
 
 std::vector<std::string> Scheduler::CalcRollingHash(const std::vector<std::int32_t>& input_tokens, bool apply_match) {
@@ -160,6 +224,48 @@ std::size_t Scheduler::ActiveKvPages() const {
     return active_pages.size();
 }
 
+std::vector<std::string> Scheduler::PagedCacheGroupIds() const {
+    if (!hybrid_prefix_cache_) return {};
+    return hybrid_prefix_cache_->PagedCacheGroupIds();
+}
+
+std::int32_t Scheduler::PagedCacheGroupTotalPages(const std::string& group_id) const {
+    if (!hybrid_prefix_cache_) {
+        throw std::out_of_range("Scheduler::PagedCacheGroupTotalPages: group_id not configured");
+    }
+    return hybrid_prefix_cache_->PagedCacheGroupTotalPages(group_id);
+}
+
+std::int32_t Scheduler::PagedCacheGroupAvailablePages(const std::string& group_id) const {
+    if (!hybrid_prefix_cache_) {
+        throw std::out_of_range("Scheduler::PagedCacheGroupAvailablePages: group_id not configured");
+    }
+    return hybrid_prefix_cache_->PagedCacheGroupAvailablePages(group_id);
+}
+
+std::int64_t Scheduler::PagedCacheGroupFailedAllocCount(const std::string& group_id) const {
+    if (!hybrid_prefix_cache_) {
+        throw std::out_of_range("Scheduler::PagedCacheGroupFailedAllocCount: group_id not configured");
+    }
+    return hybrid_prefix_cache_->PagedCacheGroupFailedAllocCount(group_id);
+}
+
+std::vector<std::int32_t> Scheduler::GetRequestPagedCachePageIds(const std::string& request_id,
+                                                                 const std::string& group_id) const {
+    if (!hybrid_prefix_cache_) {
+        throw std::out_of_range("Scheduler::GetRequestPagedCachePageIds: group_id not configured");
+    }
+    return hybrid_prefix_cache_->GetRequestPagedCachePageIds(request_id, group_id);
+}
+
+std::int32_t Scheduler::GetRequestPagedCacheBaseLogicalPage(const std::string& request_id,
+                                                            const std::string& group_id) const {
+    if (!hybrid_prefix_cache_) {
+        throw std::out_of_range("Scheduler::GetRequestPagedCacheBaseLogicalPage: group_id not configured");
+    }
+    return hybrid_prefix_cache_->GetRequestPagedCacheBaseLogicalPage(request_id, group_id);
+}
+
 std::int32_t Scheduler::GetRequestTokenSize(const std::string& id) const {
     auto it = requests_.find(id);
     if (it == requests_.end()) {
@@ -183,8 +289,8 @@ std::vector<WriteBackOperation> Scheduler::newWriteBackOperation(
             CacheOpSpec spec;
             spec.request_id = id;
             cache_op_tracker_[op_id] = std::move(spec);
-            ops.push_back(WriteBackOperation{op_id, std::vector<std::tuple<std::int32_t, std::int32_t>>(
-                                                        pages_to_transfer.begin(), pages_to_transfer.end())});
+            ops.push_back(WriteBackOperation{
+                op_id, std::vector<TransferPair>(pages_to_transfer.begin(), pages_to_transfer.end())});
             req->Apply(fsm::CommitDrainingEvent{});
         } else {
             req->Apply(fsm::AbortEvent{});
@@ -199,6 +305,13 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     std::vector<WriteBackOperation> write_back_ops;
     write_back_ops = std::move(newWriteBackOperation(requests_));
 
+    if (hybrid_prefix_cache_) {
+        for (const auto& [id, req] : requests_) {
+            if (req->Is<fsm::Finished>()) {
+                hybrid_prefix_cache_->ReleaseRequest(id);
+            }
+        }
+    }
     std::erase_if(requests_, [](const auto& req) { return req.second->template Is<fsm::Finished>(); });
 
     std::vector<Request*> candidates;

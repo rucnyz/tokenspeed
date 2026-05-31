@@ -45,8 +45,6 @@ dependencies = [
     "msgspec",
     "ninja",
     "numpy",
-    "nvidia-cutlass-dsl",
-    "nvtx",
     "openai==2.33.0",
     "openai-harmony",
     "orjson",
@@ -60,11 +58,15 @@ dependencies = [
     "pybind11",
     "pydantic",
     "py-spy",
+    "pytest-asyncio",
     "python-multipart",
     "pyzmq",
     "requests",
     "setproctitle",
     "tiktoken",
+    "tokenspeed-smg==1.4.1.post20260527",
+    "tokenspeed-smg-grpc-proto==0.4.8.post20260527",
+    "tokenspeed-smg-grpc-servicer==0.5.3.post20260527",
     "torch==2.11.0",
     "torchvision",
     "tqdm",
@@ -79,8 +81,6 @@ dependencies = [
 [project.scripts]
 tokenspeed = "tokenspeed.cli:main"
 ts = "tokenspeed.cli:main"
-tokenspeed-serve = "tokenspeed.api_server:main"
-ts-serve = "tokenspeed.api_server:main"
 
 [project.urls]
 "Homepage" = "https://github.com/lightseekorg/tokenspeed"

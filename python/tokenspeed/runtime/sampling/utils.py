@@ -20,16 +20,10 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 from tokenspeed.runtime.utils import crash_on_warnings, get_colorful_logger
-
-if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
-
 
 logger = get_colorful_logger(__name__)
 
@@ -56,7 +50,7 @@ def nan_guard_logits(
 ) -> torch.Tensor:
     """Replace NaNs with -1e5 and optionally crash; no-op when detection is disabled."""
     if not enable_nan_detection:
-        return logits.nan_to_num_()
+        return logits
 
     if not torch.any(torch.isnan(logits)):
         return logits
@@ -68,16 +62,16 @@ def nan_guard_logits(
     return logits
 
 
-def write_output_logprobs(
-    logits_output: LogitsProcessorOutput,
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def gather_token_logprobs_torch(
     logits: torch.Tensor,
     tokens: torch.Tensor,
-) -> None:
-    """Fill logits_output.next_token_logprobs; callers gate on the enable flag."""
-    raw_logprobs = torch.log_softmax(logits, dim=-1)
-    logits_output.next_token_logprobs = raw_logprobs.gather(
-        -1, tokens.long().unsqueeze(-1)
-    ).squeeze(-1)
+) -> torch.Tensor:
+    """Per-row log_softmax(logits)[tokens]. Fuses cast + online softmax + gather
+    into one Triton kernel sequence so the full [B, V] log_softmax matrix is
+    never materialized."""
+    raw_logprobs = torch.log_softmax(logits.float(), dim=-1)
+    return raw_logprobs.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -91,27 +85,3 @@ def top_p_normalize_probs_torch(
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
     return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
-
-
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def top_k_top_p_renorm_torch(
-    probs: torch.Tensor,
-    top_ks: torch.Tensor,
-    top_ps: torch.Tensor,
-) -> torch.Tensor:
-    """Joint top-k + top-p filter and renormalize. One sort serves both masks;
-    replaces the flashinfer top_k_renorm + AIR Top-P sequence (5 kernels)."""
-    sorted_probs, sorted_idx = probs.sort(dim=-1, descending=True)
-
-    # Exclusive cumsum (= prefix sum BEFORE this token in sorted order).
-    excl_cumsum = sorted_probs.cumsum(dim=-1) - sorted_probs
-
-    pos = torch.arange(sorted_probs.size(-1), device=probs.device)
-    mask = (pos < top_ks.unsqueeze(-1)) & (excl_cumsum <= top_ps.unsqueeze(-1))
-
-    kept = sorted_probs * mask
-    kept = kept / kept.sum(dim=-1, keepdim=True)
-
-    # sorted_idx is a permutation of [0, V) per row, so scatter_ overwrites
-    # every position exactly once — no need to pre-zero the output buffer.
-    return torch.empty_like(probs).scatter_(-1, sorted_idx, kept)

@@ -42,6 +42,7 @@ from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.io_struct import TokenizedGenerateReqInput
     from tokenspeed.runtime.execution.types import ModelExecutionResult
+    from tokenspeed.runtime.metrics.collector import EngineMetrics
     from tokenspeed.runtime.grammar.base_grammar_backend import (
         BaseGrammarObject,
     )
@@ -71,9 +72,17 @@ class RequestState:
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
         token_ids_logprob: list[int] | None = None,
+        multimodal_inputs=None,
+        prompt_input_ids_unpadded: list[int] | None = None,
     ) -> None:
         # --- Extracted from recv_req (immutable) ---
         self.prompt_input_ids: list[int] = prompt_input_ids
+        self.prompt_input_ids_unpadded: list[int] = (
+            prompt_input_ids_unpadded
+            if prompt_input_ids_unpadded is not None
+            else prompt_input_ids
+        )
+        self.multimodal_inputs = multimodal_inputs
         self.sampling_params = sampling_params
         self.stream = stream
         self.eos_token_ids = eos_token_ids
@@ -144,6 +153,8 @@ class RequestState:
             return_logprob=getattr(recv_req, "return_logprob", False),
             top_logprobs_num=getattr(recv_req, "top_logprobs_num", 0),
             token_ids_logprob=getattr(recv_req, "token_ids_logprob", None),
+            multimodal_inputs=getattr(recv_req, "multimodal_inputs", None),
+            prompt_input_ids_unpadded=getattr(recv_req, "input_ids_unpadded", None),
         )
 
     @property
@@ -165,14 +176,32 @@ class RequestState:
     def add_computed_length(self, incr: int):
         self.computed_length += incr
 
+    def maybe_extend_multimodal_mrope_positions(self) -> None:
+        mm = self.multimodal_inputs
+        if mm is None or mm.mrope_positions is None:
+            return
+
+        target_len = self.input_length + self.output_length
+        current_len = mm.mrope_positions.shape[-1]
+        if current_len >= target_len:
+            return
+
+        from tokenspeed.runtime.multimodal.mrope import (
+            extend_mrope_positions_for_retracted_request,
+        )
+
+        mm.mrope_positions = extend_mrope_positions_for_retracted_request(
+            mm.mrope_positions, target_len - current_len
+        )
+
     def init_incremental_detokenize(self):
         """Return (all_ids_from_surr_offset, read_offset_relative_to_surr)."""
         if self._surr_offset is None or self._read_offset is None:
-            self._read_offset = self.input_length
+            self._read_offset = len(self.prompt_input_ids_unpadded)
             self._surr_offset = max(
                 self._read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
-        all_ids = self.prompt_input_ids + self.output_ids
+        all_ids = self.prompt_input_ids_unpadded + self.output_ids
         return (
             all_ids[self._surr_offset :],
             self._read_offset - self._surr_offset,
@@ -264,6 +293,8 @@ class OutputProcesser:
         spec_algorithm=None,
         spec_num_tokens: int | None = None,
         stream_interval: int = 1,
+        *,
+        metrics: EngineMetrics,
     ) -> None:
         # BatchTokenIDOut is pushed directly to
         # ``send_to_tokenizer`` (AsyncLLM's input socket). The
@@ -274,6 +305,7 @@ class OutputProcesser:
         self.spec_algorithm = spec_algorithm
         self.spec_num_tokens = spec_num_tokens
         self.stream_interval = stream_interval
+        self.metrics = metrics
         self.log_cnt = 0
         self.rid_to_state: dict[str, RequestState] = {}
         # rid → monotonic ts at which the abort was seen. Covers the
@@ -317,7 +349,6 @@ class OutputProcesser:
         running the request until natural ``max_tokens``/EOS — the
         cancelled request burns up to ``max_tokens`` forward steps and
         latches a ``--max-num-seqs`` slot in the meantime.
-        See https://github.com/lightseekorg/tokenspeed/issues/520.
         """
         state = self.rid_to_state.get(rid)
         if state is not None:
@@ -396,6 +427,49 @@ class OutputProcesser:
             else:
                 self.rid_to_state[rid].add_computed_length(input_lengths[i])
 
+    @staticmethod
+    def _aggregate_spec_decode_step(
+        *,
+        forward_op,
+        output_lengths,
+        rid_to_state,
+    ) -> tuple[int, int]:
+        n_ext = forward_op.num_extends()
+        accepted = 0
+        num_slots = 0
+        for i in range(n_ext, len(forward_op.request_ids)):
+            rid = forward_op.request_ids[i]
+            rs = rid_to_state.get(rid)
+            if rs is None or not rs.prefill_finished:
+                continue
+            out_len = int(output_lengths[i].item())
+            accepted += max(0, out_len - 1)
+            num_slots += 1
+        return num_slots, accepted
+
+    def _emit_spec_decode_metrics(
+        self, forward_op, model_execution_results: ModelExecutionResult
+    ) -> None:
+        if not self.metrics.enabled:
+            return
+        if forward_op.num_extends() > 0:
+            return
+        if self.spec_algorithm is None or self.spec_num_tokens is None:
+            return
+        if model_execution_results.output_lengths is None:
+            return
+        num_slots, accepted_draft_tokens = self._aggregate_spec_decode_step(
+            forward_op=forward_op,
+            output_lengths=model_execution_results.output_lengths,
+            rid_to_state=self.rid_to_state,
+        )
+        if num_slots > 0:
+            self.metrics.record_spec_decode_step(
+                num_decode_slots=num_slots,
+                accepted_draft_tokens=accepted_draft_tokens,
+                draft_width=self.spec_num_tokens,
+            )
+
     def add_cached_tokens(self, rids: list[str], extend_prefix_lens: list[int]) -> None:
         for rid, prefix_len in zip(rids, extend_prefix_lens):
             if rs := self.rid_to_state.get(rid):
@@ -414,6 +488,8 @@ class OutputProcesser:
         )
         with nvtx_range("commit:sync", color="red"):
             model_execution_results.sync()
+
+        self._emit_spec_decode_metrics(forward_op, model_execution_results)
 
         # Wait briefly for the next step's build hostfunc to advance
         # the matcher; if it doesn't come, advance on host. The lock
@@ -435,7 +511,7 @@ class OutputProcesser:
             forward_op.input_lengths,
             forward_op.extend_prefix_lens,
         )
-        is_decode_op = forward_op.num_extends() <= 0
+        num_extends = forward_op.num_extends()
 
         request_changes = []
         stream_out_rids = []
@@ -456,7 +532,8 @@ class OutputProcesser:
                 if output_logprobs_list is not None
                 else None
             )
-            if self.spec_num_tokens is not None and is_decode_op:
+            is_decode_slot = i >= num_extends
+            if self.spec_num_tokens is not None and is_decode_slot:
                 pt += self.spec_num_tokens
             else:
                 pt += output_length
@@ -467,16 +544,16 @@ class OutputProcesser:
 
             request_state: RequestState = self.rid_to_state[rid]
 
-            # Notify caller of first output token before suppressing prefill chunks.
-            # PD layerwise transfer needs this token to release the final status.
-            if on_first_token is not None and model_output_ids:
-                on_first_token(forward_op.request_pool_indices[i], model_output_ids[0])
-
             # Do not output chunking result
             if not request_state.prefill_finished:
                 continue
 
-            if is_decode_op and self.spec_algorithm is not None:
+            # Notify caller of first output token (used by prefill node to hand off
+            # bootstrap token to the KV transfer layer before streaming output).
+            if on_first_token is not None and model_output_ids:
+                on_first_token(forward_op.request_pool_indices[i], model_output_ids[0])
+
+            if is_decode_slot and self.spec_algorithm is not None:
                 request_state.spec_verify_ct += 1
 
             # With the capturable grammar pipeline the matcher is
@@ -549,7 +626,7 @@ class OutputProcesser:
             else:
                 stream_out_rids.append(rid)
                 stream_out_states.append(request_state)
-                if is_decode_op:
+                if is_decode_slot:
                     request_changes.append(
                         make_update_reserve_tokens_event(rid, output_length)
                     )

@@ -1,3 +1,8 @@
+# Adapted from meituan-longcat/SGLang-FluentLLM.
+# This file has been modified for this repository.
+# This file may incorporate material from ModelTC/lightllm,
+# vllm-project/vllm, and sgl-project/sglang, as identified in
+# python/THIRDPARTYNOTICES.
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -40,11 +45,6 @@ import zmq.asyncio
 
 from tokenspeed.runtime.engine.async_llm import AsyncLLM
 from tokenspeed.runtime.engine.llm import LLM
-from tokenspeed.runtime.entrypoints.openai.protocol import ChatCompletionRequest
-from tokenspeed.runtime.entrypoints.openai.serving_chat import OpenAIServingChat
-from tokenspeed.runtime.entrypoints.openai.serving_completions import (
-    OpenAIServingCompletion,
-)
 
 
 def _ignore_threading_atexit(*args, **kwargs) -> None:
@@ -65,7 +65,6 @@ from tokenspeed.runtime.engine.io_struct import (
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
-    MultimodalDataInputFormat,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -75,7 +74,6 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from tokenspeed.runtime.entrypoints.engine_base import EngineBase
-from tokenspeed.runtime.inputs.template_manager import TemplateManager
 from tokenspeed.runtime.utils import (
     MultiprocessingSerializer,
     configure_logger,
@@ -132,46 +130,17 @@ class Engine(EngineBase):
         logger.info("server_args=%r", server_args)
 
         # Launch subprocesses
-        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
+        tokenizer_manager, _, scheduler_info = _launch_subprocesses(
             server_args=server_args,
             port_args=self.port_args,
         )
         self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
-        self.template_manager = template_manager
         self.scheduler_info = scheduler_info
 
         # Sync facade for blocking callers. Owns its own bg event-loop thread; see runtime/engine/llm.py
         # for the queue-bridge semantics.
         self.llm = LLM(self.tokenizer_manager)
-
-        self.openai_serving_completion = OpenAIServingCompletion(
-            self.tokenizer_manager, self.template_manager
-        )
-
-        self.openai_serving_chat = OpenAIServingChat(
-            self.tokenizer_manager, self.template_manager
-        )
-
-    async def openai_v1_chat_completions(
-        self,
-        request_dict: dict,
-        bootstrap_host: str | None = None,
-        bootstrap_port: int | None = None,
-        bootstrap_room: int | None = None,
-    ):
-        request = ChatCompletionRequest(**request_dict)
-        if bootstrap_host is not None:
-            request.bootstrap_host = bootstrap_host
-            request.bootstrap_port = bootstrap_port
-            request.bootstrap_room = bootstrap_room
-
-        generator = self.openai_serving_chat.handle_request_engine(request)
-        if request.stream:
-            return generator
-        else:
-            response = await generator.__anext__()
-            return response
 
     def generate(
         self,
@@ -186,9 +155,6 @@ class Engine(EngineBase):
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
         # See also python/tokenspeed/runtime/utils/common.py:load_image for more details.
-        image_data: MultimodalDataInputFormat | None = None,
-        audio_data: MultimodalDataInputFormat | None = None,
-        video_data: MultimodalDataInputFormat | None = None,
         return_logprob: list[bool] | bool | None = False,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,
@@ -226,9 +192,6 @@ class Engine(EngineBase):
             text=prompt,
             input_ids=input_ids,
             sampling_params=sampling_params,
-            image_data=image_data,
-            audio_data=audio_data,
-            video_data=video_data,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -261,9 +224,6 @@ class Engine(EngineBase):
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
         # See also python/tokenspeed/runtime/utils/common.py:load_image for more details.
-        image_data: MultimodalDataInputFormat | None = None,
-        audio_data: MultimodalDataInputFormat | None = None,
-        video_data: MultimodalDataInputFormat | None = None,
         return_logprob: list[bool] | bool | None = False,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,
@@ -295,9 +255,6 @@ class Engine(EngineBase):
             input_multi_ids=input_multi_ids,
             input_extra_infos=input_extra_infos,
             sampling_params=sampling_params,
-            image_data=image_data,
-            audio_data=audio_data,
-            video_data=video_data,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -512,7 +469,7 @@ def _set_envs_and_config(server_args: ServerArgs):
 
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: PortArgs | None = None
-) -> tuple[AsyncLLM, TemplateManager, dict]:
+) -> tuple[AsyncLLM, None, dict]:
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """
@@ -600,15 +557,6 @@ def _launch_subprocesses(
     # inline inside AsyncLLM — no separate subprocess.
     tokenizer_manager = AsyncLLM(server_args, port_args)
 
-    # Initialize templates
-    template_manager = TemplateManager()
-    template_manager.initialize_templates(
-        tokenizer_manager=tokenizer_manager,
-        model_path=server_args.model,
-        chat_template=server_args.chat_template,
-        completion_template=server_args.completion_template,
-    )
-
     # Wait for the model to finish loading
     scheduler_infos = []
     for i in range(len(scheduler_pipe_readers)):
@@ -631,4 +579,4 @@ def _launch_subprocesses(
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
-    return tokenizer_manager, template_manager, scheduler_info
+    return tokenizer_manager, None, scheduler_info

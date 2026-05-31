@@ -111,4 +111,101 @@ TEST_F(SchedulerTestSuite, NoCacheOps_PlainRequestNoCacheHit) {
     EXPECT_TRUE(cache_ops.empty());
 }
 
+class DisablePrefixCacheTestSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.disable_prefix_cache = true;
+        return cfg;
+    }
+};
+
+TEST_F(DisablePrefixCacheTestSuite, SamePromptDoesNotReuseDevicePrefix) {
+    Submit(MakeRequestSpec("r_seed", 2));
+    PlanOnce();
+    SendForwardDone("r_seed", {100});
+    PlanOnce();
+    SendFinish("r_seed");
+    PlanOnce();
+
+    Submit(MakeRequestSpec("r1", 2));
+    auto plan = PlanOnce();
+    const auto& op = plan.Operations()[0];
+    auto* fwd = std::get_if<FlatForwardOperation>(&op);
+    ASSERT_NE(fwd, nullptr);
+    ASSERT_EQ(fwd->request_ids.size(), 1u);
+    EXPECT_EQ(fwd->request_ids[0], "r1");
+    EXPECT_EQ(fwd->extend_prefix_lens[0], 0);
+    EXPECT_EQ(fwd->input_lengths[0], 4);
+    EXPECT_TRUE(ExtractCacheOpsOfKind<FlatLoadBackOperation>(plan).empty());
+}
+
+TEST_F(DisablePrefixCacheTestSuite, PrefetchNotGeneratedForStorageHit) {
+    Submit(MakePrefetchableSpec("r1", 8, 6));
+    auto plan = PlanOnce();
+    EXPECT_TRUE(ExtractCacheOpsOfKind<PrefetchOperation>(plan).empty());
+}
+
+class StableCandidateOrderingSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        // Force the candidates loop to break after exactly one push so the
+        // tiebreaker decides which request wins.
+        cfg.max_batch_size = 1;
+        return cfg;
+    }
+};
+
+TEST_F(StableCandidateOrderingSuite, NewForwardOperationTieBreaksOnRequestId) {
+    // TP-determinism regression: requests_ is unordered_map<string, ...> so
+    // candidates are visited in per-process random order. Without an Id()
+    // tiebreaker in newForwardOperation's sort, each rank picks a different
+    // request when the loop budget admits only a subset — making forward_op
+    // None on some ranks and non-None on others, which deadlocks NCCL.
+    Submit(MakeRequestSpec("r_ccc", 2, 300));
+    Submit(MakeRequestSpec("r_aaa", 2, 100));
+    Submit(MakeRequestSpec("r_bbb", 2, 200));
+    auto plan = PlanOnce();
+    std::vector<std::string> ids;
+    for (const auto& op : plan.Operations()) {
+        if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) {
+            ids = fwd->request_ids;
+        }
+    }
+    ASSERT_EQ(ids.size(), 1u);
+    EXPECT_EQ(ids[0], "r_aaa");
+}
+
+TEST_F(StableCandidateOrderingSuite, ForwardOpIsInsertionOrderIndependent) {
+    // Mirror of the above using two scheduler instances fed the same request
+    // set in opposite submit orders. The chosen forward request must depend
+    // only on the SET of request ids, not the submission sequence.
+    Submit(MakeRequestSpec("r_ccc", 2, 300));
+    Submit(MakeRequestSpec("r_aaa", 2, 100));
+    Submit(MakeRequestSpec("r_bbb", 2, 200));
+    auto plan_a = PlanOnce();
+    std::vector<std::string> ids_a;
+    for (const auto& op : plan_a.Operations()) {
+        if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) {
+            ids_a = fwd->request_ids;
+        }
+    }
+
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    Submit(MakeRequestSpec("r_bbb", 2, 200));
+    Submit(MakeRequestSpec("r_ccc", 2, 300));
+    Submit(MakeRequestSpec("r_aaa", 2, 100));
+    auto plan_b = PlanOnce();
+    std::vector<std::string> ids_b;
+    for (const auto& op : plan_b.Operations()) {
+        if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) {
+            ids_b = fwd->request_ids;
+        }
+    }
+
+    ASSERT_FALSE(ids_a.empty());
+    EXPECT_EQ(ids_a, ids_b);
+}
+
 }  // namespace tokenspeed::test

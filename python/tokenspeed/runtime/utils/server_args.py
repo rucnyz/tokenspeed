@@ -30,8 +30,6 @@ from typing import Literal
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
-from tokenspeed.runtime.grammar.function_call_parser import FunctionCallParser
-from tokenspeed.runtime.inputs.reasoning_parser import ReasoningParser
 from tokenspeed.runtime.layers.attention.linear.chunk_delta_h import (
     CHUNK_SIZE as FLA_CHUNK_SIZE,
 )
@@ -78,10 +76,8 @@ class ServerArgs:
     max_model_len: int | None = None
     device: str = "cuda"
     served_model_name: str | None = None
-    chat_template: str | None = None
-    completion_template: str | None = None
     revision: str | None = None
-    think_end_token: str | None = None
+    language_model_only: bool = False
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -92,13 +88,20 @@ class ServerArgs:
     max_num_seqs: int | None = None
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
-    max_prefill_tokens: int = 16384
+    max_prefill_tokens: int = 8192
+    enable_mixed_batch: bool = False
     block_size: int = 64
     # special kv cache
     mamba_ssm_dtype: str = "float32"
     mamba_track_interval: int = 256
     max_mamba_cache_size: int | None = None
     mamba_full_memory_ratio: float = 0.9
+    enable_mamba_l2: bool = False
+    mamba_l2_host_slots: int = 0
+    mamba_l2_ratio: float = 2.0
+    mamba_l2_layout: str = "layer_first"
+    mamba_l2_io_backend: str = "kernel"
+    mamba_l2_host_gb: int = 0
 
     # Other runtime options
     stream_interval: int = 1
@@ -127,6 +130,7 @@ class ServerArgs:
     # API related
     api_key: str | None = None
     enable_cache_report: bool = False
+    kv_events_config: str | None = None
 
     # Data parallelism
     data_parallel_size: int | None = None
@@ -188,14 +192,18 @@ class ServerArgs:
     sampling_backend: str | None = None
     attention_use_fp4_indexer_cache: bool | None = None
     use_trtllm_ragged_deepseek_prefill: bool | None = None
+    mha_extend_mode: Literal["paged", "ragged"] = "paged"
 
     # DeepSeek V4
-    disable_deepseek_v4_fast_mhc: bool = False
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
+    deepseek_v4_prefill_chunk_size: int = 4
 
     # Grammar backend
     grammar_backend: str = "none"
+    # Used by ``input_processor`` to defer json_schema grammars past the
+    # model's reasoning channel.
+    reasoning_parser: str | None = None
     grammar_compile_timeout_secs: float = 30.0
     grammar_compile_max_retries: int = 2
     disable_any_whitespace: bool = False
@@ -209,7 +217,7 @@ class ServerArgs:
     speculative_config: str | None = None
     speculative_algorithm: str | None = None
     speculative_draft_model_path: str | None = None
-    speculative_draft_model_quantization: str | None = None
+    speculative_draft_model_quantization: str | None = "unquant"
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
@@ -247,8 +255,6 @@ class ServerArgs:
     weight_loader_prefetch_num_threads: int = 4
     enable_memory_saver: bool = False
     enable_custom_logit_processor: bool = False
-    tool_call_parser: str = None
-    reasoning_parser: str | None = None
     mla_disable_ragged: bool = False
     warmups: str | None = None
 
@@ -261,7 +267,7 @@ class ServerArgs:
     mapping: Mapping | None = None
 
     mla_chunk_multiplier: int = 4
-    mm_mode: str = "none"
+    mm_attention_backend: str | None = None
 
     # For PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: str = "null"
@@ -270,9 +276,6 @@ class ServerArgs:
     disaggregation_ib_device: str | None = None
     disaggregation_layerwise_interval: int = 1
     pdlb_url: str | None = None
-
-    # For built-in tool server
-    tool_server: str | None = None
 
     skip_server_warmup: bool = False
 
@@ -338,7 +341,7 @@ class ServerArgs:
 
             num_speculative_tokens = config.get("num_speculative_tokens")
             if num_speculative_tokens is not None:
-                self.speculative_num_draft_tokens = int(num_speculative_tokens)
+                self.speculative_num_steps = int(num_speculative_tokens)
 
         if self.speculative_num_draft_tokens is None:
             self.speculative_num_draft_tokens = self.speculative_num_steps + 1
@@ -353,26 +356,23 @@ class ServerArgs:
             gpu_mem = None
 
         # Set GPU memory utilization, which depends on the tensor parallelism size.
+        self._gpu_memory_utilization_defaulted = False
         if self.gpu_memory_utilization is None:
             if self.mapping.world_size >= 16:
                 self.gpu_memory_utilization = 0.79
             elif self.mapping.world_size >= 8:
                 self.gpu_memory_utilization = 0.81
             elif self.mapping.world_size >= 4:
-                self.gpu_memory_utilization = 0.85
+                self.gpu_memory_utilization = 0.95
             elif self.mapping.world_size >= 2:
                 self.gpu_memory_utilization = 0.87
             else:
                 self.gpu_memory_utilization = 0.88
+            self._gpu_memory_utilization_defaulted = True
 
-        # Set the chunked prefill token budget, which depends on GPU memory.
+        # Set the chunked prefill token budget.
         if self.chunked_prefill_size is None:
-            if gpu_mem is not None and gpu_mem < 25_000:
-                self.chunked_prefill_size = 2048
-            elif gpu_mem is not None and gpu_mem < 100_000:
-                self.chunked_prefill_size = 8192
-            else:
-                self.chunked_prefill_size = 16384
+            self.chunked_prefill_size = 8192
 
         # Set CUDA graph max capture size.
         if self.max_cudagraph_capture_size is None:
@@ -518,15 +518,21 @@ class ServerArgs:
         if self.speculative_draft_model_path == self.model:
             self.draft_model_path_use_base = True
 
-        if self.speculative_draft_model_quantization is None:
-            self.speculative_draft_model_quantization = self.quantization
-        elif self.speculative_draft_model_quantization == "unquant":
+        if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
 
         if self.eagle3_layers_to_capture is not None:
             self.eagle3_layers_to_capture = [
                 int(x) for x in self.eagle3_layers_to_capture.split(",")
             ]
+
+        # Hoist the PD-decode runtime assert (topk == 1) to startup.
+        if self.speculative_algorithm is not None and self.speculative_eagle_topk != 1:
+            raise ValueError(
+                "speculative_eagle_topk > 1 (tree spec) is not currently "
+                f"supported: {self.speculative_eagle_topk=}. Only chain spec "
+                "(topk=1) is wired end-to-end."
+            )
 
     def resolve_communication(self):
         # Auto-enable allreduce fusion on supported single-node TP configurations.
@@ -619,6 +625,9 @@ class ServerArgs:
                     f"chunked_prefill_size must be <= max_prefill_tokens: {self.chunked_prefill_size=} > {self.max_prefill_tokens=}"
                 )
 
+        if self.deepseek_v4_prefill_chunk_size <= 0:
+            raise ValueError("deepseek_v4_prefill_chunk_size must be positive")
+
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
             logger.info(
@@ -657,6 +666,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--model",
+            "--model-path",
             metavar="MODEL",
             type=str,
             default=None,
@@ -689,6 +699,13 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.skip_tokenizer_init,
             help="If set, skip init tokenizer and pass input_ids in generate request",
+        )
+        parser.add_argument(
+            "--language-model-only",
+            action="store_true",
+            default=ServerArgs.language_model_only,
+            help="Skip vision/audio encoders on a multimodal checkpoint and "
+            "run text-only. Multimodal requests are rejected.",
         )
         parser.add_argument("--ext-yaml", type=str, default=None)
         parser.add_argument(
@@ -789,30 +806,12 @@ class ServerArgs:
             help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
         )
         parser.add_argument(
-            "--chat-template",
-            type=str,
-            default=ServerArgs.chat_template,
-            help="The built-in chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
-        )
-        parser.add_argument(
-            "--completion-template",
-            type=str,
-            default=ServerArgs.completion_template,
-            help="The built-in completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. Only for code completion currently.",
-        )
-        parser.add_argument(
             "--revision",
             type=str,
             default=None,
             help="The specific model version to use. It can be a branch "
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
-        )
-        parser.add_argument(
-            "--think-end-token",
-            type=str,
-            default=ServerArgs.think_end_token,
-            help="The think end token of a thinking model, such as '</think>' for DeepSeek R1.",
         )
         # Memory and scheduling
         parser.add_argument(
@@ -842,6 +841,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.chunked_prefill_size,
             help="Maximum number of tokens the scheduler may issue in a single iteration. Setting this to -1 disables chunked prefill.",
+        )
+        parser.add_argument(
+            "--enable-mixed-batch",
+            action="store_true",
+            dest="enable_mixed_batch",
+            default=ServerArgs.enable_mixed_batch,
+            help="Allow the scheduler to issue prefill and decode requests in the same iteration.",
         )
         parser.add_argument(
             "--block-size",
@@ -932,6 +938,43 @@ class ServerArgs:
             type=float,
             default=ServerArgs.mamba_full_memory_ratio,
             help="Memory ratio used to split cache budget between Mamba state chunks and full-attention KV cache.",
+        )
+        parser.add_argument(
+            "--enable-mamba-l2",
+            action="store_true",
+            help="Enable host-memory L2 cache for Mamba state slots.",
+        )
+        parser.add_argument(
+            "--mamba-l2-host-slots",
+            type=int,
+            default=ServerArgs.mamba_l2_host_slots,
+            help="Number of host Mamba L2 slots. If 0, derive from --mamba-l2-host-gb or --mamba-l2-ratio.",
+        )
+        parser.add_argument(
+            "--mamba-l2-ratio",
+            type=float,
+            default=ServerArgs.mamba_l2_ratio,
+            help="Mamba host L2 slot ratio relative to device Mamba slots when host slots are not explicit.",
+        )
+        parser.add_argument(
+            "--mamba-l2-layout",
+            type=str,
+            choices=["layer_first"],
+            default=ServerArgs.mamba_l2_layout,
+            help="Mamba host L2 memory layout.",
+        )
+        parser.add_argument(
+            "--mamba-l2-io-backend",
+            type=str,
+            choices=["direct", "kernel"],
+            default=ServerArgs.mamba_l2_io_backend,
+            help="IO backend for Mamba L2 host/device transfers.",
+        )
+        parser.add_argument(
+            "--mamba-l2-host-gb",
+            type=int,
+            default=ServerArgs.mamba_l2_host_gb,
+            help="Mamba L2 host memory budget in GiB. Overrides --mamba-l2-ratio when host slots are not explicit.",
         )
 
         parser.add_argument(
@@ -1053,6 +1096,16 @@ class ServerArgs:
             "--enable-cache-report",
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
+        parser.add_argument(
+            "--kv-events-config",
+            type=str,
+            default=ServerArgs.kv_events_config,
+            help=(
+                "JSON KV cache event publisher config. Set "
+                "'enable_kv_cache_events': true and publisher 'zmq' to "
+                "publish device prefix-cache mutations."
+            ),
         )
 
         # Data parallelism
@@ -1204,14 +1257,16 @@ class ServerArgs:
 
         # Kernel backend
         attention_backend_choices = [
-            "triton",
-            "flashmla",
-            "fa3",
-            "hybrid_linear_attn",
             "mha",
+            "fa3",
+            "fa4",
+            "triton",
+            "flashinfer",
             "trtllm",
             "trtllm_mla",
+            "flashmla",
             "tokenspeed_mla",
+            "hybrid_linear_attn",
         ]
         parser.add_argument(
             "--attention-backend",
@@ -1228,6 +1283,18 @@ class ServerArgs:
             "If not specified, uses the same backend as the main model (attention_backend).",
         )
         parser.add_argument(
+            "--mha-extend-mode",
+            type=str,
+            choices=["paged", "ragged"],
+            default=ServerArgs.mha_extend_mode,
+            help=(
+                "MHA extend strategy for prefix-cache/chunked-prefill batches. "
+                "'paged' uses one paged KV-cache attention kernel over full visible KV; "
+                "'ragged' uses ragged current-chunk prefill plus paged cached-prefix "
+                "attention and merges with mha_merge_state."
+            ),
+        )
+        parser.add_argument(
             "--sampling-backend",
             type=str,
             choices=["greedy", "flashinfer", "flashinfer_full"],
@@ -1235,11 +1302,12 @@ class ServerArgs:
             help="Sampling backend. "
             "When unspecified, defaults to 'flashinfer' on NVIDIA and 'greedy' elsewhere. "
             "'greedy': argmax + verify_chain_greedy, zero sampling-param plumbing. "
-            "'flashinfer': temperature/top_k/top_p via one fused kernel (top_k_top_p_sampling_from_logits); "
+            "'flashinfer': temperature/top_k/top_p via fused softmax + top_k_top_p_sampling_from_probs; "
             "min_p and penalties silently ignored. "
             "'flashinfer_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
             "via the softmax+renorm+min_p kernel sequence. "
-            "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory).",
+            "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
+            "Both 'flashinfer' and 'flashinfer_full' require top_k < 128 (fused kernel limit) or -1.",
         )
         parser.add_argument(
             "--attention-use-fp4-indexer-cache",
@@ -1263,16 +1331,6 @@ class ServerArgs:
             help="Use ragged prefill for DeepSeek MLA attention.",
         )
         parser.add_argument(
-            "--disable-deepseek-v4-fast-mhc",
-            action="store_true",
-            default=ServerArgs.disable_deepseek_v4_fast_mhc,
-            help=(
-                "Disable the DeepSeek V4 fast multi-head capture (mHC) layer. "
-                "Falls back to the PyTorch reference when set or when nvcc is "
-                "not available."
-            ),
-        )
-        parser.add_argument(
             "--deepseek-v4-mega-moe-max-num-tokens",
             type=int,
             default=ServerArgs.deepseek_v4_mega_moe_max_num_tokens,
@@ -1291,11 +1349,29 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
+            "--deepseek-v4-prefill-chunk-size",
+            type=int,
+            default=ServerArgs.deepseek_v4_prefill_chunk_size,
+            help=(
+                "Maximum number of requests per DeepSeek V4 FlashMLA prefill " "chunk."
+            ),
+        )
+        parser.add_argument(
             "--grammar-backend",
             type=str,
             choices=["xgrammar", "none"],
             default=ServerArgs.grammar_backend,
             help="Grammar backend. 'none' disables grammar-guided decoding entirely ",
+        )
+        parser.add_argument(
+            "--reasoning-parser",
+            type=str,
+            default=ServerArgs.reasoning_parser,
+            help=(
+                "Reasoning parser name (e.g. 'minimax', 'kimi_k25'). "
+                "Used to defer json_schema grammars past the model's "
+                "reasoning channel."
+            ),
         )
         parser.add_argument(
             "--grammar-compile-timeout-secs",
@@ -1359,8 +1435,7 @@ class ServerArgs:
             "--speculative-draft-model-quantization",
             type=str,
             default=ServerArgs.speculative_draft_model_quantization,
-            help="Quantization method for the draft model. If not specified, inherits the main model's quantization. "
-            "Use 'unquant' to explicitly disable quantization for the draft model.",
+            help="Quantization method for the draft model. Defaults to 'unquant'.",
         )
         parser.add_argument(
             "--speculative-num-steps",
@@ -1372,7 +1447,7 @@ class ServerArgs:
             "--speculative-eagle-topk",
             type=int,
             help="The number of tokens sampled from the draft model in each speculative step.",
-            choices=[1, 2, 4, 8],
+            choices=[1],
             default=ServerArgs.speculative_eagle_topk,
         )
         parser.add_argument(
@@ -1533,31 +1608,6 @@ class ServerArgs:
             action="store_true",
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
         )
-        tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
-        parser.add_argument(
-            "--tool-call-parser",
-            type=str,
-            choices=tool_call_parser_choices,
-            default=ServerArgs.tool_call_parser,
-            help=f"Specify the parser for handling tool-call interactions. Options include: {tool_call_parser_choices}.",
-        )
-        parser.add_argument(
-            "--reasoning-parser",
-            type=str,
-            choices=list(ReasoningParser.DetectorMap.keys()),
-            default=ServerArgs.reasoning_parser,
-            help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
-        )
-
-        # For built-in tool server
-        parser.add_argument(
-            "--tool-server",
-            type=str,
-            choices=("demo",),
-            default=None,
-            help="Use the built-in demo tool server. If not specified, no tool server will be used.",
-        )
-
         # Server warmups
         parser.add_argument(
             "--skip-server-warmup",
@@ -1645,6 +1695,20 @@ class ServerArgs:
             ),
         )
 
+        # Multimodal
+        mm_attention_backend_choices = [
+            "fa3",
+            "fa4",
+            "triton_attn",
+            "flashinfer_cudnn",
+        ]
+        parser.add_argument(
+            "--mm-attention-backend",
+            type=str,
+            choices=mm_attention_backend_choices,
+            default=ServerArgs.mm_attention_backend,
+            help="Set multimodal attention backend.",
+        )
         # Disaggregation
         parser.add_argument(
             "--disaggregation-mode",
@@ -1698,9 +1762,6 @@ class ServerArgs:
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
 
-        # Multi-modal inference mode
-        parser.add_argument("--mm-mode", type=str, default=ServerArgs.mm_mode)
-
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.ep_size = args.expert_parallel_size
@@ -1717,7 +1778,7 @@ class ServerArgs:
         if args.model is None:
             raise ValueError(
                 "Model is required. Provide it as a positional argument "
-                "(e.g., `tokenspeed serve <model>`) or via --model."
+                "(e.g., `tokenspeed serve <model>`) or via --model/--model-path."
             )
 
         # --tensor-parallel-size → --attn-tp-size

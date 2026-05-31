@@ -63,11 +63,27 @@ void MambaEvictionManager::UpdateLeaf(TreeNode* node) {
     }
 }
 
-std::int32_t MambaEvictionManager::Evict(std::int32_t num_slots) {
-    auto older = [](const TreeNode* a, const TreeNode* b) { return a->Time() > b->Time(); };
+std::int32_t MambaEvictionManager::Evict(std::int32_t num_slots, TreeNode* protected_node) {
+    // TP-determinism: ties on Time() must resolve identically across ranks.
+    // mamba_leaves_ is unordered_set<TreeNode*> whose iteration order is
+    // pointer-hash-randomized per-process, so the priority_queue's push order
+    // (and thus internal heap structure for tied elements) diverges across
+    // ranks. Comparing only on Time() leaves ties resolved by heap order →
+    // different ranks evict different leaves on Time ties → cascading parent
+    // re-insertions cause mamba_leaves_ membership to permanently diverge,
+    // eventually wedging the next NCCL collective.
+    // SeqId() is assigned monotonically at TreeNode construction; all ranks
+    // construct nodes in the same order, so SeqId() is identical across ranks.
+    auto older = [](const TreeNode* a, const TreeNode* b) {
+        if (a->Time() != b->Time()) return a->Time() > b->Time();
+        return a->SeqId() > b->SeqId();
+    };
     std::priority_queue<TreeNode*, std::vector<TreeNode*>, decltype(older)> candidates(older);
 
     for (TreeNode* n : mamba_leaves_) {
+        if (n == protected_node) {
+            continue;
+        }
         if (n->OnDevice() && GetResource<ResourceType::Device>(n).RefCount() > 0) {
             continue;
         }
@@ -87,7 +103,7 @@ std::int32_t MambaEvictionManager::Evict(std::int32_t num_slots) {
         if (parent != nullptr && !parent->IsRoot() && isMambaLeaf(parent)) {
             mamba_leaves_.insert(parent);
             bool parent_locked = parent->OnDevice() && GetResource<ResourceType::Device>(parent).RefCount() > 0;
-            if (!parent_locked) {
+            if (!parent_locked && parent != protected_node) {
                 candidates.push(parent);
             }
         }
@@ -95,10 +111,10 @@ std::int32_t MambaEvictionManager::Evict(std::int32_t num_slots) {
     return evicted;
 }
 
-bool MambaEvictionManager::EnsureCapacity(std::int32_t required_slots) {
+bool MambaEvictionManager::EnsureCapacity(std::int32_t required_slots, TreeNode* protected_node) {
     std::int32_t available = allocator_->AvailableSlots();
     if (available >= required_slots) return true;
-    Evict(required_slots - available);
+    Evict(required_slots - available, protected_node);
     return allocator_->AvailableSlots() >= required_slots;
 }
 

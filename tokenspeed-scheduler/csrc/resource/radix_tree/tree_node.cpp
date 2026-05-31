@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include "resource/allocator/owned_pages.h"
@@ -28,8 +29,12 @@
 #include "resource/types.h"
 namespace tokenspeed {
 
+std::atomic<TreeNode::seq_id_t> TreeNode::next_seq_id_{0};
+
 TreeNode::TreeNode(token_vec_t tokens, timestamp_t access_time)
-    : tokens_{std::move(tokens)}, last_access_time_{access_time} {}
+    : tokens_{std::move(tokens)},
+      last_access_time_{access_time},
+      seq_id_{next_seq_id_.fetch_add(1, std::memory_order_relaxed)} {}
 
 void TreeNode::AddChild(const token_vec_t& key, std::unique_ptr<TreeNode>&& child) {
     if (child == nullptr) [[unlikely]] {
@@ -70,6 +75,15 @@ void TreeNode::SplitSelfInto(TreeNode& prefix, std::size_t prefix_pages, std::in
         page_hashes_ = SliceStrings(old_hashes, prefix_pages, total_pages - prefix_pages);
     }
 
+    if (block_hashes_.size() == total_pages) {
+        const std::vector<std::uint64_t> old_hashes = block_hashes_;
+        prefix.block_hashes_ = std::vector<std::uint64_t>(old_hashes.begin(), old_hashes.begin() + prefix_pages);
+        block_hashes_ = std::vector<std::uint64_t>(old_hashes.begin() + prefix_pages, old_hashes.end());
+    } else {
+        prefix.block_hashes_.clear();
+        block_hashes_.clear();
+    }
+
     prefix.storage_persisted_ = storage_persisted_;
     prefix.last_access_time_ = last_access_time_;
 
@@ -82,7 +96,20 @@ void TreeNode::SplitSelfInto(TreeNode& prefix, std::size_t prefix_pages, std::in
         std::int32_t ref_count = host_resource_->RefCount();
         prefix.AttachResource(std::make_unique<HostResource>(host_resource_->SplitFirst(prefix_pages), ref_count));
     }
-    // Mamba resources stay in suffix node, no special handling needed
+    // Mamba stays in suffix.
+    // Invariant: snapshot-bearing nodes are never split (RadixTree refuses).
+    // A split here would dangle borrowed ids in active requests.
+    _assert(paged_cache_snapshot_ == nullptr,
+            "TreeNode::SplitSelfInto called on a node with an attached paged-cache snapshot; "
+            "splitting would invalidate borrowed page id references in active requests");
+}
+
+void TreeNode::AttachPagedCacheSnapshot(std::unique_ptr<PagedCacheSnapshot> snapshot) {
+    paged_cache_snapshot_ = std::move(snapshot);
+}
+
+std::unique_ptr<PagedCacheSnapshot> TreeNode::DetachPagedCacheSnapshot() {
+    return std::move(paged_cache_snapshot_);
 }
 
 void TreeNode::SetPersisted(bool persisted) {
@@ -97,6 +124,17 @@ void TreeNode::SetPageHashes(std::vector<std::string> page_hashes) {
     page_hashes_ = std::move(page_hashes);
 }
 
+std::optional<std::uint64_t> TreeNode::BlockHash() const {
+    if (block_hashes_.empty()) {
+        return std::nullopt;
+    }
+    return block_hashes_.back();
+}
+
+void TreeNode::SetBlockHashes(std::vector<std::uint64_t> block_hashes) {
+    block_hashes_ = std::move(block_hashes);
+}
+
 std::optional<cache_op_id> TreeNode::CacheOpId() const {
     return 0;
 }
@@ -104,6 +142,11 @@ std::optional<cache_op_id> TreeNode::CacheOpId() const {
 std::int32_t TreeNode::MambaSlotIndex() const {
     _assert(mamba_slot_ != nullptr, "MambaSlotIndex called on node without mamba");
     return mamba_slot_->Index();
+}
+
+std::int32_t TreeNode::MambaHostSlotIndex() const {
+    _assert(mamba_host_slot_ != nullptr, "MambaHostSlotIndex called on node without mamba host slot");
+    return mamba_host_slot_->Index();
 }
 
 }  // namespace tokenspeed

@@ -12,46 +12,56 @@ runner:
     b200-2gpu:
       GPT_OSS_EVAL_ATTENTION_BACKEND: trtllm
       GPT_OSS_EVAL_MOE_BACKEND: flashinfer_mxfp4
+      GPT_OSS_EVAL_MODEL: openai/gpt-oss-120b
     linux-mi355-2gpu-lightseek:
-      # speed up host-side mem alloc in ci
-      GPT_OSS_EVAL_KVSTORE_RATIO: "0.25"
+      GPT_OSS_EVAL_DISABLE_KVSTORE: "1"
+      GPT_OSS_EVAL_DISABLE_PREFIX_CACHING: "1"
+      GPT_OSS_EVAL_MODEL: amd/gpt-oss-120b-w-mxfp4-a-fp8
 env:
   CI: "true"
 install:
   - bash test/ci_system/install_deps.sh
 server:
   command: >-
-    python3 -m tokenspeed.api_server
-    --model openai/gpt-oss-120b
+    ts serve
+    --model ${GPT_OSS_EVAL_MODEL}
     --attn-tp-size 2
     --moe-tp-size 2
     --max-model-len 80000
-    --max-prefill-tokens 8192
-    --chunked-prefill-size 8192
     --trust-remote-code
-    --reasoning-parser gpt-oss
+    --reasoning-parser base
     ${GPT_OSS_EVAL_ATTENTION_BACKEND:+--attention-backend ${GPT_OSS_EVAL_ATTENTION_BACKEND}}
     ${GPT_OSS_EVAL_MOE_BACKEND:+--moe-backend ${GPT_OSS_EVAL_MOE_BACKEND}}
-    ${GPT_OSS_EVAL_KVSTORE_RATIO:+--kvstore-ratio ${GPT_OSS_EVAL_KVSTORE_RATIO}}
+    ${GPT_OSS_EVAL_DISABLE_KVSTORE:+--disable-kvstore}
+    ${GPT_OSS_EVAL_DISABLE_PREFIX_CACHING:+--no-enable-prefix-caching}
     --enable-cache-report
     --host 127.0.0.1
+    --port 8000
   ready:
-    url: http://127.0.0.1:8000/health
+    url: http://127.0.0.1:8000/readiness
     timeout: 1800
     interval: 10
 eval:
   install:
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
   # Expected GPQA-Diamond AveragePass@1 bar: 0.74 +- 0.03 (gpt-oss-120b reasoning).
+  # --repeats 3 samples each of the 198 questions 3x and averages, shrinking the
+  # per-run stddev by ~sqrt(3). At the 0.7 threshold this drops the noise-only
+  # failure rate from ~11% to ~2%.
+  # --eval-batch-size 64 lifts evalscope's client-side concurrency from 16 to 64
+  # (server's max_num_seqs=160, so still 2.5x headroom). At batch=16 the server
+  # was pinned at 13-16 in-flight requests with page_ratio=0.00-0.01, leaving
+  # most decode capacity idle. Higher concurrency also lets the prefix cache
+  # hit on --repeats duplicates, further reducing TTFT. Net effect: roughly
+  # cancels the 3x sample cost, making this change cost-neutral overall.
   command: >-
     /tmp/evalscope-perf/bin/evalscope eval
-    --model openai/gpt-oss-120b
+    --model ${GPT_OSS_EVAL_MODEL}
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
     --datasets gpqa_diamond
-    --eval-batch-size 16
-    --stream
-    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":65536}'
+    --eval-batch-size 64
+    --repeats 3
 report:
   github_step_summary: true
 score_threshold: 0.7

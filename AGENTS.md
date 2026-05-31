@@ -14,6 +14,16 @@
 * Before creating commits, run `pre-commit run --all-files` to format.
 * When creating commits, perform sign off on behalf of the author.
 
+## Dependency boundaries
+
+* `tokenspeed` runtime dependencies should stay vendor-neutral.
+* Runtime code should use `tokenspeed-kernel` as its only kernel package
+  boundary.
+* Third-party kernel libraries belong under `tokenspeed-kernel`; avoid direct
+  runtime dependencies or imports that bypass it.
+* If a dependency repeatedly breaks during version upgrades or slows project
+  progress, consider removing it entirely or at least making it optional.
+
 ## tokenspeed-kernel
 
 Inside the root tokenspeed-kernel/ directory:
@@ -22,5 +32,9 @@ Inside the root tokenspeed-kernel/ directory:
   re-import to other places.
 * All direct third-party code should be placed in `thirdparty/` and imported
   into `ops/` then registered via `register_kernel`.
+* Prefer CuteDSL for NVIDIA GPU kernels and Triton Gluon for AMD GPU kernels.
+  Use Triton for portable solutions across vendors. Vendor libraries should
+  stay optional, and other solutions may be used as temporary transitions, but
+  new work should consolidate toward these backend choices.
 * Files under `ops/` should follow `<family>/<solution>` structure, like
   `gemm/trtllm.py` or `attention/triton/`.

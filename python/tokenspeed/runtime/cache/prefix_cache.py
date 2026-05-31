@@ -184,6 +184,10 @@ class PrefixCache(BasePrefixCache):
         self.root_node.hash_value = []
         self.evictable_size_ = 0
         self.protected_size_ = 0
+        self.evictable_leaves: set[TreeNode] = set()
+
+        if self.enable_kv_cache_events and KV_EVENTS_AVAILABLE:
+            self.kv_event_queue.append(AllBlocksCleared())
 
     def match_prefix(self, key: list, **kwargs) -> MatchResult:
         """Find the matching prefix from the prefix tree.
@@ -197,9 +201,6 @@ class PrefixCache(BasePrefixCache):
             than the last node's value.
         """
 
-        # Emit AllBlocksCleared event when cache is reset
-        if self.enable_kv_cache_events and KV_EVENTS_AVAILABLE:
-            self.kv_event_queue.append(AllBlocksCleared())
         if self.disable or len(key) == 0:
             return self._empty_match_result()
 
@@ -380,27 +381,37 @@ class PrefixCache(BasePrefixCache):
         if self.disable:
             return
 
-        leaves = self._collect_leaves()
-        heapq.heapify(leaves)
+        heap = [
+            (self.eviction_strategy.get_priority(node), node)
+            for node in self.evictable_leaves
+        ]
+        heapq.heapify(heap)
 
         num_evicted = 0
-        while num_evicted < num_tokens and leaves:
-            x = heapq.heappop(leaves)
+        while num_evicted < num_tokens and heap:
+            _, x = heapq.heappop(heap)
 
-            if x == self.root_node:
-                break
+            # evictable_leaves only contains unlocked leaves so lock_ref > 0 can
+            # only happen for cascade parents pushed mid-loop; guard defensively.
             if x.lock_ref > 0:
                 continue
 
-            # use new free function
             self.token_to_kv_pool_allocator.append_to_later_free(x.value)
             num_evicted += len(x.value)
-            self._delete_leaf(x)
+            self._delete_leaf(x)  # removes x from evictable_leaves, may add parent
 
-            if len(x.parent.children) == 0:
-                heapq.heappush(leaves, x.parent)
+            # Push cascade parent onto the working heap so it can be evicted in
+            # this same call. _delete_leaf already added it to evictable_leaves.
+            parent = x.parent
+            if (
+                not parent.children
+                and parent.lock_ref == 0
+                and parent != self.root_node
+            ):
+                heapq.heappush(
+                    heap, (self.eviction_strategy.get_priority(parent), parent)
+                )
 
-        # trigger, append tensor to free_slots
         self.token_to_kv_pool_allocator.free_group_end()
         return num_evicted
 
@@ -414,6 +425,7 @@ class PrefixCache(BasePrefixCache):
                 self.evictable_size_ -= len(node.value)
                 self.protected_size_ += len(node.value)
                 delta -= len(node.value)
+                self.evictable_leaves.discard(node)
             node.lock_ref += 1
             node = node.parent
         return delta
@@ -431,6 +443,8 @@ class PrefixCache(BasePrefixCache):
                 self.evictable_size_ += len(node.value)
                 self.protected_size_ -= len(node.value)
                 delta += len(node.value)
+                if not node.children:
+                    self.evictable_leaves.add(node)
             node.lock_ref -= 1
             node = node.parent
         return delta
@@ -443,6 +457,14 @@ class PrefixCache(BasePrefixCache):
         return self.protected_size_
 
     ##### Internal Helper Functions #####
+
+    def _update_leaf_status(self, node: TreeNode) -> None:
+        if node == self.root_node:
+            return
+        if not node.children and node.lock_ref == 0:
+            self.evictable_leaves.add(node)
+        else:
+            self.evictable_leaves.discard(node)
 
     def _empty_match_result(self):
         return MatchResult(
@@ -515,6 +537,9 @@ class PrefixCache(BasePrefixCache):
             new_node.value = value
             node.children[key[0]] = new_node
             self.evictable_size_ += len(value)
+            # New node is a leaf; parent may have transitioned from leaf to internal.
+            self._update_leaf_status(new_node)
+            self._update_leaf_status(node)
 
             # Emit BlockStored event when new KV blocks are inserted
             if self.enable_kv_cache_events:
@@ -533,11 +558,11 @@ class PrefixCache(BasePrefixCache):
         return print_str
 
     def _delete_leaf(self, node):
-        for k, v in node.parent.children.items():
-            if v == node:
-                break
-        del node.parent.children[k]
+        del node.parent.children[node.key[0]]
         self.evictable_size_ -= len(node.key)
+        self.evictable_leaves.discard(node)
+        # Parent may have become a childless leaf.
+        self._update_leaf_status(node.parent)
 
         # Emit BlockRemoved event when KV blocks are removed
         if self.enable_kv_cache_events:
@@ -619,17 +644,3 @@ class PrefixCache(BasePrefixCache):
                 continue
             block_hash = hash(tuple(page_tokens))
             self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
-
-
-if __name__ == "__main__":
-    params = CacheInitParams(
-        req_to_token_pool=None, token_to_kv_pool_allocator=None, disable=False
-    )
-    tree = PrefixCache(params=params)
-    tree.insert([(1, 2), (3, 4)], [torch.tensor([1, 2]), torch.tensor([3, 4])])
-    tree.insert(
-        [(1, 2), (3, 4), (5, 6)],
-        [torch.tensor([1, 2]), torch.tensor([6, 5]), torch.tensor([7, 8])],
-    )
-    tree.pretty_print()
-    print(tree.match_prefix([(1, 2), (3, 4)]))

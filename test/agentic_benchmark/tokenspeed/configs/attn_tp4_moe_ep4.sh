@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-exec tokenspeed-serve \
+exec ts serve \
     --model nvidia/Kimi-K2.5-NVFP4 \
     --attn-tp-size 4 \
     --ep-size 4 \
@@ -25,5 +25,5 @@ exec tokenspeed-serve \
     --speculative-draft-model-quantization unquant \
     --drafter-attention-backend tokenspeed_mla \
     --enable-cache-report \
-    --host localhost \
+    --host 127.0.0.1 \
     --port 8000

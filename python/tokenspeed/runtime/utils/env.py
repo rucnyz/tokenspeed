@@ -28,11 +28,12 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 global_server_args_dict: dict = {
     "attention_backend": ServerArgs.attention_backend,
+    "mha_extend_mode": ServerArgs.mha_extend_mode,
     "sampling_backend": ServerArgs.sampling_backend,
     "attention_use_fp4_indexer_cache": ServerArgs.attention_use_fp4_indexer_cache,
-    "disable_deepseek_v4_fast_mhc": ServerArgs.disable_deepseek_v4_fast_mhc,
     "deepseek_v4_mega_moe_max_num_tokens": ServerArgs.deepseek_v4_mega_moe_max_num_tokens,
     "deepseek_v4_indexer_prefill_max_logits_mb": ServerArgs.deepseek_v4_indexer_prefill_max_logits_mb,
+    "deepseek_v4_prefill_chunk_size": ServerArgs.deepseek_v4_prefill_chunk_size,
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
     "kv_cache_dtype": ServerArgs.kv_cache_dtype,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
@@ -50,7 +51,7 @@ global_server_args_dict: dict = {
     "ep_num_redundant_experts": ServerArgs.ep_num_redundant_experts,
     "ep_dispatch_algorithm": ServerArgs.ep_dispatch_algorithm,
     "enable_eplb": ServerArgs.enable_eplb,
-    "mm_mode": ServerArgs.mm_mode,
+    "mm_attention_backend": ServerArgs.mm_attention_backend,
     "comm_fusion_max_num_tokens": ServerArgs.comm_fusion_max_num_tokens,
     "enable_allreduce_fusion": ServerArgs.enable_allreduce_fusion,
     "max_prefill_tokens": ServerArgs.max_prefill_tokens,
@@ -72,11 +73,12 @@ def global_server_args_dict_update(server_args: ServerArgs):
     global_server_args_dict.update(
         {
             "attention_backend": server_args.attention_backend,
+            "mha_extend_mode": server_args.mha_extend_mode,
             "sampling_backend": server_args.sampling_backend,
             "attention_use_fp4_indexer_cache": server_args.attention_use_fp4_indexer_cache,
-            "disable_deepseek_v4_fast_mhc": server_args.disable_deepseek_v4_fast_mhc,
             "deepseek_v4_mega_moe_max_num_tokens": server_args.deepseek_v4_mega_moe_max_num_tokens,
             "deepseek_v4_indexer_prefill_max_logits_mb": server_args.deepseek_v4_indexer_prefill_max_logits_mb,
+            "deepseek_v4_prefill_chunk_size": server_args.deepseek_v4_prefill_chunk_size,
             "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
             "kv_cache_dtype": server_args.kv_cache_dtype,
             "enable_nan_detection": server_args.enable_nan_detection,
@@ -95,7 +97,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
             "ep_dispatch_algorithm": server_args.ep_dispatch_algorithm,
             "enable_eplb": server_args.enable_eplb,
-            "mm_mode": server_args.mm_mode,
+            "mm_attention_backend": server_args.mm_attention_backend,
             "comm_fusion_max_num_tokens": server_args.comm_fusion_max_num_tokens,
             "enable_allreduce_fusion": server_args.enable_allreduce_fusion,
             "max_prefill_tokens": server_args.max_prefill_tokens,
@@ -282,6 +284,10 @@ class Envs:
     TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE = EnvBool(True)
     TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY = EnvBool(True)
     TOKENSPEED_REQUEST_CONVERSION_WORKERS = EnvInt(8)
+
+    # Multimodal / VLM
+    TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH = EnvBool(False)
+    TOKENSPEED_MM_SKIP_COMPUTE_HASH = EnvBool(False)
 
     # fmt: on
 

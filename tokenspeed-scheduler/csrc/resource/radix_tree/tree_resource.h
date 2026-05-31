@@ -23,7 +23,9 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <unordered_set>
+#include <set>
+#include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -35,6 +37,11 @@
 namespace tokenspeed {
 
 class TreeNode;
+
+// Forward declaration so NodeResource can store a typed back-pointer without
+// a std::function closure (avoids heap allocation and the layering ambiguity).
+template <ResourceType RType>
+class ResourceManager;
 
 template <ResourceType RType>
 class NodeResource {
@@ -48,9 +55,19 @@ public:
         ref_count_ = ref_count_ + 1;
     }
 
-    void Unlock() {
-        _assert(ref_count_ >= 1, "ref_count must >= 0");
-        ref_count_ = ref_count_ - 1;
+    // Defined below after ResourceManager is complete (needs OnNodeEvictable).
+    void Unlock();
+
+    // Called by ResourceManager when this node enters lru_leaves_.
+    // On the last Unlock(), OnNodeEvictable is called so the manager can
+    // refresh the LRU sort key with the post-Touch timestamp.
+    void BindEvictableNotifier(ResourceManager<RType>* mgr, TreeNode* node) {
+        evict_notifier_ = mgr;
+        owner_node_ = node;
+    }
+    void ClearEvictableNotifier() {
+        evict_notifier_ = nullptr;
+        owner_node_ = nullptr;
     }
 
     bool IsEmpty() const { return pages_.Empty(); }
@@ -72,6 +89,8 @@ public:
 private:
     OwnedPages pages_{};
     std::int32_t ref_count_{0};
+    ResourceManager<RType>* evict_notifier_{nullptr};
+    TreeNode* owner_node_{nullptr};
 };
 
 using DeviceResource = NodeResource<ResourceType::Device>;
@@ -81,38 +100,65 @@ template <ResourceType RType>
 class ResourceManager {
 public:
     using EvictionCallback = std::function<void(TreeNode*)>;
+    using timestamp_t = std::chrono::steady_clock::time_point;
 
     explicit ResourceManager(PageAllocator* allocator) : allocator_(allocator) {}
 
     void SetEvictionCallback(EvictionCallback cb) { eviction_callback_ = std::move(cb); }
 
+    void RemoveLeaf(TreeNode* node);
     void UpdateLeaves(TreeNode* node);
     std::vector<TreeNode*> Evict(std::int32_t num_pages);
     std::vector<TreeNode*> EnsureCapacity(std::int32_t required_num_pages);
 
+    // Called by NodeResource::Unlock() when ref_count transitions 1→0.
+    void OnNodeEvictable(TreeNode* node) { updateLeaf(node); }
+
     OwnedPages Allocate(std::int32_t num_pages) { return allocator_->Allocate(num_pages); }
     std::int32_t AvailablePages() const { return allocator_->AvailablePages(); }
 
+    // O(N) scan — locked leaves are in lru_leaves_ but not evictable.
     std::int32_t EvictablePagesNum() const {
         std::int32_t total = 0;
-        for (const TreeNode* node : leaves_) {
-            const auto& node_resource = GetResource<RType>(node);
-            if (node_resource.IsEvictable()) {
-                total += node_resource.NumPages();
+        for (const auto& [ts, sid, node] : lru_leaves_) {
+            const auto& res = GetResource<RType>(node);
+            if (res.IsEvictable()) {
+                total += res.NumPages();
             }
         }
         return total;
     }
 
 private:
+    void removeLeaf(TreeNode* node);
     void updateLeaf(TreeNode* node);
 
     PageAllocator* allocator_;
-    std::unordered_set<TreeNode*> leaves_;
+    // Leaf nodes sorted by last-access time (oldest first = LRU eviction order).
+    // node_time_ holds each node's sort key for O(1) keyed removal.
+    // Tuple key: (Time, SeqId, TreeNode*). SeqId is the deterministic
+    // tiebreaker — pointer values would diverge across TP ranks (per-process
+    // ASLR), causing different ranks to evict different leaves on Time ties
+    // and eventually wedging the next NCCL collective. Stored as std::int64_t
+    // (not TreeNode::seq_id_t) to keep the include cycle broken — tree_node.h
+    // pulls in this header for NodeResource.
+    std::set<std::tuple<timestamp_t, std::int64_t, TreeNode*>> lru_leaves_;
+    std::unordered_map<TreeNode*, timestamp_t> node_time_;
     EvictionCallback eviction_callback_{};
 };
 
 using DeviceManager = ResourceManager<ResourceType::Device>;
 using HostManager = ResourceManager<ResourceType::Host>;
+
+// Defined here (after ResourceManager is complete) because Unlock() calls
+// OnNodeEvictable(), which requires the full ResourceManager definition.
+template <ResourceType RType>
+inline void NodeResource<RType>::Unlock() {
+    _assert(ref_count_ >= 1, "ref_count must >= 1");
+    ref_count_ = ref_count_ - 1;
+    if (ref_count_ == 0 && evict_notifier_) {
+        evict_notifier_->OnNodeEvictable(owner_node_);
+    }
+}
 
 }  // namespace tokenspeed

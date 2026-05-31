@@ -56,7 +56,6 @@ from tokenspeed.runtime.engine.input_processor import InputProcessor
 from tokenspeed.runtime.engine.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
-    BatchMultimodalOut,
     BatchStrOut,
     BatchTokenIDOut,
     CloseSessionReqInput,
@@ -84,10 +83,7 @@ from tokenspeed.runtime.engine.protocol import EngineClient
 from tokenspeed.runtime.engine.scheduler_control_client import (
     SchedulerControlClient,
 )
-from tokenspeed.runtime.metrics.collector import (
-    ErrorMetricsCollector,
-    TokenizerMetricsCollector,
-)
+from tokenspeed.runtime.metrics.collector import RequestMetrics
 from tokenspeed.runtime.pd.utils import (
     DisaggregationMode,
     KVClassType,
@@ -100,7 +96,7 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
-from tokenspeed.runtime.utils.hf_transformers_utils import get_processor, get_tokenizer
+from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
 from tokenspeed.runtime.utils.process import kill_process_tree
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
@@ -161,28 +157,21 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.is_image_gen = self.model_config.is_image_gen
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
-        # Create tokenizer
+        # Create tokenizer. The engine never preprocesses images -- the SMG
+        # gateway ships precomputed multimodal inputs -- so even multimodal
+        # models only need the tokenizer, not the full HF AutoProcessor.
         if server_args.skip_tokenizer_init:
-            self.tokenizer = self.processor = None
+            self.tokenizer = None
         else:
+            self.tokenizer = get_tokenizer(
+                server_args.tokenizer,
+                tokenizer_mode=server_args.tokenizer_mode,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                architectures=self.model_config.hf_config.architectures,
+            )
             if self.model_config.is_multimodal:
-                self.processor = get_processor(
-                    server_args.tokenizer,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                )
-                self.tokenizer = self.processor.tokenizer
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-            else:
-                self.tokenizer = get_tokenizer(
-                    server_args.tokenizer,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                    architectures=self.model_config.hf_config.architectures,
-                )
-
         # Store states
         self.no_create_loop = False
         self.rid_to_state: dict[str, ReqState] = {}
@@ -205,22 +194,16 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         # Set after scheduler is initialized
         self.max_req_input_len = None
 
-        # Metrics
-        if self.enable_metrics:
-            self.metrics_collector = TokenizerMetricsCollector(
-                labels={
-                    "model_name": self.server_args.served_model_name,
-                    "app_key": self.server_args.app_key,
-                },
-                metrics_reporters=server_args.metrics_reporters,
-            )
-            self.error_collector = ErrorMetricsCollector(
-                labels={
-                    "model_name": self.server_args.served_model_name,
-                    "app_key": self.server_args.app_key,
-                },
-                metrics_reporters=server_args.metrics_reporters,
-            )
+        self.metrics = RequestMetrics(
+            labels={
+                "model_name": self.server_args.served_model_name,
+                "app_key": self.server_args.app_key,
+            },
+            enabled=(
+                self.enable_metrics
+                and "prometheus" in (server_args.metrics_reporters or [])
+            ),
+        )
 
         self.output_processor = OutputProcessor(self)
 
@@ -231,7 +214,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                         BatchStrOut,
                         BatchEmbeddingOut,
                         BatchTokenIDOut,
-                        BatchMultimodalOut,
                     ),
                     self.output_processor.handle_batch_output,
                 ),
@@ -277,10 +259,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.input_processor.validate_request(obj)
 
         obj.normalize_batch_and_arguments()
-
-        if self.enable_metrics:
-            batch_size = obj.batch_size if hasattr(obj, "batch_size") else 1
-            self.metrics_collector.observe_request_arrival(batch_size)
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -328,6 +306,9 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             tokenized_time=tokenized_obj.created_time,
         )
         self.rid_to_state[obj.rid] = state
+        mm_inputs = getattr(tokenized_obj, "multimodal_inputs", None)
+        if mm_inputs is not None:
+            mm_inputs.publish_shm_features()
         self.engine_core_client.send_to_scheduler.send_pyobj(tokenized_obj)
 
     async def _wait_one_response(
@@ -386,10 +367,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                     if isinstance(out["meta_info"].get("finish_reason"), dict):
                         finish_reason = out["meta_info"]["finish_reason"]
                         if finish_reason.get("type") == "abort":
-                            if self.enable_metrics:
-                                self.error_collector.record_error(
-                                    finish_reason.get("message")
-                                )
                             if (
                                 finish_reason.get("status_code")
                                 == HTTPStatus.BAD_REQUEST

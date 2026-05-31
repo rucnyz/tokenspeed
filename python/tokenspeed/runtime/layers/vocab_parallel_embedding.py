@@ -1,3 +1,9 @@
+# Adapted from meituan-longcat/SGLang-FluentLLM.
+# This file has been modified for this repository.
+# This file may incorporate material from ModelTC/lightllm,
+# vllm-project/vllm, and sgl-project/sglang, as identified in
+# python/THIRDPARTYNOTICES.
+
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -497,14 +503,14 @@ class VocabParallelEmbedding(torch.nn.Module):
             masked_input = input_
 
         # Get the embeddings.
-        output_parallel = self.linear_method.embedding(self, masked_input.long())
+        output_parallel = self.linear_method.embedding(self, masked_input)
 
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
 
             if reduce_results:
-                output = all_reduce(output_parallel, self.tp_rank, self.tp_group)
+                output = all_reduce(output_parallel, self.tp_group)
             else:
                 output = output_parallel
 

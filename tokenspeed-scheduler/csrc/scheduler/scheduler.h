@@ -22,6 +22,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -32,11 +34,14 @@
 #include "scheduler/request.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/execution_event.h"
+#include "scheduler/kv_cache_events.h"
 
 #include "resource/allocator/page_allocator.h"
+#include "resource/allocator/paged_cache_group.h"
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "resource/allocator/mamba_chunk_allocator.h"
+#include "resource/allocator/mamba_host_allocator.h"
 #include "resource/hybrid_prefix_cache/hybrid_prefix_cache.h"
 
 #include "fsm/forward_events.h"
@@ -54,6 +59,7 @@ public:
     ExecutionPlan NextExecutionPlan();
 
     void Advance(const ExecutionEvent& event);
+    std::vector<KvCacheEvent> DrainKvEvents();
 
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
@@ -62,6 +68,14 @@ public:
     std::size_t ActiveKvPages() const;
     std::size_t PrefillSize() const;
     std::int32_t GetRequestTokenSize(const std::string& id) const;
+    std::vector<std::string> PagedCacheGroupIds() const;
+    std::int32_t PagedCacheGroupTotalPages(const std::string& group_id) const;
+    std::int32_t PagedCacheGroupAvailablePages(const std::string& group_id) const;
+    std::int64_t PagedCacheGroupFailedAllocCount(const std::string& group_id) const;
+    std::vector<std::int32_t> GetRequestPagedCachePageIds(const std::string& request_id,
+                                                          const std::string& group_id) const;
+    // Compact-view base logical-page offset; 0 for full-history / unseen.
+    std::int32_t GetRequestPagedCacheBaseLogicalPage(const std::string& request_id, const std::string& group_id) const;
 
 private:
     // Second element is LoadBackOperation list (normal path) or WriteBackOperation list (retract triggered).
@@ -83,11 +97,14 @@ private:
 
     std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(
         Request* request, std::int32_t remaining, std::int32_t reserve_num_tokens_in_next_schedule_event,
-        bool disable_l2_cache);
+        bool disable_l2_cache, std::map<std::string, std::int32_t>& simulated_free);
     std::optional<fsm::SchedulePrefillEvent> schedulePrefill(Request* request, std::int32_t remaining,
-                                                             std::int32_t reserve_num_tokens_in_next_schedule_event);
-    std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(Request* request);
-    std::optional<fsm::ScheduleDecodeFromRetractedEvent> scheduleDecodeFromRetracted(Request* request);
+                                                             std::int32_t reserve_num_tokens_in_next_schedule_event,
+                                                             std::map<std::string, std::int32_t>& simulated_free);
+    std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(Request* request,
+                                                           std::map<std::string, std::int32_t>& simulated_free);
+    std::optional<fsm::ScheduleDecodeFromRetractedEvent> scheduleDecodeFromRetracted(
+        Request* request, std::map<std::string, std::int32_t>& simulated_free);
     std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);
 
     void check_device_mem();
@@ -116,14 +133,16 @@ private:
 private:
     PageAllocator device_allocator_;
     PageAllocator host_allocator_;
+    std::optional<MambaChunkAllocator> mamba_allocator_{};
+    std::optional<MambaHostAllocator> mamba_host_allocator_{};
     KVPrefixCache kv_prefix_cache_;
     ReqPoolAllocator req_pool_allocator_;
-    std::optional<MambaChunkAllocator> mamba_allocator_{};
     std::optional<HybridPrefixCache> hybrid_prefix_cache_{};
 
 private:
     std::unordered_map<std::string, std::unique_ptr<Request>> requests_;
     std::unordered_map<cache_op_id, CacheOpSpec> cache_op_tracker_;
+    std::vector<KvCacheEvent> kv_events_;
     // Stats
     SchedulerStats stats_;
 };

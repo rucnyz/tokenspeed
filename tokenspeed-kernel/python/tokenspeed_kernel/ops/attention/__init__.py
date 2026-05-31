@@ -20,25 +20,38 @@
 
 from __future__ import annotations
 
+import math
+
 # Backend registration (side-effect imports)
+import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
 import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
 import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
+import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.attention.flash_attn import mha_decode_scheduler_metadata
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 
+
+def _attention_format_signature(**roles: torch.Tensor):
+    return format_signature(
+        **{role: dense_tensor_format(tensor.dtype) for role, tensor in roles.items()}
+    )
+
+
 __all__ = [
     "mha_prefill",
-    "mha_prefill_with_kvcache",
+    "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
+    "mha_merge_state",
+    "mha_decode_scheduler_metadata",
 ]
 
-
-def _requires_logit_cap(logit_cap: float) -> bool:
-    return logit_cap != 0.0
+LSE_LN = math.log2(math.e)
 
 
 def mha_prefill(
@@ -46,70 +59,70 @@ def mha_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_kv: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu: list[int],
+    max_seqlen: int,
     # attention options
-    softmax_scale: float | None = None,
-    is_causal: bool = True,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
     # dispatch options
     override: str | None = None,
+    solution: str | None = None,
 ) -> AttentionResult:
-    """Ragged MHA prefill without KV cache.
+    """MHA prefill from uncached KV.
 
     Args:
         q: Query tensor with shape [total_q, num_q_heads, head_dim].
         k: Key tensor with shape [total_kv, num_kv_heads, head_dim].
         v: Value tensor with shape [total_kv, num_kv_heads, head_dim].
-        cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
-        cu_seqlens_kv: KV cumulative sequence lengths with shape [batch + 1].
-        max_seqlen_q: Maximum query length.
-        max_seqlen_k: Maximum KV length.
-        softmax_scale: Optional scale factor applied before softmax.
-        is_causal: Whether to apply causal masking.
+        cu_seqlens: Cumulative sequence lengths with shape [batch + 1].
+            KV cumulative sequence lengths are assumed to be identical.
+        cu_seqlens_cpu: Host-side cumulative sequence lengths as a strict
+            list[int]. Used for host-side launch metadata; must match cu_seqlens.
+        max_seqlen: Maximum sequence length.
         window_left: Inclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
-        return_lse: Whether to also return log-sum-exp values.
+        return_lse: Whether to also return natural-log log-sum-exp values with
+            shape [total_q, num_q_heads].
         override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
 
-    Standard full-sequence prefill is the special case where
-    cu_seqlens_q == cu_seqlens_kv.
+    Standard full-sequence prefill assumes query and KV sequence boundaries match.
     """
+    batch_size = cu_seqlens.shape[0] - 1
+
     # Select kernel
     traits = {
         "num_q_heads": q.shape[1],
         "num_kv_heads": k.shape[1],
         "head_dim": q.shape[-1],
-        "is_causal": is_causal,
         "sliding_window": window_left >= 0,
-        "support_logit_cap": _requires_logit_cap(logit_cap),
+        "support_logit_cap": logit_cap != 0.0,
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
     }
+    signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(
         "attention",
         "mha_prefill",
-        q.dtype,
+        signature,
         traits=traits,
+        solution=solution,
         override=override,
     )
 
     # Record shapes
     shape_params = {
-        "batch_size": cu_seqlens_q.shape[0] - 1,
+        "batch_size": batch_size,
         "total_q": q.shape[0],
         "total_kv": k.shape[0],
         "num_q_heads": q.shape[1],
         "num_kv_heads": k.shape[1],
         "head_dim": q.shape[-1],
-        "max_seqlen_q": max_seqlen_q,
-        "max_seqlen_k": max_seqlen_k,
+        "max_seqlen": max_seqlen,
     }
     ShapeCapture.get().record(
         "attention",
@@ -131,12 +144,9 @@ def mha_prefill(
             q=q,
             k=k,
             v=v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_kv,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=softmax_scale,
-            is_causal=is_causal,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            max_seqlen=max_seqlen,
             window_left=window_left,
             logit_cap=logit_cap,
             sinks=sinks,
@@ -144,11 +154,9 @@ def mha_prefill(
         )
 
 
-def mha_prefill_with_kvcache(
+def mha_extend_with_kvcache(
     # attention inputs
     q: torch.Tensor,
-    k: torch.Tensor | None,
-    v: torch.Tensor | None,
     cu_seqlens_q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -157,55 +165,57 @@ def mha_prefill_with_kvcache(
     max_seqlen_q: int,
     max_seqlen_k: int,
     # attention options
-    softmax_scale: float | None = None,
-    is_causal: bool = True,
+    is_causal: bool = False,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
     # dispatch options
     override: str | None = None,
+    solution: str | None = None,
 ) -> AttentionResult:
-    """Ragged MHA extend-prefill with paged KV cache.
+    """MHA extend with paged KV cache.
 
     Args:
         q: Query tensor with shape [total_q, num_q_heads, head_dim].
-        k: Optional new key tensor with shape [total_q, num_kv_heads, head_dim].
-            When None, the appended KV is assumed to already be present in k_cache.
-        v: Optional new value tensor with shape [total_q, num_kv_heads, head_dim].
-            When None, the appended KV is assumed to already be present in v_cache.
         cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
         k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
         v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
         page_table: Page table with shape [batch, max_pages_per_seq].
-        cache_seqlens: Total visible KV lengths after appending the new KV, shape [batch].
+        cache_seqlens: Visible KV lengths in the cache, shape [batch]. Query
+            lengths are independent and may be smaller than KV lengths.
         max_seqlen_q: Maximum query length.
         max_seqlen_k: Maximum KV length.
-        softmax_scale: Optional scale factor applied before softmax.
-        is_causal: Whether to apply causal masking.
+        is_causal: Whether query tokens are a causal suffix of cached KV.
         window_left: Inclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
-        return_lse: Whether to also return log-sum-exp values.
+        return_lse: Whether to also return natural-log log-sum-exp values with
+            shape [total_q, num_q_heads].
         override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Each request's query tokens attend all visible cached KV tokens.
     """
     # Select kernel
     traits = {
         "num_q_heads": q.shape[1],
-        "num_kv_heads": (k.shape[1] if k is not None else k_cache.shape[2]),
+        "num_kv_heads": k_cache.shape[2],
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
         "is_causal": is_causal,
         "sliding_window": window_left >= 0,
-        "support_logit_cap": _requires_logit_cap(logit_cap),
+        "support_logit_cap": logit_cap != 0.0,
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
     }
+    signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
     kernel = select_kernel(
         "attention",
-        "mha_prefill_with_kvcache",
-        q.dtype,
+        "mha_extend_with_kvcache",
+        signature,
         traits=traits,
+        solution=solution,
         override=override,
     )
 
@@ -217,14 +227,14 @@ def mha_prefill_with_kvcache(
         "page_size": k_cache.shape[1],
         "max_pages_per_seq": page_table.shape[1],
         "num_q_heads": q.shape[1],
-        "num_kv_heads": k.shape[1] if k is not None else k_cache.shape[2],
+        "num_kv_heads": k_cache.shape[2],
         "head_dim": q.shape[-1],
         "max_seqlen_q": max_seqlen_q,
         "max_seqlen_k": max_seqlen_k,
     }
     ShapeCapture.get().record(
         "attention",
-        "mha_prefill_with_kvcache",
+        "mha_extend_with_kvcache",
         kernel.name,
         q.dtype,
         shape_params,
@@ -233,21 +243,18 @@ def mha_prefill_with_kvcache(
     # Enter profiling scope
     with kernel_scope(
         "attention",
-        "mha_prefill_with_kvcache",
+        "mha_extend_with_kvcache",
         q.dtype,
         kernel_name=kernel.name,
         **shape_params,
     ):
         return kernel(
             q=q,
-            k=k,
-            v=v,
             cu_seqlens_q=cu_seqlens_q,
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=page_table,
             cache_seqlens=cache_seqlens,
-            softmax_scale=softmax_scale,
             is_causal=is_causal,
             window_left=window_left,
             logit_cap=logit_cap,
@@ -267,16 +274,16 @@ def mha_decode_with_kvcache(
     cache_seqlens: torch.Tensor,
     max_seqlen_k: int,
     # attention options
-    softmax_scale: float | None = None,
-    is_causal: bool = True,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
+    scheduler_metadata: torch.Tensor | None = None,
     # dispatch options
     override: str | None = None,
+    solution: str | None = None,
 ) -> AttentionResult:
-    """Single-token MHA decode with paged KV cache.
+    """MHA decode with paged KV cache.
 
     Args:
         q: Query tensor with shape [batch, num_q_heads, head_dim].
@@ -285,13 +292,12 @@ def mha_decode_with_kvcache(
         page_table: Page table with shape [batch, max_pages_per_seq].
         cache_seqlens: Total visible KV lengths after appending current decode tokens, shape [batch].
         max_seqlen_k: Maximum KV length.
-        softmax_scale: Optional scale factor applied before softmax.
-        is_causal: Whether to apply causal masking.
         window_left: Inclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return log-sum-exp values.
         override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
     """
     if q.shape[0] != cache_seqlens.shape[0]:
         raise ValueError(
@@ -305,18 +311,18 @@ def mha_decode_with_kvcache(
         "num_kv_heads": k_cache.shape[2],
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
-        "is_causal": is_causal,
         "sliding_window": window_left >= 0,
-        "support_logit_cap": _requires_logit_cap(logit_cap),
+        "support_logit_cap": logit_cap != 0.0,
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
-        "query_len": 1,
     }
+    signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
     kernel = select_kernel(
         "attention",
         "mha_decode_with_kvcache",
-        q.dtype,
+        signature,
         traits=traits,
+        solution=solution,
         override=override,
     )
 
@@ -349,17 +355,83 @@ def mha_decode_with_kvcache(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        return kernel(
+        kernel_kwargs = dict(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=page_table,
             cache_seqlens=cache_seqlens,
-            softmax_scale=softmax_scale,
-            is_causal=is_causal,
             window_left=window_left,
             logit_cap=logit_cap,
             sinks=sinks,
             return_lse=return_lse,
             max_seqlen_k=max_seqlen_k,
+        )
+        # Only the FA3 path accepts pre-computed scheduler metadata; other
+        # backends would reject the unknown kwarg.
+        if scheduler_metadata is not None:
+            kernel_kwargs["scheduler_metadata"] = scheduler_metadata
+        return kernel(**kernel_kwargs)
+
+
+def mha_merge_state(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+    *,
+    lse_scale_log2: float = LSE_LN,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge two MHA partial attention states.
+
+    Args:
+        out_a: First partial output with shape [total_q, num_heads, head_dim].
+        lse_a: First partial log-sum-exp with shape [total_q, num_heads].
+        out_b: Second partial output with shape [total_q, num_heads, head_dim].
+        lse_b: Second partial log-sum-exp with shape [total_q, num_heads].
+        lse_scale_log2: Multiplier that converts input LSE to log2 domain.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+    """
+    traits = {
+        "head_dim": out_a.shape[-1],
+    }
+    signature = _attention_format_signature(out_a=out_a, out_b=out_b)
+    kernel = select_kernel(
+        "attention",
+        "mha_merge_state",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "total_q": out_a.shape[0],
+        "num_heads": out_a.shape[1],
+        "head_dim": out_a.shape[2],
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mha_merge_state",
+        kernel.name,
+        out_a.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "mha_merge_state",
+        out_a.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            out_a=out_a,
+            lse_a=lse_a,
+            out_b=out_b,
+            lse_b=lse_b,
+            lse_scale_log2=lse_scale_log2,
         )

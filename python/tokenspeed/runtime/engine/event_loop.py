@@ -20,6 +20,7 @@
 
 import faulthandler
 import signal
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -34,6 +35,7 @@ from tokenspeed.runtime.cache.executor.memory_executor import (
     MemoryExecutor,
     MemoryExecutorConfig,
 )
+from tokenspeed.runtime.cache.transfer.types import CacheKind
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -47,6 +49,8 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_to_payload,
     cache_sync_debug_enabled,
     make_config,
+    pool_to_paged_cache_groups,
+    pool_to_prefix_cache_adjunct_spec,
     pop_common_cache_event_payloads,
 )
 from tokenspeed.runtime.execution.distributed_initializer import (
@@ -62,10 +66,18 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import GrammarStepInputs
 from tokenspeed.runtime.layers.attention.registry import create_attn_components
+from tokenspeed.runtime.metrics.collector import EngineMetrics
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.factory import (
     create_pd_kv_transfer,
     get_kv_args,
+)
+from tokenspeed.runtime.pd.kv_events import (
+    EventPublisherFactory,
+    KVEventBatch,
+    NullEventPublisher,
+    drain_scheduler_kv_events,
+    scheduler_kv_events_to_wire_events,
 )
 from tokenspeed.runtime.pd.mooncake.entities import ManagerArgs
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
@@ -160,7 +172,7 @@ class EventLoop:
         has_mamba = getattr(self.model_config, "mambaish_config", None) is not None or (
             text_config is not None and hasattr(text_config, "mamba2_cache_params")
         )
-        enable_mamba_radix_cache = has_mamba and server_args.enable_prefix_caching
+
         model_executor_config = ModelExecutorConfig.from_server_args(
             server_args=server_args,
             model_config=self.model_config,
@@ -213,6 +225,26 @@ class EventLoop:
                 "KVStore L2 cache will not be used during normal execution, but it will still be used when retraction happens."
             )
 
+        mamba_l2_host_slots = 0
+        if has_mamba and server_args.enable_mamba_l2:
+            if server_args.mamba_l2_host_slots > 0:
+                mamba_l2_host_slots = server_args.mamba_l2_host_slots
+            elif server_args.mamba_l2_host_gb > 0 and mamba_pool is not None:
+                slot_bytes = int(
+                    mamba_pool.conv_state.shape[0]
+                    * (
+                        mamba_pool.conv_state[0, 0].nbytes
+                        + mamba_pool.ssm_state[0, 0].nbytes
+                    )
+                )
+                mamba_l2_host_slots = int(
+                    server_args.mamba_l2_host_gb * (1024**3) // max(slot_bytes, 1)
+                )
+            else:
+                mamba_l2_host_slots = max(
+                    int(mamba_pool_total_chunks * server_args.mamba_l2_ratio), 1
+                )
+
         mem_cfg = MemoryExecutorConfig(
             layer_num=self.model_config.num_hidden_layers,
             page_size=server_args.block_size,
@@ -223,6 +255,10 @@ class EventLoop:
             storage_backend=server_args.kvstore_storage_backend,
             storage_backend_extra_config=server_args.kvstore_storage_backend_extra_config,
             model_name=server_args.model,
+            enable_mamba_l2=server_args.enable_mamba_l2,
+            mamba_l2_host_slots=mamba_l2_host_slots,
+            mamba_l2_layout=server_args.mamba_l2_layout,
+            mamba_l2_io_backend=server_args.mamba_l2_io_backend,
         )
         is_deepseek_v4_pool = (
             type(token_to_kv_pool).__name__ == "DeepseekV4TokenToKVPool"
@@ -242,6 +278,7 @@ class EventLoop:
                 is_dp_attention_enabled=self.has_dp,
                 tp_group=self.attn_tp_cpu_group,
                 draft_device_pool=draft_token_to_kv_pool,
+                mamba_pool=mamba_pool,
             )
             num_host_pages = self.memory_executor.host_pool.page_num
 
@@ -250,13 +287,25 @@ class EventLoop:
         # req_pool_slots based on this value, so it must match the
         # per-DP-rank budget (same division used in cuda_graph_wrapper).
         per_rank_max_batch = server_args.max_num_seqs // max(self.dp_size, 1)
-        if enable_mamba_radix_cache and server_args.max_mamba_cache_size is None:
+        self._kv_events_enabled = (
+            EventPublisherFactory.is_enabled(server_args.kv_events_config)
+            and attn_tp_rank == 0
+        )
+
+        if has_mamba and server_args.max_mamba_cache_size is None:
             logger.info(
                 f"Mamba radix cache enabled without explicit max_mamba_cache_size. "
                 f"Auto-derived mamba_pool_total_chunks={mamba_pool_total_chunks} "
                 f"(ratio={server_args.mamba_full_memory_ratio})."
             )
 
+        # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
+
+        paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
+        prefix_cache_adjunct = None
+        required_groups = token_to_kv_pool.prefix_cache_required_group_ids
+        if required_groups is not None and server_args.enable_prefix_caching:
+            prefix_cache_adjunct = pool_to_prefix_cache_adjunct_spec(required_groups)
         scheduler_cfg = make_config(
             num_device_pages=self.max_total_num_tokens // server_args.block_size,
             max_scheduled_tokens=server_args.chunked_prefill_size,
@@ -267,21 +316,27 @@ class EventLoop:
             enable_l3_storage=server_args.kvstore_storage_backend is not None,
             prefetch_threshold=4,  # Keep this hard-coded until it becomes configurable.
             role=server_args.disaggregation_mode,
+            enable_kv_cache_events=self._kv_events_enabled,
             decode_input_tokens=(
                 server_args.speculative_num_draft_tokens
                 if server_args.speculative_algorithm is not None
                 else 1
             ),
             disable_prefix_cache=not server_args.enable_prefix_caching,
-            enable_mamba=enable_mamba_radix_cache,
+            enable_mamba=has_mamba,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
             mamba_pool_total_chunks=mamba_pool_total_chunks,
+            enable_mamba_l2=server_args.enable_mamba_l2,
+            mamba_l2_host_slots=mamba_l2_host_slots,
+            paged_cache_groups=paged_cache_groups,
+            enable_mixed_prefill_decode=server_args.enable_mixed_batch,
+            prefix_cache_adjunct=prefix_cache_adjunct,
         )
         logger.info(
             "Scheduler config: page_size=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
-            "num_mamba_slots=%s",
+            "mamba_pool_total_chunks=%s enable_mamba=%s",
             scheduler_cfg.page_size,
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
@@ -291,10 +346,31 @@ class EventLoop:
             server_args.max_num_seqs,
             self.dp_size,
             mamba_pool_total_chunks,
+            has_mamba,
         )
         self.scheduler = Scheduler(scheduler_cfg)
+        if attn_tp_rank == 0:
+            self.kv_event_publisher = EventPublisherFactory.create(
+                server_args.kv_events_config,
+                attn_dp_rank=dp_rank,
+            )
+        else:
+            self.kv_event_publisher = NullEventPublisher(attn_dp_rank=dp_rank)
 
         self._init_interprocess_comm()
+
+        self.metrics = EngineMetrics(
+            labels={
+                "model_name": server_args.served_model_name,
+                "app_key": server_args.app_key or "",
+                "dp_rank": str(dp_rank),
+            },
+            enabled=(
+                server_args.enable_metrics
+                and attn_tp_rank == 0
+                and "prometheus" in (server_args.metrics_reporters or [])
+            ),
+        )
 
         self.request_handler = RequestHandler(
             server_args=self.server_args,
@@ -317,6 +393,7 @@ class EventLoop:
                 else None
             ),
             stream_interval=self.server_args.stream_interval,
+            metrics=self.metrics,
         )
         self.prefetch_threshold = scheduler_cfg.prefetch_threshold
 
@@ -408,6 +485,23 @@ class EventLoop:
             ec.add_event(e)
         self.scheduler.advance(ec)
         logger.debug("[cache_poll] scheduler.advance() done")
+        self._publish_scheduler_kv_events()
+
+    def _publish_scheduler_kv_events(self) -> None:
+        raw_events = drain_scheduler_kv_events(
+            self.scheduler,
+            enabled=self._kv_events_enabled,
+        )
+        if not raw_events:
+            return
+
+        events = scheduler_kv_events_to_wire_events(raw_events)
+        if not events:
+            return
+
+        self.kv_event_publisher.publish(
+            KVEventBatch(ts=time.time(), events=events, attn_dp_rank=self.dp_rank)
+        )
 
     def _pop_ready_cache_event_payloads(self) -> list[dict]:
         local_payloads = list(self._pending_cache_event_payloads.values())
@@ -472,6 +566,7 @@ class EventLoop:
         dp_all_decode_or_idle = (
             dp_metadata.all_decode_or_idle if dp_metadata is not None else False
         )
+        multimodal_context = self._get_multimodal_context_for_forward(forward_op)
 
         self.model_executor.update_block_table(forward_op)
 
@@ -486,6 +581,7 @@ class EventLoop:
                     dp_global_bs=dp_global_bs,
                     dp_all_decode_or_idle=dp_all_decode_or_idle,
                     grammar_inputs=grammar_inputs,
+                    multimodal_context=multimodal_context,
                     **stats,
                 ),
                 None,
@@ -513,6 +609,7 @@ class EventLoop:
                         dp_global_num_tokens=dp_global_num_tokens,
                         dp_global_bs=dp_global_bs,
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
+                        multimodal_context=multimodal_context,
                         **stats,
                     ),
                     None,
@@ -537,18 +634,88 @@ class EventLoop:
                         dp_global_bs=dp_global_bs,
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
                         grammar_inputs=grammar_inputs,
+                        multimodal_context=multimodal_context,
                         **stats,
                     ),
                     self.pd_kv_transfer.store_prefill_token,
                 )
 
+    def _get_multimodal_context_for_forward(self, forward_op):
+        if not self.model_config.is_multimodal_active:
+            return None
+
+        num_extends = forward_op.num_extends()
+        mm_inputs = []
+        has_mm = False
+        for index, rid in enumerate(forward_op.request_ids):
+            state = self.output_processor.rid_to_state.get(rid)
+            if state is not None and index < num_extends:
+                state.maybe_extend_multimodal_mrope_positions()
+            item = getattr(state, "multimodal_inputs", None) if state else None
+            mm_inputs.append(item)
+            has_mm = has_mm or item is not None
+        if not has_mm:
+            return None
+
+        from tokenspeed.runtime.multimodal.inputs import MultimodalForwardContext
+
+        return MultimodalForwardContext(
+            mm_inputs=mm_inputs,
+            extend_prefix_lens=list(forward_op.extend_prefix_lens),
+            extend_seq_lens=list(forward_op.input_lengths[:num_extends]),
+        )
+
+    def _build_mamba_layerwise_cow(
+        self, execution_plan, forward_op
+    ) -> dict[int, list[int]]:
+        if forward_op is None:
+            return {}
+        loaded_mamba_slots: set[int] = set()
+        for cache_op in execution_plan.cache:
+            if not isinstance(cache_op, Cache.LoadBackOp):
+                continue
+            dst_by_kind = getattr(cache_op, "dst_pages_by_kind", None)
+            if dst_by_kind is None:
+                dst_groups = getattr(cache_op, "dst_pages", [])
+            else:
+                dst_groups = dst_by_kind.get(CacheKind.MAMBA.value, [])
+            for dst_pages in dst_groups:
+                loaded_mamba_slots.update(int(page) for page in dst_pages)
+        if not loaded_mamba_slots:
+            return {}
+
+        cow_src_indices = getattr(forward_op, "mamba_cow_src_indices", None)
+        working_indices = getattr(forward_op, "mamba_pool_indices", None)
+        if cow_src_indices is None or working_indices is None:
+            return {}
+
+        cow_by_src: dict[int, list[int]] = {}
+        for cow_src, working in zip(list(cow_src_indices), list(working_indices)):
+            cow_src = int(cow_src)
+            working = int(working)
+            if cow_src < 0 or working < 0 or cow_src not in loaded_mamba_slots:
+                continue
+            cow_dsts = cow_by_src.setdefault(cow_src, [])
+            if working not in cow_dsts:
+                cow_dsts.append(working)
+        return cow_by_src
+
     def _submit_cache_ops(self, execution_plan) -> None:
         if self.memory_executor is None:
             return
+        forward_op = self._get_forward_op(execution_plan)
+        mamba_layerwise_cow = self._build_mamba_layerwise_cow(
+            execution_plan, forward_op
+        )
+        if mamba_layerwise_cow:
+            self.model_executor.set_layerwise_mamba_cow_done(mamba_layerwise_cow)
+            self.memory_executor.set_mamba_layerwise_cow(mamba_layerwise_cow)
         self.memory_executor.submit_plan(execution_plan)
         for op in execution_plan.cache:
-            if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
+            if isinstance(op, Cache.WriteBackOp):
                 self._num_inflight_cache_ops += len(op.op_ids)
+            elif isinstance(op, Cache.LoadBackOp):
+                continue
             elif isinstance(op, (Cache.PrefetchOp, Cache.BackUpOp)):
                 self._num_inflight_cache_ops += 1
             else:
@@ -556,29 +723,39 @@ class EventLoop:
         self._setup_layerwise_loadback(execution_plan)
 
     def _setup_layerwise_loadback(self, execution_plan) -> None:
-        consumer_indices = []
+        host_exec = getattr(self.memory_executor, "host_exec", None)
+        available_pools = (
+            getattr(host_exec, "pools", {}) if host_exec is not None else {}
+        )
+        consumer_indices_by_kind: dict[CacheKind, list[int]] = {
+            kind: [] for kind in available_pools
+        }
         for cache_op in execution_plan.cache:
             if isinstance(cache_op, Cache.LoadBackOp):
                 for op_id in cache_op.op_ids:
-                    producer_idx = self.memory_executor.get_producer_index(op_id)
-                    if (
-                        producer_idx is not None
-                        and producer_idx not in consumer_indices
-                    ):
-                        consumer_indices.append(producer_idx)
-        self.memory_executor.set_consumer(consumer_indices if consumer_indices else -1)
-        # Fence WriteBack against this iter's ``set_kv_buffer``: the
-        # scheduler can re-allocate a freed-but-not-yet-written-back slot
-        # to a new prefill / decode within the same iter. ``set_kv_buffer``
-        # runs before any ``wait_until`` in attention, so nothing else
-        # orders writeback's reads against the new writes. Cheap when
-        # write_stream is idle.
-        # LoadBack does not need fencing here: it only fires on admission
-        # iters (eager prefill), whose per-layer ``wait_until`` drains
-        # ``load_stream`` before the iter ends.
-        host_exec = getattr(self.memory_executor, "host_exec", None)
-        if host_exec is not None:
-            self.model_executor.execution_stream.wait_stream(host_exec.write_stream)
+                    for kind in consumer_indices_by_kind:
+                        producer_idx = self.memory_executor.get_producer_index(
+                            kind, op_id
+                        )
+                        if (
+                            producer_idx is not None
+                            and producer_idx not in consumer_indices_by_kind[kind]
+                        ):
+                            consumer_indices_by_kind[kind].append(producer_idx)
+        for kind, consumer_indices in consumer_indices_by_kind.items():
+            self.memory_executor.set_consumer(
+                kind, consumer_indices if consumer_indices else -1
+            )
+
+    def _flush_mamba_retract_states(self, forward_op) -> None:
+        """Copy draft->working mamba states when retract occurred (no forward scheduled)."""
+        if forward_op is not None:
+            return
+        if self.model_executor.drafter is None:
+            return
+        if self.model_executor.runtime_states.mamba_pool is None:
+            return
+        self.model_executor.flush_mamba_draft_to_working_on_retract()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -729,8 +906,9 @@ class EventLoop:
         on_first_token=None,
     ):
         self.request_handler.forward_ct += 1
-        forward_mode = (
-            ForwardMode.EXTEND if forward_op.num_extends() > 0 else ForwardMode.DECODE
+        forward_mode = ForwardMode.from_num_extends(
+            forward_op.num_extends(),
+            len(forward_op.request_ids),
         )
         self.request_handler._profile_batch_predicate(forward_mode)
 
@@ -803,12 +981,11 @@ class EventLoop:
         batch_size = len(forward_op.request_ids) if forward_op is not None else 0
         if forward_op is None:
             forward_mode = ForwardMode.IDLE
-        elif forward_op.num_extends() > 0:
-            forward_mode = ForwardMode.EXTEND
-        elif self.server_args.speculative_algorithm is not None:
-            forward_mode = ForwardMode.TARGET_VERIFY
         else:
-            forward_mode = ForwardMode.DECODE
+            forward_mode = ForwardMode.from_num_extends(
+                forward_op.num_extends(),
+                batch_size,
+            )
 
         self._dp_local_info[0, 0] = num_tokens
         self._dp_local_info[0, 1] = batch_size
@@ -824,13 +1001,7 @@ class EventLoop:
         any_rank_has_work = max(global_num_tokens) > 0
         need_idle_forward = num_tokens == 0 and any_rank_has_work
         all_decode_or_idle = all(
-            mode
-            in (
-                int(ForwardMode.DECODE),
-                int(ForwardMode.IDLE),
-                int(ForwardMode.TARGET_VERIFY),
-            )
-            for mode in global_forward_mode
+            ForwardMode(mode).is_decode_or_idle() for mode in global_forward_mode
         )
         return DpForwardMetadata(
             global_num_tokens=global_num_tokens,
@@ -851,6 +1022,17 @@ class EventLoop:
             "num_queue_reqs": self.scheduler.waiting_size(),
         }
 
+    def _record_scheduler_iteration_metrics(
+        self, stats: dict, num_iteration_tokens: int
+    ) -> None:
+        self.metrics.record_scheduler_iteration(
+            running=len(self.output_processor.rid_to_state),
+            waiting=stats["num_queue_reqs"],
+            num_active_pages=stats["num_active_pages"],
+            num_total_pages=self.max_total_num_tokens // self.server_args.block_size,
+            num_iteration_tokens=num_iteration_tokens,
+        )
+
     # ------------------------------------------------------------------
     # Event loops
     # ------------------------------------------------------------------
@@ -861,9 +1043,16 @@ class EventLoop:
             self._process_new_requests()
             self._commit_cache_results()
             execution_plan = self.scheduler.next_execution_plan()
+            self._publish_scheduler_kv_events()
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
+            self._flush_mamba_retract_states(forward_op)
+
+            stats = self._get_scheduler_stats()
+            num_iter_tokens = (
+                sum(forward_op.input_lengths) if forward_op is not None else 0
+            )
 
             # DP sync: all ranks must participate even when idle.
             dp_metadata = None
@@ -875,12 +1064,12 @@ class EventLoop:
                         dp_metadata.global_batch_size,
                         dp_metadata.all_decode_or_idle,
                     )
+                    self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
                     continue
 
             request_changes = []
 
             if forward_op is not None:
-                stats = self._get_scheduler_stats()
                 sampling_params_list = self._gather_sampling_params(forward_op)
                 grammar_inputs = self._gather_grammar_state(forward_op)
                 results, on_first_token = self._dispatch_forward(
@@ -904,6 +1093,9 @@ class EventLoop:
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
+                self._publish_scheduler_kv_events()
+
+            self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 
     def _gather_sampling_params(self, forward_op) -> list[SamplingParams]:
         """Look up per-request SamplingParams from the output processor. The
@@ -965,10 +1157,18 @@ class EventLoop:
             self._process_new_requests()
             self._commit_cache_results()
             execution_plan = self.scheduler.next_execution_plan()
+            self._publish_scheduler_kv_events()
 
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
+            self._flush_mamba_retract_states(forward_op)
+
+            stats = self._get_scheduler_stats()
+            num_iter_tokens = (
+                sum(forward_op.input_lengths) if forward_op is not None else 0
+            )
+
             grammar_inputs = None
             if forward_op is not None:
                 # Gather both sampling params and grammar state BEFORE the
@@ -989,6 +1189,7 @@ class EventLoop:
                             prev_forward_op, prev_results
                         )
                         advance_forward(self.scheduler, request_changes)
+                        self._publish_scheduler_kv_events()
                         prev_results = None
                         prev_forward_op = None
                     self.model_executor.execute_idle_forward(
@@ -996,6 +1197,7 @@ class EventLoop:
                         dp_metadata.global_batch_size,
                         dp_metadata.all_decode_or_idle,
                     )
+                    self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
                     continue
 
             # ---- dispatch current forward first (async GPU launch) ----
@@ -1029,13 +1231,6 @@ class EventLoop:
 
             curr_results = None
             if forward_op is not None:
-                if forward_op.num_extends() <= 0:
-                    # Overlap dispatch may schedule one extra decode before
-                    # the previous result is committed. Snapshot the completed
-                    # working state before this decode mutates the same slot;
-                    # the snapshot helper only copies block-aligned states.
-                    self.model_executor.snapshot_mamba_checkpoints_for_op(forward_op)
-                stats = self._get_scheduler_stats()
                 curr_results, _ = self._dispatch_forward(
                     forward_op,
                     sampling_params_list,
@@ -1058,6 +1253,9 @@ class EventLoop:
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
+                self._publish_scheduler_kv_events()
+
+            self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 
             prev_results = curr_results
             prev_forward_op = forward_op

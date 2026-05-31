@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 //
-// DeepSeek V4 fused SWA cache insert.
+// DeepSeek V4 fused SWA cache insert and sparse attention/indexer helpers.
 //
 // Cache layout per paged block:
 //   [0, block_size * 576): token data, each token [448 fp8 bytes | 64 bf16/fp16]
@@ -47,7 +47,80 @@ constexpr int kNumQuantBlocks = kNopeDim / kQuantBlock;
 constexpr int kScaleBytesPerToken = kNumQuantBlocks + 1;
 constexpr int kTokenDataBytes = kNopeDim + kRopeDim * 2;
 constexpr int kThreads = 256;
+constexpr int kNumLanes = 32;
+constexpr int kElemsPerLane = kHeadDim / kNumLanes;
+constexpr unsigned kFullWarpMask = 0xffffffffu;
 constexpr float kFp8Max = 448.0f;
+
+template <int BlockYSize>
+__global__ void gather_paged_indexer_mxfp4_cache_kernel(
+    const uint8_t* __restrict__ kv_cache,
+    uint8_t* __restrict__ values_out,
+    uint8_t* __restrict__ scales_out,
+    const int32_t* __restrict__ block_table,
+    const int32_t* __restrict__ cu_seq_lens,
+    int batch_size,
+    int num_tokens,
+    int value_bytes,
+    int scale_bytes,
+    int cache_block_size,
+    int64_t cache_block_stride,
+    int64_t value_stride,
+    int64_t scale_stride,
+    int64_t block_table_stride) {
+  constexpr int kVecBytes = sizeof(uint4);
+  const int token_idx = blockIdx.x * blockDim.y + threadIdx.y;
+  const int head_idx = (blockIdx.y * blockDim.x + threadIdx.x) * kVecBytes;
+
+  __shared__ int batch_idx[BlockYSize];
+  if (threadIdx.x == 0) {
+    batch_idx[threadIdx.y] = -1;
+  }
+  __syncthreads();
+
+  for (int iter = 0; iter < (batch_size + blockDim.x - 1) / blockDim.x;
+       ++iter) {
+    const int req = iter * blockDim.x + threadIdx.x;
+    if (req < batch_size) {
+      const int seq_start = cu_seq_lens[req];
+      const int seq_end = cu_seq_lens[req + 1];
+      if (token_idx >= seq_start && token_idx < seq_end) {
+        batch_idx[threadIdx.y] = req;
+      }
+    }
+  }
+  __syncthreads();
+
+  const int req = batch_idx[threadIdx.y];
+  if (token_idx >= num_tokens || req < 0) {
+    return;
+  }
+
+  const int in_req_token_idx = token_idx - cu_seq_lens[req];
+  const int block_idx =
+      block_table[static_cast<int64_t>(req) * block_table_stride +
+                  in_req_token_idx / cache_block_size];
+  const int block_offset = in_req_token_idx % cache_block_size;
+  const int64_t block_base = static_cast<int64_t>(block_idx) * cache_block_stride;
+
+  if (head_idx < value_bytes) {
+    const int64_t value_src =
+        block_base + static_cast<int64_t>(block_offset) * value_bytes + head_idx;
+    const int64_t value_dst =
+        static_cast<int64_t>(token_idx) * value_stride + head_idx;
+    *reinterpret_cast<uint4*>(values_out + value_dst) =
+        *reinterpret_cast<const uint4*>(kv_cache + value_src);
+  }
+
+  if (blockIdx.y == 0 && threadIdx.x == 0) {
+    const int64_t scale_src =
+        block_base + static_cast<int64_t>(cache_block_size) * value_bytes +
+        static_cast<int64_t>(block_offset) * scale_bytes;
+    const int64_t scale_dst = static_cast<int64_t>(token_idx) * scale_stride;
+    *reinterpret_cast<uint32_t*>(scales_out + scale_dst) =
+        *reinterpret_cast<const uint32_t*>(kv_cache + scale_src);
+  }
+}
 
 template <typename scalar_t>
 __device__ __forceinline__ float scalar_to_float(scalar_t value);
@@ -80,6 +153,22 @@ __device__ __forceinline__ uint8_t encode_ue8m0_scale(float exponent) {
   return static_cast<uint8_t>(encoded);
 }
 
+__device__ __forceinline__ float warp4_max_abs(float val) {
+  float peer = __shfl_xor_sync(kFullWarpMask, val, 1);
+  val = fmaxf(val, peer);
+  peer = __shfl_xor_sync(kFullWarpMask, val, 2);
+  val = fmaxf(val, peer);
+  return val;
+}
+
+__device__ __forceinline__ float warp_sum(float val) {
+#pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1) {
+    val += __shfl_xor_sync(kFullWarpMask, val, mask, 32);
+  }
+  return val;
+}
+
 template <typename scalar_t>
 __global__ void fused_qnorm_rope_kv_insert_kernel(
     scalar_t* __restrict__ q,
@@ -93,98 +182,123 @@ __global__ void fused_qnorm_rope_kv_insert_kernel(
     int num_tokens_insert,
     int num_heads,
     int cache_block_size,
-    int64_t cache_block_stride) {
-  const int token_idx = blockIdx.x;
-  const int task_idx = blockIdx.y;
-  const int tid = threadIdx.x;
+    int64_t cache_block_stride,
+    bool enable_pdl) {
+  const int warps_per_block = blockDim.x / kNumLanes;
+  const int warp_id = threadIdx.x / kNumLanes;
+  const int lane_id = threadIdx.x % kNumLanes;
+  const int global_warp_idx = blockIdx.x * warps_per_block + warp_id;
 
+  const int slots_per_token = num_heads + 1;
+  const int token_idx = global_warp_idx / slots_per_token;
+  const int task_idx = global_warp_idx % slots_per_token;
   if (token_idx >= num_tokens_full) {
     return;
   }
 
-  __shared__ float values[kHeadDim];
-  __shared__ float reduction[kThreads];
-  __shared__ float scales[kNumQuantBlocks];
-
-  if (task_idx < num_heads) {
-    const int64_t q_offset =
-        (static_cast<int64_t>(token_idx) * num_heads + task_idx) * kHeadDim;
-    float local_sum = 0.0f;
-
-    for (int dim = tid; dim < kHeadDim; dim += blockDim.x) {
-      const float value = scalar_to_float(q[q_offset + dim]);
-      values[dim] = value;
-      local_sum += value * value;
-    }
-    reduction[tid] = local_sum;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (tid < stride) {
-        reduction[tid] += reduction[tid + stride];
-      }
-      __syncthreads();
-    }
-
-    const float rms_scale =
-        rsqrtf(reduction[0] / static_cast<float>(kHeadDim) + rms_norm_eps);
-    const int64_t position = positions[token_idx];
-    const float* cos_ptr = cos_sin_cache + position * kRopeDim;
-    const float* sin_ptr = cos_ptr + kHalfRopeDim;
-
-    for (int dim = tid; dim < kNopeDim; dim += blockDim.x) {
-      q[q_offset + dim] = float_to_scalar<scalar_t>(values[dim] * rms_scale);
-    }
-
-    for (int pair = tid; pair < kHalfRopeDim; pair += blockDim.x) {
-      const int dim = kNopeDim + pair * 2;
-      const float x_even = values[dim] * rms_scale;
-      const float x_odd = values[dim + 1] * rms_scale;
-      const float cos_v = cos_ptr[pair];
-      const float sin_v = sin_ptr[pair];
-      q[q_offset + dim] =
-          float_to_scalar<scalar_t>(x_even * cos_v - x_odd * sin_v);
-      q[q_offset + dim + 1] =
-          float_to_scalar<scalar_t>(x_even * sin_v + x_odd * cos_v);
-    }
+  const bool is_kv = task_idx == num_heads;
+  if (is_kv && token_idx >= num_tokens_insert) {
     return;
   }
 
-  if (task_idx != num_heads || token_idx >= num_tokens_insert) {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 900)
+  if (enable_pdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+
+  const int dim_base = lane_id * kElemsPerLane;
+  float values[kElemsPerLane];
+
+  const scalar_t* src_ptr;
+  if (is_kv) {
+    src_ptr = kv + static_cast<int64_t>(token_idx) * kHeadDim + dim_base;
+  } else {
+    src_ptr = q +
+              (static_cast<int64_t>(token_idx) * num_heads + task_idx) *
+                  kHeadDim +
+              dim_base;
+  }
+
+  const uint4 v0 = *reinterpret_cast<const uint4*>(src_ptr);
+  const uint4 v1 = *reinterpret_cast<const uint4*>(src_ptr + 8);
+  const scalar_t* p0 = reinterpret_cast<const scalar_t*>(&v0);
+  const scalar_t* p1 = reinterpret_cast<const scalar_t*>(&v1);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    values[i] = scalar_to_float(p0[i]);
+    values[8 + i] = scalar_to_float(p1[i]);
+  }
+
+  if (!is_kv) {
+    float sum_squares = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kElemsPerLane; ++i) {
+      sum_squares += values[i] * values[i];
+    }
+    const float rms_scale =
+        rsqrtf(warp_sum(sum_squares) / static_cast<float>(kHeadDim) +
+               rms_norm_eps);
+#pragma unroll
+    for (int i = 0; i < kElemsPerLane; ++i) {
+      values[i] *= rms_scale;
+    }
+  }
+
+  const bool is_rope_lane = dim_base >= kNopeDim;
+  if (is_rope_lane) {
+    const int64_t position = positions[token_idx];
+    const float* cos_ptr = cos_sin_cache + position * kRopeDim;
+    const float* sin_ptr = cos_ptr + kHalfRopeDim;
+    const int rope_local_base = dim_base - kNopeDim;
+#pragma unroll
+    for (int p = 0; p < kElemsPerLane / 2; ++p) {
+      const int pair_dim = rope_local_base + 2 * p;
+      const int half_idx = pair_dim / 2;
+      const float cos_v = cos_ptr[half_idx];
+      const float sin_v = sin_ptr[half_idx];
+      const float x_even = values[2 * p];
+      const float x_odd = values[2 * p + 1];
+      values[2 * p] = x_even * cos_v - x_odd * sin_v;
+      values[2 * p + 1] = x_even * sin_v + x_odd * cos_v;
+    }
+  }
+
+  if (!is_kv) {
+    uint4 out0;
+    uint4 out1;
+    scalar_t* po0 = reinterpret_cast<scalar_t*>(&out0);
+    scalar_t* po1 = reinterpret_cast<scalar_t*>(&out1);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      po0[i] = float_to_scalar<scalar_t>(values[i]);
+      po1[i] = float_to_scalar<scalar_t>(values[8 + i]);
+    }
+    scalar_t* dst =
+        q + (static_cast<int64_t>(token_idx) * num_heads + task_idx) * kHeadDim +
+        dim_base;
+    *reinterpret_cast<uint4*>(dst) = out0;
+    *reinterpret_cast<uint4*>(dst + 8) = out1;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 900)
+    if (enable_pdl) {
+      cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
     return;
   }
 
   const int64_t slot = slot_mapping[token_idx];
   if (slot < 0) {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 900)
+    if (enable_pdl) {
+      cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
     return;
   }
-
-  for (int dim = tid; dim < kHeadDim; dim += blockDim.x) {
-    values[dim] =
-        scalar_to_float(kv[static_cast<int64_t>(token_idx) * kHeadDim + dim]);
-  }
-  __syncthreads();
-
-  const int64_t position = positions[token_idx];
-  const float* cos_ptr = cos_sin_cache + position * kRopeDim;
-  const float* sin_ptr = cos_ptr + kHalfRopeDim;
-  for (int pair = tid; pair < kHalfRopeDim; pair += blockDim.x) {
-    const int dim = kNopeDim + pair * 2;
-    const float x_even = values[dim];
-    const float x_odd = values[dim + 1];
-    const float cos_v = cos_ptr[pair];
-    const float sin_v = sin_ptr[pair];
-    values[dim] = x_even * cos_v - x_odd * sin_v;
-    values[dim + 1] = x_even * sin_v + x_odd * cos_v;
-  }
-  __syncthreads();
-
-  // Match vLLM's numeric contract: materialize K at activation dtype before
-  // the UE8M0 absmax and final cache write.
-  for (int dim = tid; dim < kHeadDim; dim += blockDim.x) {
-    values[dim] = scalar_to_float(float_to_scalar<scalar_t>(values[dim]));
-  }
-  __syncthreads();
 
   const int64_t block_idx = slot / cache_block_size;
   const int64_t pos_in_block = slot % cache_block_size;
@@ -194,35 +308,64 @@ __global__ void fused_qnorm_rope_kv_insert_kernel(
       block_base + static_cast<int64_t>(cache_block_size) * kTokenDataBytes +
       pos_in_block * kScaleBytesPerToken;
 
-  if (tid < kNumQuantBlocks) {
-    float absmax = 0.0f;
-    const int start = tid * kQuantBlock;
-    for (int i = 0; i < kQuantBlock; ++i) {
-      absmax = fmaxf(absmax, fabsf(values[start + i]));
+  // Match the reference cache writer by materializing K at activation dtype
+  // before the UE8M0 absmax and final cache write.
+#pragma unroll
+  for (int i = 0; i < kElemsPerLane; ++i) {
+    values[i] = scalar_to_float(float_to_scalar<scalar_t>(values[i]));
+  }
+
+  float local_absmax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kElemsPerLane; ++i) {
+    local_absmax = fmaxf(local_absmax, fabsf(values[i]));
+  }
+  const float absmax = fmaxf(warp4_max_abs(local_absmax), 1.0e-4f);
+  const float exponent = ceilf(log2f(absmax / kFp8Max));
+  const float inv_scale = exp2f(-exponent);
+
+  if (!is_rope_lane) {
+    uint4 out;
+    uint8_t* out_bytes = reinterpret_cast<uint8_t*>(&out);
+#pragma unroll
+    for (int i = 0; i < kElemsPerLane; ++i) {
+      float scaled = values[i] * inv_scale;
+      scaled = fminf(fmaxf(scaled, -kFp8Max), kFp8Max);
+      const __nv_fp8_storage_t storage =
+          __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3);
+      out_bytes[i] = static_cast<uint8_t>(storage);
     }
-    absmax = fmaxf(absmax, 1.0e-4f);
-    const float exponent = ceilf(log2f(absmax / kFp8Max));
-    scales[tid] = exponent;
-    token_scales[tid] = encode_ue8m0_scale(exponent);
+    *reinterpret_cast<uint4*>(token_data + dim_base) = out;
+    if ((lane_id & 3) == 0) {
+      const int quant_block_idx = lane_id >> 2;
+      token_scales[quant_block_idx] = encode_ue8m0_scale(exponent);
+    }
+    if (lane_id == 0) {
+      token_scales[kNumQuantBlocks] = 0;
+    }
+  } else {
+    uint4 out0;
+    uint4 out1;
+    scalar_t* po0 = reinterpret_cast<scalar_t*>(&out0);
+    scalar_t* po1 = reinterpret_cast<scalar_t*>(&out1);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      po0[i] = float_to_scalar<scalar_t>(values[i]);
+      po1[i] = float_to_scalar<scalar_t>(values[8 + i]);
+    }
+    const int rope_local_base = dim_base - kNopeDim;
+    scalar_t* rope_tail =
+        reinterpret_cast<scalar_t*>(token_data + kNopeDim) + rope_local_base;
+    *reinterpret_cast<uint4*>(rope_tail) = out0;
+    *reinterpret_cast<uint4*>(rope_tail + 8) = out1;
   }
-  if (tid == 0) {
-    token_scales[kNumQuantBlocks] = 0;
-  }
-  __syncthreads();
 
-  for (int dim = tid; dim < kNopeDim; dim += blockDim.x) {
-    const float inv_scale = exp2f(-scales[dim / kQuantBlock]);
-    float scaled = values[dim] * inv_scale;
-    scaled = fminf(fmaxf(scaled, -kFp8Max), kFp8Max);
-    const __nv_fp8_storage_t storage =
-        __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3);
-    token_data[dim] = static_cast<uint8_t>(storage);
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ >= 900)
+  if (enable_pdl) {
+    cudaTriggerProgrammaticLaunchCompletion();
   }
-
-  scalar_t* rope_tail = reinterpret_cast<scalar_t*>(token_data + kNopeDim);
-  for (int dim = tid; dim < kRopeDim; dim += blockDim.x) {
-    rope_tail[dim] = float_to_scalar<scalar_t>(values[kNopeDim + dim]);
-  }
+#endif
 }
 
 template <typename scalar_t>
@@ -239,15 +382,143 @@ void launch_fused_qnorm_rope_kv_insert(
     int num_heads,
     int cache_block_size,
     int64_t cache_block_stride,
+    bool enable_pdl,
     cudaStream_t stream) {
-  const dim3 grid(num_tokens_full, num_heads + 1);
+  constexpr int kWarpsPerBlock = kThreads / kNumLanes;
+  const int64_t total_warps =
+      static_cast<int64_t>(num_tokens_full) * (num_heads + 1);
+  const int grid =
+      static_cast<int>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
+
+#if CUDART_VERSION >= 12000
+  if (enable_pdl) {
+    int device = 0;
+    cudaDeviceProp props;
+    cudaGetDevice(&device);
+    cudaGetDeviceProperties(&props, device);
+    const int sm_version = props.major * 10 + props.minor;
+    if (sm_version >= 90) {
+      cudaLaunchConfig_t config;
+      config.gridDim = dim3(grid);
+      config.blockDim = dim3(kThreads);
+      config.dynamicSmemBytes = 0;
+      config.stream = stream;
+      cudaLaunchAttribute attrs[1];
+      attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attrs[0].val.programmaticStreamSerializationAllowed = 1;
+      config.attrs = attrs;
+      config.numAttrs = 1;
+      cudaLaunchKernelEx(
+          &config, fused_qnorm_rope_kv_insert_kernel<scalar_t>, q, kv, k_cache,
+          slot_mapping, positions, cos_sin_cache, rms_norm_eps, num_tokens_full,
+          num_tokens_insert, num_heads, cache_block_size, cache_block_stride, true);
+      return;
+    }
+  }
+#endif
   fused_qnorm_rope_kv_insert_kernel<scalar_t><<<grid, kThreads, 0, stream>>>(
       q, kv, k_cache, slot_mapping, positions, cos_sin_cache, rms_norm_eps,
       num_tokens_full, num_tokens_insert, num_heads, cache_block_size,
-      cache_block_stride);
+      cache_block_stride, false);
 }
 
 }  // namespace
+
+void deepseek_v4_gather_paged_indexer_mxfp4_cache(TensorView kv_cache,
+                                                  TensorView values_out,
+                                                  TensorView scales_out,
+                                                  TensorView block_table,
+                                                  TensorView cu_seq_lens,
+                                                  int64_t cache_block_size) {
+  CHECK_CUDA(kv_cache);
+  CHECK_CUDA(values_out);
+  CHECK_CUDA(scales_out);
+  CHECK_CUDA(block_table);
+  CHECK_CUDA(cu_seq_lens);
+  CHECK_DIM(2, kv_cache);
+  CHECK_DIM(2, values_out);
+  CHECK_DIM(2, scales_out);
+  CHECK_DIM(2, block_table);
+  CHECK_DIM(1, cu_seq_lens);
+
+  TVM_FFI_ICHECK(kv_cache.dtype() == dl_uint8) << "kv_cache must be uint8";
+  TVM_FFI_ICHECK(values_out.dtype() == dl_uint8) << "values_out must be uint8";
+  TVM_FFI_ICHECK(scales_out.dtype() == dl_uint8) << "scales_out must be uint8";
+  TVM_FFI_ICHECK(block_table.dtype() == dl_int32)
+      << "block_table must be int32";
+  TVM_FFI_ICHECK(cu_seq_lens.dtype() == dl_int32)
+      << "cu_seq_lens must be int32";
+  TVM_FFI_ICHECK(kv_cache.stride(1) == 1) << "kv_cache last dim must be contiguous";
+  TVM_FFI_ICHECK(values_out.stride(1) == 1)
+      << "values_out last dim must be contiguous";
+  TVM_FFI_ICHECK(scales_out.stride(1) == 1)
+      << "scales_out last dim must be contiguous";
+  TVM_FFI_ICHECK(cache_block_size > 0) << "cache_block_size must be positive";
+  TVM_FFI_ICHECK(cu_seq_lens.size(0) == block_table.size(0) + 1)
+      << "cu_seq_lens must have batch_size + 1 entries";
+
+  const int batch_size = static_cast<int>(block_table.size(0));
+  const int num_tokens = static_cast<int>(values_out.size(0));
+  TVM_FFI_ICHECK(scales_out.size(0) >= num_tokens)
+      << "scales_out must cover values_out rows";
+  // Output rows may be an exact length or a conservative upper bound, so do
+  // not read cu_seq_lens[-1] on host here. The kernel only writes rows covered
+  // by device-side cu_seq_lens.
+  if (batch_size == 0 || num_tokens == 0) {
+    return;
+  }
+  const int value_bytes = static_cast<int>(values_out.size(1));
+  const int scale_bytes = static_cast<int>(scales_out.size(1));
+  TVM_FFI_ICHECK(value_bytes > 0 && value_bytes % static_cast<int>(sizeof(uint4)) == 0)
+      << "values_out width must be a positive multiple of 16 bytes";
+  TVM_FFI_ICHECK(scale_bytes > 0) << "scales_out width must be positive";
+  TVM_FFI_ICHECK(scale_bytes == static_cast<int>(sizeof(uint32_t)))
+      << "paged indexer MXFP4 gather expects 4 scale bytes per row";
+  TVM_FFI_ICHECK(kv_cache.size(1) >= cache_block_size * (value_bytes + scale_bytes))
+      << "kv_cache block stride is too small for indexer MXFP4 rows";
+
+  cudaSetDevice(kv_cache.device().device_id);
+  const cudaStream_t stream = get_stream(kv_cache.device());
+  constexpr int kBlockX = 8;
+  constexpr int kVecBytes = sizeof(uint4);
+  const int grid_y = (value_bytes + kBlockX * kVecBytes - 1) / (kBlockX * kVecBytes);
+
+#define LAUNCH_PAGED_GATHER(BLOCK_Y)                                            \
+  do {                                                                          \
+    const dim3 grid((num_tokens + (BLOCK_Y)-1) / (BLOCK_Y), grid_y);            \
+    const dim3 block(kBlockX, (BLOCK_Y));                                       \
+    gather_paged_indexer_mxfp4_cache_kernel<(BLOCK_Y)>                          \
+        <<<grid, block, 0, stream>>>(                                           \
+            static_cast<const uint8_t*>(kv_cache.data_ptr()),                   \
+            static_cast<uint8_t*>(values_out.data_ptr()),                       \
+            static_cast<uint8_t*>(scales_out.data_ptr()),                       \
+            static_cast<const int32_t*>(block_table.data_ptr()),                \
+            static_cast<const int32_t*>(cu_seq_lens.data_ptr()), batch_size,    \
+            num_tokens, value_bytes, scale_bytes,                               \
+            static_cast<int>(cache_block_size), kv_cache.stride(0),             \
+            values_out.stride(0), scales_out.stride(0), block_table.stride(0)); \
+  } while (0)
+
+  if (num_tokens < 32) {
+    LAUNCH_PAGED_GATHER(1);
+  } else if (num_tokens < 64) {
+    LAUNCH_PAGED_GATHER(2);
+  } else if (num_tokens < 128) {
+    LAUNCH_PAGED_GATHER(4);
+  } else if (num_tokens < 256) {
+    LAUNCH_PAGED_GATHER(8);
+  } else if (num_tokens < 512) {
+    LAUNCH_PAGED_GATHER(16);
+  } else {
+    LAUNCH_PAGED_GATHER(32);
+  }
+#undef LAUNCH_PAGED_GATHER
+
+  cudaError_t status = cudaGetLastError();
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "deepseek_v4_gather_paged_indexer_mxfp4_cache failed: "
+      << cudaGetErrorString(status);
+}
 
 void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     TensorView q,
@@ -257,7 +528,8 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     TensorView positions,
     TensorView cos_sin_cache,
     double rms_norm_eps,
-    int64_t cache_block_size) {
+    int64_t cache_block_size,
+    bool enable_pdl) {
   CHECK_CUDA(q);
   CHECK_CUDA(kv);
   CHECK_CUDA(k_cache);
@@ -311,7 +583,8 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         static_cast<const int64_t*>(positions.data_ptr()),
         static_cast<const float*>(cos_sin_cache.data_ptr()),
         static_cast<float>(rms_norm_eps), num_tokens_full, num_tokens_insert,
-        num_heads, static_cast<int>(cache_block_size), cache_block_stride, stream);
+        num_heads, static_cast<int>(cache_block_size), cache_block_stride,
+        enable_pdl, stream);
   } else if (q.dtype() == dl_bfloat16) {
     launch_fused_qnorm_rope_kv_insert<nv_bfloat16>(
         static_cast<nv_bfloat16*>(q.data_ptr()),
@@ -321,7 +594,8 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         static_cast<const int64_t*>(positions.data_ptr()),
         static_cast<const float*>(cos_sin_cache.data_ptr()),
         static_cast<float>(rms_norm_eps), num_tokens_full, num_tokens_insert,
-        num_heads, static_cast<int>(cache_block_size), cache_block_stride, stream);
+        num_heads, static_cast<int>(cache_block_size), cache_block_stride,
+        enable_pdl, stream);
   } else {
     TVM_FFI_ICHECK(false) << "q/kv dtype must be float16 or bfloat16";
   }

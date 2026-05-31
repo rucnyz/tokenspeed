@@ -22,6 +22,19 @@ from __future__ import annotations
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.moe.triton_kernels import (
+    FP4,
+    FlexCtx,
+    FnSpecs,
+    FusedActivation,
+    InFlexData,
+    PrecisionConfig,
+    convert_layout,
+    layout,
+    opt_flags,
+    swiglu_fn,
+    wrap_torch_tensor,
+)
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from torch.nn.parameter import Parameter
@@ -29,13 +42,15 @@ from torch.nn.parameter import Parameter
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
 from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import (
     MXFP4_BLOCK,
+    create_mxfp4_fp8_input_scales,
     create_mxfp4_weights,
 )
 from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
 from tokenspeed.runtime.layers.quantization import Mxfp4Config
+from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
+from tokenspeed.runtime.utils import round_up
 
-_is_nvidia = current_platform().is_nvidia
 _is_blackwell = current_platform().is_blackwell
 _is_hopper = current_platform().is_hopper
 _is_amd = current_platform().is_amd
@@ -43,14 +58,6 @@ _is_amd = current_platform().is_amd
 
 def swizzle_mxfp4(quant_tensor, scale, num_warps):
     """Weight swizzle for mxfp4 MoE, used for OAI mxfp4 kernel."""
-    from tokenspeed_kernel.ops.moe.triton_kernels import (
-        FP4,
-        InFlexData,
-        convert_layout,
-        layout,
-        opt_flags,
-        wrap_torch_tensor,
-    )
 
     if layout is None:
         raise RuntimeError("triton_kernels backend unavailable")
@@ -102,11 +109,25 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         self.quant_config = quant_config
         self._activation: str | None = None
         self._swiglu_arg = None
+        self._is_w4a8_fp8 = (
+            isinstance(quant_config, Mxfp4Config)
+            and quant_config.is_w4a8_fp8
+            and current_platform().is_amd
+        )
 
     @classmethod
     def supports(cls, spec: MoELayerSpec, quant_config: object) -> bool:
         if not isinstance(quant_config, Mxfp4Config):
             return False
+        if should_ignore_quant_layer(
+            prefix=spec.prefix,
+            ignored_layers=getattr(quant_config, "ignored_layers", []) or [],
+        ):
+            return False
+        if quant_config.is_w4a8_fp8:
+            if not current_platform().is_amd:
+                # Quark quantization has only been tested on AMD platform
+                return False
         return spec.ep_size <= 1 and spec.activation in {
             "silu",
             "swiglu",
@@ -119,7 +140,6 @@ class Mxfp4TritonKernelBackend(MoEBackend):
     def create_layer_weights(
         self, layer: nn.Module, *, with_bias: bool = False
     ) -> None:
-        from tokenspeed.runtime.utils import round_up
 
         hidden = self.spec.hidden_size
         ispp = self.spec.intermediate_size // self.spec.tp_size
@@ -138,15 +158,13 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             ispp_padded,
             with_bias=with_bias,
         )
+        if self._is_w4a8_fp8:
+            create_mxfp4_fp8_input_scales(layer, self.spec.num_local_experts)
 
         self._activation = layer.activation
         self._swiglu_arg = getattr(layer, "swiglu_arg", None)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        from tokenspeed_kernel.ops.moe.triton_kernels import (
-            FlexCtx,
-            PrecisionConfig,
-        )
 
         MXFP_BLOCK_SIZE = 32
 
@@ -163,15 +181,52 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             layer.w2_weight, layer.w2_weight_scale, num_warps
         )
 
+        if self._is_w4a8_fp8:
+            # Collapse per-expert input scales to a single per-tensor scale
+            # per GEMM. Quark exports a constant value across experts for
+            # static ``per_tensor`` quantisation; ``max`` is a safe reduction
+            # in case individual experts reach slightly different values.
+            w13_in_scale = (
+                layer.w13_input_scale.data.to(torch.float32)
+                .max()
+                .reshape(1)
+                .to(layer.w13_input_scale.device)
+                .contiguous()
+            )
+            w2_in_scale = (
+                layer.w2_input_scale.data.to(torch.float32)
+                .max()
+                .reshape(1)
+                .to(layer.w2_input_scale.device)
+                .contiguous()
+            )
+            layer.w13_act_scale = w13_in_scale
+            layer.w2_act_scale = w2_in_scale
+
+            fp8_dtype = current_platform().fp8e4m3fn.dtype
+            w13_lhs = InFlexData(dtype=fp8_dtype, scale=w13_in_scale)
+            w2_lhs = InFlexData(dtype=fp8_dtype, scale=w2_in_scale)
+            # Force bf16 output so the swiglu / down-proj results stay in a
+            # standard floating dtype; without this, ``triton_kernels.matmul``
+            # defaults ``out_dtype`` to the input dtype (fp8) which would
+            # make the subsequent reductions / re-quantisation blow up.
+            out_dtype = torch.bfloat16
+        else:
+            w13_lhs = InFlexData()
+            w2_lhs = InFlexData()
+            out_dtype = None
+
         layer.w13_precision_config = PrecisionConfig(
-            flex_ctx=FlexCtx(rhs_data=w13_flex),
+            flex_ctx=FlexCtx(lhs_data=w13_lhs, rhs_data=w13_flex),
             b_mx_scale=w13_scale,
             b_microblock_size=MXFP_BLOCK_SIZE,
+            out_dtype=out_dtype,
         )
         layer.w2_precision_config = PrecisionConfig(
-            flex_ctx=FlexCtx(rhs_data=w2_flex),
+            flex_ctx=FlexCtx(lhs_data=w2_lhs, rhs_data=w2_flex),
             b_mx_scale=w2_scale,
             b_microblock_size=MXFP_BLOCK_SIZE,
+            out_dtype=out_dtype,
         )
 
         layer.w13_weight_triton_tensor = w13_weight
@@ -189,13 +244,6 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
-        del num_global_tokens, max_num_tokens_per_gpu
-        from tokenspeed_kernel.ops.moe.triton_kernels import (
-            FnSpecs,
-            FusedActivation,
-            swiglu_fn,
-        )
-
         router_logits = topk_output.router_logits
         top_k = topk_output.topk_config.top_k
         n_tokens = router_logits.shape[0]
@@ -226,9 +274,18 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             (gemm1_alpha, gemm1_clamp),
         )
 
+        if self._is_w4a8_fp8:
+            gemm1_input = tokenspeed_kernel.quantize_fp8(
+                hidden_states,
+                scale=layer.w13_act_scale,
+                solution="triton",
+            )
+        else:
+            gemm1_input = hidden_states
+
         # First GEMM: gate_up projection with fused activation
         intermediate_cache = tokenspeed_kernel.moe_experts(
-            hidden_states,
+            gemm1_input,
             w13_weight,
             w13_bias,
             a_ragged_metadata=ragged_metadata,
@@ -237,14 +294,22 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             fused_activation=act,
             dtype=hidden_states.dtype,
             features={"ragged_metadata", "dispatch_gemm"},
-            traits={"weight_dtype": "mxfp4"},
             expected_kernel_name="triton_kernels_dispatch_gemm",
         )
+
+        if self._is_w4a8_fp8:
+            gemm2_input = tokenspeed_kernel.quantize_fp8(
+                intermediate_cache,
+                scale=layer.w2_act_scale,
+                solution="triton",
+            )
+        else:
+            gemm2_input = intermediate_cache
 
         # Second GEMM: down projection with scatter (combine)
         # gammas applies the routing weights (expert contribution weights)
         return tokenspeed_kernel.moe_experts(
-            intermediate_cache,
+            gemm2_input,
             w2_weight,
             w2_bias,
             a_ragged_metadata=ragged_metadata,
@@ -255,7 +320,6 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             n_expts_act=top_k,
             dtype=hidden_states.dtype,
             features={"ragged_metadata", "gemm_combine"},
-            traits={"weight_dtype": "mxfp4"},
             expected_kernel_name="triton_kernels_gemm_combine",
         )
 

@@ -1,3 +1,8 @@
+# Adapted from meituan-longcat/SGLang-FluentLLM.
+# This file has been modified for this repository.
+# This file may incorporate material from ModelTC/lightllm,
+# vllm-project/vllm, and sgl-project/sglang, as identified in
+# python/THIRDPARTYNOTICES.
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -39,7 +44,6 @@ class EngineBase(ABC):
         prompt: list[str] | str | None = None,
         sampling_params: list[dict] | dict | None = None,
         input_ids: list[list[int]] | list[int] | None = None,
-        image_data: list[str] | str | None = None,
         return_logprob: list[bool] | bool | None = False,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,
