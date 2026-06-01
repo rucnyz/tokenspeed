@@ -126,6 +126,9 @@ class PlatformInfo:
     # NUMA-local CPU IDs per logical device. Empty means unavailable.
     numa_cpu_affinity: tuple[tuple[int, ...], ...] = ()
 
+    # NUMA memory node ID per logical device. Empty means unavailable.
+    numa_memory_nodes: tuple[int, ...] = ()
+
     @classmethod
     def detect(cls) -> PlatformInfo:
         """Detect platform from current environment."""
@@ -352,6 +355,7 @@ def _detect_cuda_platform() -> PlatformInfo:
     runtime_features = _get_cuda_runtime_features()
     interconnect = _detect_cuda_interconnect()
     numa_cpu_affinity = _detect_cuda_numa_cpu_affinity()
+    numa_memory_nodes = _detect_cuda_numa_memory_nodes(numa_cpu_affinity)
 
     return PlatformInfo(
         vendor="nvidia",
@@ -367,6 +371,7 @@ def _detect_cuda_platform() -> PlatformInfo:
         runtime_features=runtime_features,
         interconnect=interconnect,
         numa_cpu_affinity=numa_cpu_affinity,
+        numa_memory_nodes=numa_memory_nodes,
     )
 
 
@@ -593,6 +598,35 @@ def _detect_cuda_numa_cpu_affinity() -> tuple[tuple[int, ...], ...]:
             pynvml.nvmlShutdown()
 
     return tuple(affinities)
+
+
+def _detect_cuda_numa_memory_nodes(
+    numa_cpu_affinity: tuple[tuple[int, ...], ...],
+) -> tuple[int, ...]:
+    """Return NUMA memory node ID per visible CUDA device.
+
+    Derives the NUMA memory node from the CPU affinity by reading
+    ``/sys/devices/system/cpu/cpuN/topology/physical_node_id`` for the
+    first CPU in each device's affinity mask.
+    """
+    if not numa_cpu_affinity:
+        return ()
+
+    nodes: list[int] = []
+    for cpus in numa_cpu_affinity:
+        if not cpus:
+            nodes.append(0)
+            continue
+        node_path = (
+            f"/sys/devices/system/cpu/cpu{cpus[0]}/topology/physical_node_id"
+        )
+        try:
+            with open(node_path) as f:
+                nodes.append(int(f.read().strip()))
+        except (FileNotFoundError, ValueError):
+            nodes.append(0)
+
+    return tuple(nodes)
 
 
 @lru_cache(maxsize=1)

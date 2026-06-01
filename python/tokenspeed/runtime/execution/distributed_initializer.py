@@ -29,7 +29,10 @@ from tokenspeed.runtime.utils import (
     get_available_gpu_memory,
     get_colorful_logger,
 )
-from tokenspeed.runtime.utils.common import maybe_set_numa_aware_cpu_affinity
+from tokenspeed.runtime.utils.common import (
+    maybe_set_numa_aware_cpu_affinity,
+    set_numa_memory_policy,
+)
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
 logger = get_colorful_logger(__name__)
@@ -136,6 +139,7 @@ class DistributedInitializer:
         )
         if config.device == "cuda":
             maybe_set_numa_aware_cpu_affinity(config.gpu_id)
+            set_numa_memory_policy(config.gpu_id)
 
         # Determine backend
         if config.device == "cuda":

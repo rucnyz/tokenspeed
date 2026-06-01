@@ -23,6 +23,8 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import ctypes.util
 import dataclasses
 import functools
 import io
@@ -148,6 +150,51 @@ def maybe_set_numa_aware_cpu_affinity(device_id: int) -> None:
         len(cpu_affinity),
         device_id,
     )
+
+
+def set_numa_memory_policy(device_id: int) -> None:
+    """Bind this process's memory allocations to the NUMA node of *device_id*.
+
+    Uses ``set_mempolicy(MPOL_BIND, ...)`` so that all subsequent host memory
+    allocations (including ``torch.empty(device="cpu")``) are served from the
+    NUMA node closest to the GPU.  No-op when NUMA info is unavailable or the
+    syscall fails.
+    """
+    platform = current_platform()
+    if not platform.is_nvidia:
+        return
+    numa_memory_nodes = getattr(platform, "numa_memory_nodes", ())
+    if not numa_memory_nodes:
+        return
+    if device_id >= len(numa_memory_nodes):
+        return
+
+    node = numa_memory_nodes[device_id]
+
+    libc_name = ctypes.util.find_library("c")
+    if not libc_name:
+        return
+    libc = ctypes.CDLL(libc_name, use_errno=True)
+
+    # nodemask is a bitmask with one bit per NUMA node
+    nodemask = ctypes.c_ulong(1 << node)
+    maxnode = ctypes.c_ulong(node + 2)
+    ret = libc.set_mempolicy(ctypes.c_int(2), ctypes.byref(nodemask), maxnode)  # MPOL_BIND = 2
+    if ret != 0:
+        errno = ctypes.get_errno()
+        logger.warning(
+            "set_mempolicy(MPOL_BIND, node=%d) for device %d failed: errno=%d",
+            node,
+            device_id,
+            errno,
+        )
+    else:
+        logger.info(
+            "Worker process %s memory bound to NUMA node %d for device %d.",
+            os.getpid(),
+            node,
+            device_id,
+        )
 
 
 def get_available_gpu_memory(
