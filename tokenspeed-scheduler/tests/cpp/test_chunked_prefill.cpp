@@ -102,6 +102,27 @@ TEST_F(ChunkedPrefillTestSuite, CompletedChunk_IsVisibleToPrefixCacheWithoutHybr
     EXPECT_EQ(fwd->extend_prefix_lens[0], 4);
 }
 
+TEST_F(ChunkedPrefillTestSuite, FinalChunk_IsNotPublishedOnDecodeTransitionWithoutHybridCache) {
+    Submit(MakeRequestSpec("warm", 4));  // 8 prompt tokens, two 4-token chunks
+    PlanOnce();                          // chunk 1
+    PlanOnce();                          // chunk 2, publishes chunk 1
+
+    auto decode_plan = PlanOnce();  // transitions to decode without publishing chunk 2
+    auto* decode = GetForwardOp(decode_plan);
+    ASSERT_NE(decode, nullptr);
+    ASSERT_EQ(decode->request_ids.size(), 1u);
+    ASSERT_EQ(decode->request_ids[0], "warm");
+
+    Submit(MakeRequestSpec("reuse", 4));
+    auto reuse_plan = PlanOnce();
+    auto* reuse_forward = GetForwardOp(reuse_plan);
+    ASSERT_NE(reuse_forward, nullptr);
+    ASSERT_EQ(reuse_forward->request_ids.size(), 1u);
+    ASSERT_EQ(reuse_forward->request_ids[0], "reuse");
+    EXPECT_EQ(reuse_forward->extend_prefix_lens[0], 4);
+    EXPECT_EQ(reuse_forward->input_lengths[0], 4);
+}
+
 TEST_F(ChunkedPrefillTestSuite, InputIds_CorrectPerChunk) {
     Submit(MakeRequestSpec("r1", 3));  // 6 tokens: [1,2,3,4,5,6]
     auto plan1 = PlanOnce();
