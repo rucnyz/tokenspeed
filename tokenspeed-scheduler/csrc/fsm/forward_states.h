@@ -59,11 +59,12 @@ inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* to
 // Submitted holds only the token container and page size — no allocator pointers.
 // Allocators are owned by the events that perform resource allocation.
 struct Submitted {
-    Submitted(TokenContainer* token_container, std::int32_t page_size)
-        : token_container_{token_container}, page_size_{page_size} {}
+    Submitted(TokenContainer* token_container, std::int32_t page_size, std::int32_t prefix_match_depth = 0)
+        : token_container_{token_container}, page_size_{page_size}, prefix_match_depth_{prefix_match_depth} {}
 
     TokenContainer* GetTokenContainer() { return token_container_; }
     std::int32_t GetPageSize() const { return page_size_; }
+    std::int32_t PrefixMatchDepth() const { return prefix_match_depth_; }
 
     std::vector<std::int32_t> GetOccupiedPages() const {
         // prefix is matched, but not locked
@@ -74,6 +75,7 @@ struct Submitted {
 private:
     TokenContainer* token_container_{};
     std::int32_t page_size_{};
+    std::int32_t prefix_match_depth_{0};
 };
 
 struct Aborting {

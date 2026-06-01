@@ -163,7 +163,14 @@ std::vector<std::string> Scheduler::CalcRollingHash(const std::vector<std::int32
 
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     for (const auto& spec : request_specs) {
-        auto req = std::make_unique<Request>(spec, config_.page_size, config_.role);
+        std::int32_t prefix_match_depth = 0;
+        if (static_cast<std::int32_t>(spec.tokens.size()) >= config_.page_size) {
+            MatchResult match = hybrid_prefix_cache_
+                ? hybrid_prefix_cache_->Match(spec.tokens)
+                : kv_prefix_cache_.Match(spec.tokens);
+            prefix_match_depth = match.device.DepthInPage();
+        }
+        auto req = std::make_unique<Request>(spec, config_.page_size, config_.role, prefix_match_depth);
         requests_.emplace(spec.request_id, std::move(req));
     }
 }

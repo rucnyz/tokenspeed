@@ -567,7 +567,12 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     // and non-None on others, deadlocking the next NCCL collective.
     std::sort(candidates.begin(), candidates.end(), [&](const auto& a, const auto& b) {
         int pa = priority(a), pb = priority(b);
-        return pa != pb ? pa < pb : a->Id() < b->Id();
+        if (pa != pb) return pa < pb;
+        if (pa == 2) {
+            std::int32_t ma = a->PrefixMatchDepth(), mb = b->PrefixMatchDepth();
+            if (ma != mb) return ma > mb;
+        }
+        return a->Id() < b->Id();
     });
 
     std::vector<ForwardOperation> ops;

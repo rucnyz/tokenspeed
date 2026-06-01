@@ -50,7 +50,7 @@ struct Prefetching;
 
 class Request {
 public:
-    Request(const RequestSpec& spec, std::int32_t page_size, Role role);
+    Request(const RequestSpec& spec, std::int32_t page_size, Role role, std::int32_t prefix_match_depth = 0);
 
     std::string Id() const { return id_; }
 
@@ -225,6 +225,17 @@ public:
                               [](const fsm::Finished&) -> std::string { return "Finished"; },
                           },
                           state_);
+    }
+
+    std::int32_t PrefixMatchDepth() const {
+        return std::visit(Overloaded{
+            [](const fsm::Submitted& s) -> std::int32_t { return s.PrefixMatchDepth(); },
+            [this](const auto&) -> std::int32_t {
+                throw std::logic_error(
+                    "Request::PrefixMatchDepth: expected state=Submitted; got state=" + StateName());
+            },
+            },
+            state_);
     }
 
     std::int32_t GetReserveNumTokensInNextScheduleEvent() const {
