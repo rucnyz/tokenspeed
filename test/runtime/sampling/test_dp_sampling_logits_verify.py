@@ -211,6 +211,12 @@ def _test_dp_chain_matches_legacy(
     processor = _build_processor(
         config=config, tp_rank=rank, tp_size=tp_size, tp_group=group, n=n
     )
+    processor.configure_dp_sampling(
+        dp_num_tokens_per_req=n,
+        max_bucket_bs=pad_bs,
+        vocab_size=vocab,
+        device=device,
+    )
 
     backend = _build_backend(
         max_bs=max(bs, pad_bs),
@@ -307,7 +313,7 @@ class TestDPSamplingLogitsVerify:
             vocab=256,
             hidden=64,
             is_all_greedy=False,
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
         )
 
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
@@ -321,5 +327,5 @@ class TestDPSamplingLogitsVerify:
             vocab=256,
             hidden=64,
             is_all_greedy=True,
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
         )
