@@ -34,6 +34,7 @@ logger = get_colorful_logger(__name__)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.schedule_batch import ScheduleBatch
+    from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
 
 
 @dataclasses.dataclass
@@ -78,6 +79,28 @@ class SamplingBatchInfo:
 
     # Device
     device: str = "cuda"
+
+    @classmethod
+    def from_runtime_buffers(
+        cls,
+        *,
+        req_pool_indices: torch.Tensor | None,
+        valid_cache_lengths: torch.Tensor | None,
+        is_all_greedy: bool,
+        vocab_size: int,
+        device: torch.device | str,
+        logits_layout_plan: LogitsLayoutPlan | None = None,
+    ) -> SamplingBatchInfo:
+        return cls(
+            req_pool_indices=req_pool_indices,
+            valid_cache_lengths=valid_cache_lengths,
+            is_all_greedy=is_all_greedy,
+            vocab_size=vocab_size,
+            device=device,
+            dp_sampling=(
+                logits_layout_plan is not None and logits_layout_plan.is_dp_all_to_all
+            ),
+        )
 
     def __getitem__(self, s: slice) -> SamplingBatchInfo:
         """Row-slice batch-indexed fields; pool/scalar fields pass through.

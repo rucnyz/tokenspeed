@@ -57,41 +57,6 @@ logger = get_colorful_logger(__name__)
 _is_capture_mode = False
 
 
-def resolve_dp_sampling_min_bs(
-    tp_size: int,
-    configured_min_bs: int | None,
-    *,
-    num_tokens_per_req: int | None = None,
-    pdl_enabled: bool | None = None,
-) -> int:
-    if configured_min_bs is not None:
-        min_bs = int(configured_min_bs)
-    else:
-        min_bs = 2 * tp_size
-    if min_bs < 1:
-        raise ValueError("dp_sampling_min_bs must be >= 1")
-    return min_bs
-
-
-def should_use_dp_sampling_for_bucket(
-    *,
-    dp_sampling_enabled: bool,
-    forward_mode: ForwardMode | None,
-    effective_bs: int,
-    min_bs: int,
-) -> bool:
-    return (
-        dp_sampling_enabled
-        and forward_mode is not None
-        and forward_mode.is_decode()
-        and effective_bs >= min_bs
-    )
-
-
-def dp_sampling_layout_bucket_bs(*, real_bs: int, tp_size: int) -> int:
-    return ((real_bs + tp_size - 1) // tp_size) * tp_size
-
-
 def get_is_capture_mode() -> bool:
     return _is_capture_mode
 
@@ -228,10 +193,8 @@ class CudaGraphWrapper:
         capturable_grammar=None,
         eager_grammar_buffers=None,
         sampling_backend: SamplingBackend | None = None,
+        logits_layout_planner=None,
         runtime_states: RuntimeStates | None = None,
-        dp_sampling_enabled: bool = False,
-        dp_sampling_min_bs: int = 1,
-        logits_tp_size: int = 1,
     ):
         self.config = config
         self.attn_backend = attn_backend
@@ -244,9 +207,7 @@ class CudaGraphWrapper:
         self.capturable_grammar = capturable_grammar
         self.eager_grammar_buffers = eager_grammar_buffers
         self.runtime_states = runtime_states
-        self.dp_sampling_enabled = dp_sampling_enabled
-        self.dp_sampling_min_bs = max(1, int(dp_sampling_min_bs))
-        self.logits_tp_size = logits_tp_size
+        self.logits_layout_planner = logits_layout_planner
         self.enable_torch_compile = getattr(config, "enable_torch_compile", False)
         self.disable_padding = config.disable_cuda_graph_padding
         self.enable_cudagraph_gc = getattr(config, "enable_cudagraph_gc", True)
@@ -334,22 +295,13 @@ class CudaGraphWrapper:
 
     def _capture_one(self, bs: int):
         graph = torch.cuda.CUDAGraph()
-        dp_sampling = self._dp_sampling_for_effective_bs(bs, ForwardMode.DECODE)
         logits_layout_plan = None
-        if self.sampling_backend is not None:
-            bucket_bs = (
-                dp_sampling_layout_bucket_bs(real_bs=bs, tp_size=self.logits_tp_size)
-                if dp_sampling
-                else bs
-            )
-            logits_layout_plan = self.sampling_backend.build_logits_layout_plan(
-                dp_sampling=dp_sampling,
+        if self.logits_layout_planner is not None:
+            logits_layout_plan = self.logits_layout_planner.build_plan(
+                forward_mode=ForwardMode.DECODE,
                 real_bs=bs,
-                bucket_bs=bucket_bs,
-                tp_size=self.logits_tp_size,
-                num_tokens_per_req=self.max_tokens_per_req,
+                effective_bs=bs,
             )
-
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -362,7 +314,6 @@ class CudaGraphWrapper:
                 if self.drafter is not None
                 else CaptureHiddenMode.NULL
             ),
-            dp_sampling=dp_sampling,
             logits_layout_plan=logits_layout_plan,
         )
 
@@ -378,7 +329,7 @@ class CudaGraphWrapper:
         # is_all_greedy=True at capture would freeze the graph into
         # argmax and bypass per-request seeding at replay.
         ibd = self.input_buffers
-        sampling_info = SamplingBatchInfo(
+        sampling_info = SamplingBatchInfo.from_runtime_buffers(
             req_pool_indices=ibd.req_pool_indices_buf[:bs],
             valid_cache_lengths=(
                 self.runtime_states.valid_cache_lengths
@@ -388,7 +339,7 @@ class CudaGraphWrapper:
             is_all_greedy=False,
             vocab_size=self.vocab_size,
             device=self.device,
-            dp_sampling=dp_sampling,
+            logits_layout_plan=logits_layout_plan,
         )
 
         from tokenspeed.runtime.grammar.capturable_grammar import (
@@ -717,27 +668,10 @@ class CudaGraphWrapper:
         max_num_tokens = max(ctx.global_num_tokens)
         return (max_num_tokens + self.max_tokens_per_req - 1) // self.max_tokens_per_req
 
-    def _dp_sampling_for_effective_bs(
-        self, effective_bs: int, forward_mode: ForwardMode | None
-    ) -> bool:
-        return should_use_dp_sampling_for_bucket(
-            dp_sampling_enabled=self.dp_sampling_enabled,
-            forward_mode=forward_mode,
-            effective_bs=effective_bs,
-            min_bs=self.dp_sampling_min_bs,
-        )
-
-    def dp_sampling_route(self, bs: int, ctx: ForwardContext) -> tuple[bool, bool, int]:
+    def graph_route(self, bs: int, ctx: ForwardContext) -> tuple[bool, int]:
         use_graph = self._can_use_graph(bs, ctx)
         effective_bs = self._padded_bs(bs, ctx) if use_graph else bs
-        dp_sampling = self._dp_sampling_for_effective_bs(effective_bs, ctx.forward_mode)
-        layout_bucket_bs = effective_bs
-        if dp_sampling:
-            layout_bucket_bs = dp_sampling_layout_bucket_bs(
-                real_bs=effective_bs if use_graph else bs,
-                tp_size=self.logits_tp_size,
-            )
-        return (dp_sampling, use_graph, layout_bucket_bs)
+        return use_graph, effective_bs
 
     def _can_use_graph(self, bs: int, ctx: ForwardContext) -> bool:
         if self.disable:
@@ -842,14 +776,6 @@ class CudaGraphWrapper:
             mamba_kwargs["mamba_cache_chunk_size"] = self.config.mamba_cache_chunk_size
 
         if use_graph:
-            expected_dp_sampling = self._dp_sampling_for_effective_bs(
-                padded_bs, ctx.forward_mode
-            )
-            assert ctx.dp_sampling == expected_dp_sampling, (
-                f"ctx.dp_sampling={ctx.dp_sampling} does not match captured "
-                f"bucket policy for bs={bs}, padded_bs={padded_bs}, "
-                f"min_bs={self.dp_sampling_min_bs}"
-            )
             if (
                 bs == 0
                 and paged_cache_block_tables is None

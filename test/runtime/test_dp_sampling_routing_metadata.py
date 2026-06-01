@@ -6,18 +6,19 @@ import pytest
 import torch
 
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-    CudaGraphWrapper,
-    dp_sampling_layout_bucket_bs,
-    resolve_dp_sampling_min_bs,
-    should_use_dp_sampling_for_bucket,
-)
+from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_executor import (
     validate_dp_sampling_lm_head_vocab,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
+from tokenspeed.runtime.sampling.logits_layout import (
+    LogitsLayoutPlan,
+    LogitsLayoutPlanner,
+    resolve_dp_sampling_min_bs,
+    should_use_dp_sampling_for_bucket,
+)
+from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 
 
 def test_dp_sampling_bucket_threshold():
@@ -72,23 +73,37 @@ def test_dp_sampling_min_bs_ignores_env_override(monkeypatch):
     assert resolve_dp_sampling_min_bs(tp_size=4, configured_min_bs=12) == 12
 
 
-def test_dp_sampling_layout_bucket_rounds_to_tp_size():
-    assert dp_sampling_layout_bucket_bs(real_bs=32, tp_size=8) == 32
-    assert dp_sampling_layout_bucket_bs(real_bs=33, tp_size=8) == 40
-    assert dp_sampling_layout_bucket_bs(real_bs=24, tp_size=16) == 32
-    assert dp_sampling_layout_bucket_bs(real_bs=79, tp_size=8) == 80
+def test_layout_planner_dp_bucket_rounds_to_tp_size():
+    planner = LogitsLayoutPlanner(
+        dp_sampling_enabled=True,
+        dp_sampling_min_bs=1,
+        tp_size=8,
+        num_tokens_per_req=6,
+    )
+
+    plan = planner.build_plan(
+        forward_mode=ForwardMode.DECODE,
+        real_bs=33,
+        effective_bs=33,
+    )
+
+    assert plan.is_dp_all_to_all
+    assert plan.bucket_bs == 40
 
 
-def test_dp_sampling_route_uses_graph_bucket_threshold():
+def test_layout_planner_uses_graph_bucket_threshold():
     runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
     runner.disable = False
     runner.dp_size = 1
     runner.disable_padding = False
     runner.max_bs = 32
     runner.capture_bs = [24, 32]
-    runner.dp_sampling_enabled = True
-    runner.dp_sampling_min_bs = 32
-    runner.logits_tp_size = 8
+    planner = LogitsLayoutPlanner(
+        dp_sampling_enabled=True,
+        dp_sampling_min_bs=32,
+        tp_size=8,
+        num_tokens_per_req=6,
+    )
     ctx = ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
@@ -98,23 +113,32 @@ def test_dp_sampling_route_uses_graph_bucket_threshold():
         forward_mode=ForwardMode.DECODE,
     )
 
-    dp_sampling, use_graph, bucket_bs = runner.dp_sampling_route(30, ctx)
+    use_graph, bucket_bs = runner.graph_route(30, ctx)
+    plan = planner.build_plan(
+        forward_mode=ctx.forward_mode,
+        real_bs=30,
+        effective_bs=bucket_bs,
+    )
 
-    assert dp_sampling
     assert use_graph
-    assert bucket_bs == 32
+    assert plan.is_dp_all_to_all
+    assert plan.real_bs == 30
+    assert plan.bucket_bs == 32
 
 
-def test_dp_sampling_route_pads_graph_layout_bucket_to_tp_size():
+def test_layout_planner_pads_graph_layout_bucket_to_tp_size():
     runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
     runner.disable = False
     runner.dp_size = 1
     runner.disable_padding = False
     runner.max_bs = 80
     runner.capture_bs = [72, 79, 80]
-    runner.dp_sampling_enabled = True
-    runner.dp_sampling_min_bs = 32
-    runner.logits_tp_size = 8
+    planner = LogitsLayoutPlanner(
+        dp_sampling_enabled=True,
+        dp_sampling_min_bs=32,
+        tp_size=8,
+        num_tokens_per_req=6,
+    )
     ctx = ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
@@ -124,23 +148,31 @@ def test_dp_sampling_route_pads_graph_layout_bucket_to_tp_size():
         forward_mode=ForwardMode.DECODE,
     )
 
-    dp_sampling, use_graph, bucket_bs = runner.dp_sampling_route(79, ctx)
+    use_graph, bucket_bs = runner.graph_route(79, ctx)
+    plan = planner.build_plan(
+        forward_mode=ctx.forward_mode,
+        real_bs=79,
+        effective_bs=bucket_bs,
+    )
 
-    assert dp_sampling
     assert use_graph
-    assert bucket_bs == 80
+    assert plan.is_dp_all_to_all
+    assert plan.bucket_bs == 80
 
 
-def test_dp_sampling_route_pads_capture_bucket_above_threshold_to_tp_size():
+def test_layout_planner_pads_capture_bucket_above_threshold_to_tp_size():
     runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
     runner.disable = False
     runner.dp_size = 1
     runner.disable_padding = False
     runner.max_bs = 32
     runner.capture_bs = [24, 32]
-    runner.dp_sampling_enabled = True
-    runner.dp_sampling_min_bs = 16
-    runner.logits_tp_size = 16
+    planner = LogitsLayoutPlanner(
+        dp_sampling_enabled=True,
+        dp_sampling_min_bs=16,
+        tp_size=16,
+        num_tokens_per_req=6,
+    )
     ctx = ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
@@ -150,23 +182,31 @@ def test_dp_sampling_route_pads_capture_bucket_above_threshold_to_tp_size():
         forward_mode=ForwardMode.DECODE,
     )
 
-    dp_sampling, use_graph, bucket_bs = runner.dp_sampling_route(24, ctx)
+    use_graph, bucket_bs = runner.graph_route(24, ctx)
+    plan = planner.build_plan(
+        forward_mode=ctx.forward_mode,
+        real_bs=24,
+        effective_bs=bucket_bs,
+    )
 
-    assert dp_sampling
     assert use_graph
-    assert bucket_bs == 32
+    assert plan.is_dp_all_to_all
+    assert plan.bucket_bs == 32
 
 
-def test_dp_sampling_route_keeps_graph_bucket_below_threshold_non_dp():
+def test_layout_planner_keeps_graph_bucket_below_threshold_non_dp():
     runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
     runner.disable = False
     runner.dp_size = 1
     runner.disable_padding = False
     runner.max_bs = 32
     runner.capture_bs = [24, 32]
-    runner.dp_sampling_enabled = True
-    runner.dp_sampling_min_bs = 32
-    runner.logits_tp_size = 8
+    planner = LogitsLayoutPlanner(
+        dp_sampling_enabled=True,
+        dp_sampling_min_bs=32,
+        tp_size=8,
+        num_tokens_per_req=6,
+    )
     ctx = ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
@@ -176,14 +216,20 @@ def test_dp_sampling_route_keeps_graph_bucket_below_threshold_non_dp():
         forward_mode=ForwardMode.DECODE,
     )
 
-    dp_sampling, use_graph, bucket_bs = runner.dp_sampling_route(23, ctx)
+    use_graph, bucket_bs = runner.graph_route(23, ctx)
+    plan = planner.build_plan(
+        forward_mode=ctx.forward_mode,
+        real_bs=23,
+        effective_bs=bucket_bs,
+    )
 
-    assert not dp_sampling
     assert use_graph
-    assert bucket_bs == 24
+    assert not plan.is_dp_all_to_all
+    assert plan.real_bs == 23
+    assert plan.bucket_bs == 24
 
 
-def test_dp_sampling_route_uses_global_decode_bucket_for_idle_rank():
+def test_layout_planner_uses_global_decode_bucket_for_idle_rank():
     runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
     runner.disable = False
     runner.dp_size = 2
@@ -191,9 +237,12 @@ def test_dp_sampling_route_uses_global_decode_bucket_for_idle_rank():
     runner.max_bs = 32
     runner.capture_bs = [16, 32]
     runner.max_tokens_per_req = 1
-    runner.dp_sampling_enabled = True
-    runner.dp_sampling_min_bs = 16
-    runner.logits_tp_size = 8
+    planner = LogitsLayoutPlanner(
+        dp_sampling_enabled=True,
+        dp_sampling_min_bs=16,
+        tp_size=8,
+        num_tokens_per_req=6,
+    )
     ctx = ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
@@ -206,19 +255,28 @@ def test_dp_sampling_route_uses_global_decode_bucket_for_idle_rank():
         all_decode_or_idle=True,
     )
 
-    dp_sampling, use_graph, bucket_bs = runner.dp_sampling_route(0, ctx)
+    use_graph, bucket_bs = runner.graph_route(0, ctx)
+    plan = planner.build_plan(
+        forward_mode=ctx.forward_mode,
+        real_bs=0,
+        effective_bs=bucket_bs,
+    )
 
-    assert dp_sampling
     assert use_graph
-    assert bucket_bs == 16
+    assert plan.is_dp_all_to_all
+    assert plan.real_bs == 0
+    assert plan.bucket_bs == 16
 
 
-def test_dp_sampling_eager_route_still_returns_tp_divisible_layout_bucket():
+def test_layout_planner_eager_route_returns_tp_divisible_bucket():
     runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
     runner.disable = True
-    runner.dp_sampling_enabled = True
-    runner.dp_sampling_min_bs = 16
-    runner.logits_tp_size = 4
+    planner = LogitsLayoutPlanner(
+        dp_sampling_enabled=True,
+        dp_sampling_min_bs=16,
+        tp_size=4,
+        num_tokens_per_req=6,
+    )
     ctx = ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
@@ -228,11 +286,34 @@ def test_dp_sampling_eager_route_still_returns_tp_divisible_layout_bucket():
         forward_mode=ForwardMode.DECODE,
     )
 
-    dp_sampling, use_graph, bucket_bs = runner.dp_sampling_route(17, ctx)
+    use_graph, bucket_bs = runner.graph_route(17, ctx)
+    plan = planner.build_plan(
+        forward_mode=ctx.forward_mode,
+        real_bs=17,
+        effective_bs=bucket_bs,
+    )
 
-    assert dp_sampling
     assert not use_graph
-    assert bucket_bs == 20
+    assert plan.is_dp_all_to_all
+    assert plan.bucket_bs == 20
+
+
+def test_sampling_info_derives_dp_sampling_from_layout_plan():
+    sampling_info = SamplingBatchInfo.from_runtime_buffers(
+        req_pool_indices=torch.arange(2),
+        valid_cache_lengths=None,
+        is_all_greedy=False,
+        vocab_size=7,
+        device="cpu",
+        logits_layout_plan=LogitsLayoutPlan.dp_all_to_all(
+            real_bs=2,
+            bucket_bs=4,
+            tp_size=2,
+            num_tokens_per_req=1,
+        ),
+    )
+
+    assert sampling_info.dp_sampling is True
 
 
 def test_configure_dp_sampling_sets_state():

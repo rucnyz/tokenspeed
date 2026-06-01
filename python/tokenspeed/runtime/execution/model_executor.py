@@ -36,7 +36,6 @@ from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     CudaGraphWrapper,
-    resolve_dp_sampling_min_bs,
 )
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
 from tokenspeed.runtime.execution.forward_batch_info import (
@@ -50,6 +49,10 @@ from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
+from tokenspeed.runtime.sampling.logits_layout import (
+    LogitsLayoutPlan,
+    LogitsLayoutPlanner,
+)
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
 from tokenspeed.runtime.utils.common import maybe_inference_mode
@@ -60,7 +63,6 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
-    from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 logger = get_colorful_logger(__name__)
@@ -332,9 +334,6 @@ class ModelExecutor:
         backend_supports_dp = bool(
             getattr(self.sampling_backend, "_SUPPORTS_DP_VERIFY", False)
         )
-        self.dp_sampling_min_bs = resolve_dp_sampling_min_bs(
-            processor.tp_size, self.config.dp_sampling_min_bs
-        )
         infra_supports_dp = (
             self.drafter is not None
             and backend_supports_dp
@@ -353,6 +352,12 @@ class ModelExecutor:
             )
 
         self.dp_sampling_enabled = infra_supports_dp and self.config.dp_sampling
+        self.logits_layout_planner = LogitsLayoutPlanner.from_settings(
+            dp_sampling_enabled=self.dp_sampling_enabled,
+            configured_min_bs=self.config.dp_sampling_min_bs,
+            tp_size=processor.tp_size,
+            num_tokens_per_req=spec_num_tokens,
+        )
         if self.dp_sampling_enabled:
             lm_head = self.model_runner.model.lm_head
             weight = lm_head.weight
@@ -398,7 +403,7 @@ class ModelExecutor:
             self.config.dp_sampling,
             infra_supports_dp,
             self.dp_sampling_enabled,
-            self.dp_sampling_min_bs,
+            self.logits_layout_planner.dp_sampling_min_bs,
             self.drafter is not None,
             backend_supports_dp,
             processor.tp_size,
@@ -420,10 +425,8 @@ class ModelExecutor:
             capturable_grammar=self.capturable_grammar,
             eager_grammar_buffers=self.eager_grammar_buffers,
             sampling_backend=self.sampling_backend,
+            logits_layout_planner=self.logits_layout_planner,
             runtime_states=self.runtime_states,
-            dp_sampling_enabled=self.dp_sampling_enabled,
-            dp_sampling_min_bs=self.dp_sampling_min_bs,
-            logits_tp_size=processor.tp_size,
         )
 
         # Encoder CUDA graph: install the model-built wrapper by overriding
@@ -650,32 +653,15 @@ class ModelExecutor:
         self,
         bs: int,
         sampling_params_list: list[SamplingParams],
-        dp_sampling: bool = False,
+        logits_layout_plan: LogitsLayoutPlan | None = None,
     ) -> SamplingBatchInfo:
-        return SamplingBatchInfo(
+        return SamplingBatchInfo.from_runtime_buffers(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
             is_all_greedy=all(p.top_k <= 1 for p in sampling_params_list),
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
-            dp_sampling=dp_sampling,
-        )
-
-    def _build_logits_layout_plan(
-        self,
-        *,
-        dp_sampling: bool,
-        real_bs: int,
-        bucket_bs: int,
-    ) -> LogitsLayoutPlan | None:
-        if self.sampling_backend is None:
-            return None
-        return self.sampling_backend.build_logits_layout_plan(
-            dp_sampling=dp_sampling,
-            real_bs=real_bs,
-            bucket_bs=bucket_bs,
-            tp_size=self.model_runner.model.logits_processor.tp_size,
-            num_tokens_per_req=self.config.output_length,
+            logits_layout_plan=logits_layout_plan,
         )
 
     def accumulate_decode_stats(self, results: ModelExecutionResult, bs: int):
@@ -981,22 +967,20 @@ class ModelExecutor:
             global_bs=global_bs,
             all_decode_or_idle=all_decode_or_idle,
         )
-        ctx.dp_sampling, _use_graph, bucket_bs = self.forward_step.dp_sampling_route(
-            0, ctx
-        )
-        ctx.logits_layout_plan = self._build_logits_layout_plan(
-            dp_sampling=ctx.dp_sampling,
+        _use_graph, bucket_bs = self.forward_step.graph_route(0, ctx)
+        ctx.logits_layout_plan = self.logits_layout_planner.build_plan(
+            forward_mode=ctx.forward_mode,
             real_bs=0,
-            bucket_bs=bucket_bs,
+            effective_bs=bucket_bs,
         )
 
-        sampling_info = SamplingBatchInfo(
+        sampling_info = SamplingBatchInfo.from_runtime_buffers(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
             is_all_greedy=True,
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
-            dp_sampling=ctx.dp_sampling,
+            logits_layout_plan=ctx.logits_layout_plan,
         )
         if self.forward_step.can_run(bs=0, ctx=ctx):
             padded_bs = self.forward_step.padded_bs(bs=0, ctx=ctx)
@@ -1339,7 +1323,6 @@ class ModelExecutor:
                         else CaptureHiddenMode.NULL
                     ),
                     gather_ids=gather_ids,
-                    dp_sampling=False,
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:
@@ -1350,24 +1333,25 @@ class ModelExecutor:
                     ctx.global_num_tokens = dp_global_num_tokens
                     ctx.global_bs = dp_global_bs
                     ctx.all_decode_or_idle = dp_all_decode_or_idle
-                ctx.dp_sampling, _use_graph, bucket_bs = (
-                    self.forward_step.dp_sampling_route(bs, ctx)
-                )
-                ctx.logits_layout_plan = self._build_logits_layout_plan(
-                    dp_sampling=ctx.dp_sampling,
+                _use_graph, bucket_bs = self.forward_step.graph_route(bs, ctx)
+                ctx.logits_layout_plan = self.logits_layout_planner.build_plan(
+                    forward_mode=forward_mode,
                     real_bs=bs,
-                    bucket_bs=bucket_bs,
+                    effective_bs=bucket_bs,
                 )
                 if forward_mode.is_decode() and self.config.global_rank == 0:
                     logger.debug(
-                        "Batch-DP sampling: bs=%s enabled=%s",
+                        "Logits layout: bs=%s mode=%s bucket_bs=%s",
                         bs,
-                        ctx.dp_sampling,
+                        ctx.logits_layout_plan.mode,
+                        ctx.logits_layout_plan.bucket_bs,
                     )
 
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_info = self._build_sampling_info(
-                        bs, sampling_params_list, dp_sampling=ctx.dp_sampling
+                        bs,
+                        sampling_params_list,
+                        logits_layout_plan=ctx.logits_layout_plan,
                     )
                     grammar_completion = setup_grammar_step(
                         sampling_info=sampling_info,

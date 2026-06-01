@@ -62,5 +62,4 @@ class ForwardContext:
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None
 
-    dp_sampling: bool = False
     logits_layout_plan: LogitsLayoutPlan | None = None

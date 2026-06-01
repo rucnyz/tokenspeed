@@ -125,13 +125,16 @@ class LogitsMetadata:
         ctx: ForwardContext,
         input_lengths: torch.Tensor,
     ):
+        logits_layout_plan = ctx.logits_layout_plan
         return cls(
             forward_mode=ctx.forward_mode,
             capture_hidden_mode=ctx.capture_hidden_mode,
             gather_ids=ctx.gather_ids,
             extend_seq_lens=input_lengths,
-            dp_sampling=ctx.dp_sampling,
-            logits_layout_plan=ctx.logits_layout_plan,
+            dp_sampling=(
+                logits_layout_plan is not None and logits_layout_plan.is_dp_all_to_all
+            ),
+            logits_layout_plan=logits_layout_plan,
         )
 
 
