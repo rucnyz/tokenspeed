@@ -23,6 +23,8 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
+from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlanner
+
 
 @dataclasses.dataclass(frozen=True)
 class DpSamplingSupport:
@@ -73,6 +75,20 @@ def resolve_dp_sampling_support(
     if support.requested and not support.infra_supports:
         raise RuntimeError(support.unsupported_message())
     return support
+
+
+def create_logits_layout_planner(
+    *,
+    support: DpSamplingSupport,
+    configured_min_bs: int | None,
+    num_tokens_per_req: int,
+) -> LogitsLayoutPlanner:
+    return LogitsLayoutPlanner.from_settings(
+        dp_sampling_enabled=support.enabled,
+        configured_min_bs=configured_min_bs,
+        tp_size=support.tp_size,
+        num_tokens_per_req=num_tokens_per_req,
+    )
 
 
 def dp_sampling_comm_vocab_size(

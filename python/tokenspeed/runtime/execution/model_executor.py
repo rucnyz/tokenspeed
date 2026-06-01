@@ -50,14 +50,12 @@ from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
+    create_logits_layout_planner,
     dp_sampling_comm_vocab_size,
     resolve_dp_sampling_support,
     validate_dp_sampling_lm_head_vocab,
 )
-from tokenspeed.runtime.sampling.logits_layout import (
-    LogitsLayoutPlan,
-    LogitsLayoutPlanner,
-)
+from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
 from tokenspeed.runtime.utils.common import maybe_inference_mode
@@ -313,10 +311,9 @@ class ModelExecutor:
         )
 
         self.dp_sampling_enabled = dp_support.enabled
-        self.logits_layout_planner = LogitsLayoutPlanner.from_settings(
-            dp_sampling_enabled=self.dp_sampling_enabled,
+        self.logits_layout_planner = create_logits_layout_planner(
+            support=dp_support,
             configured_min_bs=self.config.dp_sampling_min_bs,
-            tp_size=processor.tp_size,
             num_tokens_per_req=spec_num_tokens,
         )
         if self.dp_sampling_enabled:
