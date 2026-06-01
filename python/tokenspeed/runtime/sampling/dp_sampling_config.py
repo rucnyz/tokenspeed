@@ -47,6 +47,12 @@ class DpSamplingSupport:
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class DpSamplingRuntimeConfig:
+    vocab_size: int | None = None
+    max_bucket_bs: int | None = None
+
+
 def resolve_dp_sampling_support(
     *,
     requested: bool,
@@ -88,6 +94,63 @@ def create_logits_layout_planner(
         configured_min_bs=configured_min_bs,
         tp_size=support.tp_size,
         num_tokens_per_req=num_tokens_per_req,
+    )
+
+
+def configure_dp_sampling_runtime(
+    *,
+    support: DpSamplingSupport,
+    model: Any,
+    sampling_backend: Any,
+    logits_processor: Any,
+    runtime_vocab_size: int,
+    max_num_seqs: int,
+    data_parallel_size: int,
+    num_tokens_per_req: int,
+    device: Any,
+) -> DpSamplingRuntimeConfig:
+    if not support.enabled:
+        return DpSamplingRuntimeConfig()
+
+    lm_head = model.lm_head
+    weight = lm_head.weight
+    if weight.ndim < 1:
+        raise RuntimeError(
+            f"dp_sampling LM head weight must be at least 1D, got {weight.ndim}D"
+        )
+    lm_head_rows = int(weight.shape[0])
+    validate_dp_sampling_lm_head_vocab(
+        lm_head_rows=lm_head_rows,
+        vocab_size=runtime_vocab_size,
+        tp_size=logits_processor.tp_size,
+        skip_all_gather=logits_processor.skip_all_gather,
+        tie_word_embeddings=bool(
+            getattr(logits_processor.config, "tie_word_embeddings", False)
+        ),
+    )
+    dp_vocab_size = dp_sampling_comm_vocab_size(
+        lm_head_rows=lm_head_rows,
+        tp_size=logits_processor.tp_size,
+        skip_all_gather=logits_processor.skip_all_gather,
+    )
+    configure_dp_vocab = getattr(
+        sampling_backend, "configure_dp_sampling_vocab_size", None
+    )
+    if configure_dp_vocab is not None:
+        configure_dp_vocab(dp_vocab_size)
+    max_bs = max_num_seqs // max(data_parallel_size, 1)
+    max_bucket_bs = (
+        (max_bs + logits_processor.tp_size - 1) // logits_processor.tp_size
+    ) * logits_processor.tp_size
+    logits_processor.configure_dp_sampling(
+        dp_num_tokens_per_req=num_tokens_per_req,
+        max_bucket_bs=max_bucket_bs,
+        vocab_size=dp_vocab_size,
+        device=device,
+    )
+    return DpSamplingRuntimeConfig(
+        vocab_size=dp_vocab_size,
+        max_bucket_bs=max_bucket_bs,
     )
 
 

@@ -50,12 +50,10 @@ from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
+    configure_dp_sampling_runtime,
     create_logits_layout_planner,
-    dp_sampling_comm_vocab_size,
     resolve_dp_sampling_support,
-    validate_dp_sampling_lm_head_vocab,
 )
-from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
 from tokenspeed.runtime.utils.common import maybe_inference_mode
@@ -66,6 +64,7 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 logger = get_colorful_logger(__name__)
@@ -316,44 +315,17 @@ class ModelExecutor:
             configured_min_bs=self.config.dp_sampling_min_bs,
             num_tokens_per_req=spec_num_tokens,
         )
-        if self.dp_sampling_enabled:
-            lm_head = self.model_runner.model.lm_head
-            weight = lm_head.weight
-            if weight.ndim < 1:
-                raise RuntimeError(
-                    f"dp_sampling LM head weight must be at least 1D, "
-                    f"got {weight.ndim}D"
-                )
-            lm_head_rows = int(weight.shape[0])
-            validate_dp_sampling_lm_head_vocab(
-                lm_head_rows=lm_head_rows,
-                vocab_size=self.config.vocab_size,
-                tp_size=processor.tp_size,
-                skip_all_gather=processor.skip_all_gather,
-                tie_word_embeddings=bool(
-                    getattr(processor.config, "tie_word_embeddings", False)
-                ),
-            )
-            dp_vocab_size = dp_sampling_comm_vocab_size(
-                lm_head_rows=lm_head_rows,
-                tp_size=processor.tp_size,
-                skip_all_gather=processor.skip_all_gather,
-            )
-            configure_dp_vocab = getattr(
-                self.sampling_backend, "configure_dp_sampling_vocab_size", None
-            )
-            if configure_dp_vocab is not None:
-                configure_dp_vocab(dp_vocab_size)
-            max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
-            max_bucket_bs = (
-                (max_bs + processor.tp_size - 1) // processor.tp_size
-            ) * processor.tp_size
-            processor.configure_dp_sampling(
-                dp_num_tokens_per_req=spec_num_tokens,
-                max_bucket_bs=max_bucket_bs,
-                vocab_size=dp_vocab_size,
-                device=self.device,
-            )
+        configure_dp_sampling_runtime(
+            support=dp_support,
+            model=self.model_runner.model,
+            sampling_backend=self.sampling_backend,
+            logits_processor=processor,
+            runtime_vocab_size=self.config.vocab_size,
+            max_num_seqs=config.max_num_seqs,
+            data_parallel_size=config.data_parallel_size,
+            num_tokens_per_req=spec_num_tokens,
+            device=self.device,
+        )
         logger.info(
             "Batch-DP spec-verify: requested=%s, infra_supports=%s, enabled=%s "
             "min_bs=%s (drafter=%s, backend_supports_dp=%s, "
@@ -383,7 +355,7 @@ class ModelExecutor:
             capturable_grammar=self.capturable_grammar,
             eager_grammar_buffers=self.eager_grammar_buffers,
             sampling_backend=self.sampling_backend,
-            logits_layout_planner=self.logits_layout_planner,
+            logits_layout_plan_builder=self._build_capture_logits_layout_plan,
             runtime_states=self.runtime_states,
         )
 
@@ -620,6 +592,13 @@ class ModelExecutor:
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
             logits_layout_plan=logits_layout_plan,
+        )
+
+    def _build_capture_logits_layout_plan(self, bs: int) -> LogitsLayoutPlan:
+        return self.logits_layout_planner.build_plan(
+            forward_mode=ForwardMode.DECODE,
+            real_bs=bs,
+            effective_bs=bs,
         )
 
     def accumulate_decode_stats(self, results: ModelExecutionResult, bs: int):

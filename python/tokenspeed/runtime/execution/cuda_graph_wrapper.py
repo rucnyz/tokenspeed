@@ -193,7 +193,7 @@ class CudaGraphWrapper:
         capturable_grammar=None,
         eager_grammar_buffers=None,
         sampling_backend: SamplingBackend | None = None,
-        logits_layout_planner=None,
+        logits_layout_plan_builder=None,
         runtime_states: RuntimeStates | None = None,
     ):
         self.config = config
@@ -207,7 +207,7 @@ class CudaGraphWrapper:
         self.capturable_grammar = capturable_grammar
         self.eager_grammar_buffers = eager_grammar_buffers
         self.runtime_states = runtime_states
-        self.logits_layout_planner = logits_layout_planner
+        self.logits_layout_plan_builder = logits_layout_plan_builder
         self.enable_torch_compile = getattr(config, "enable_torch_compile", False)
         self.disable_padding = config.disable_cuda_graph_padding
         self.enable_cudagraph_gc = getattr(config, "enable_cudagraph_gc", True)
@@ -296,12 +296,8 @@ class CudaGraphWrapper:
     def _capture_one(self, bs: int):
         graph = torch.cuda.CUDAGraph()
         logits_layout_plan = None
-        if self.logits_layout_planner is not None:
-            logits_layout_plan = self.logits_layout_planner.build_plan(
-                forward_mode=ForwardMode.DECODE,
-                real_bs=bs,
-                effective_bs=bs,
-            )
+        if self.logits_layout_plan_builder is not None:
+            logits_layout_plan = self.logits_layout_plan_builder(bs)
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
