@@ -164,10 +164,19 @@ std::vector<std::string> Scheduler::CalcRollingHash(const std::vector<std::int32
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     for (const auto& spec : request_specs) {
         std::int32_t prefix_match_depth = 0;
-        if (static_cast<std::int32_t>(spec.tokens.size()) >= config_.page_size) {
+        const std::int32_t num_tokens_to_match = spec.tokens.size() - 1;
+        if (num_tokens_to_match >= config_.page_size) {
+            std::vector<std::span<const std::int32_t>> page_aligned_tokens;
+            std::size_t num_full_pages = num_tokens_to_match / config_.page_size;
+            page_aligned_tokens.reserve(num_full_pages);
+            for (std::size_t i = 0; i < num_full_pages; ++i) {
+                std::size_t start = i * config_.page_size;
+                page_aligned_tokens.emplace_back(spec.tokens.data() + start, config_.page_size);
+            }
+
             MatchResult match = hybrid_prefix_cache_
-                ? hybrid_prefix_cache_->Match(spec.tokens)
-                : kv_prefix_cache_.Match(spec.tokens);
+                ? hybrid_prefix_cache_->Match(page_aligned_tokens)
+                : kv_prefix_cache_.Match(page_aligned_tokens);
             prefix_match_depth = match.device.DepthInPage();
         }
         auto req = std::make_unique<Request>(spec, config_.page_size, config_.role, prefix_match_depth);
