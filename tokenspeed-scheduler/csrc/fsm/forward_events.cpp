@@ -215,6 +215,17 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
     }
     InsertHybridCache(hybrid_prefix_cache_, paged_tokens, device_node_ref, local_kv_allocator.get(),
                       local_mamba_allocator.get(), state.window.begin, state.window.size, state.GetPageSize());
+    if (hybrid_prefix_cache_ == nullptr && kv_prefix_cache_ != nullptr) {
+        std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(device_node_ref->Node());
+        std::int32_t new_page_count =
+            static_cast<std::int32_t>(paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages.size());
+        if (new_page_count > 0) {
+            OwnedPages pages_to_insert = local_kv_allocator->TakeFirst(new_page_count);
+            auto result = kv_prefix_cache_->Insert<ResourceType::Device>(paged_tokens, prefix_pages,
+                                                                         std::move(pages_to_insert));
+            device_node_ref = std::make_unique<DeviceNodeRef>(result.last_node);
+        }
+    }
     // Allocate KV pages for the new chunk
     local_kv_allocator->Acquire(tokens_this_round_);
 
@@ -265,6 +276,17 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
     }
     InsertHybridCache(hybrid_prefix_cache_, paged_tokens, device_node_ref, local_kv_allocator.get(),
                       local_mamba_allocator.get(), state.window.begin, state.window.size, state.GetPageSize());
+    if (hybrid_prefix_cache_ == nullptr && kv_prefix_cache_ != nullptr) {
+        std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(device_node_ref->Node());
+        std::int32_t new_page_count =
+            static_cast<std::int32_t>(paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages.size());
+        if (new_page_count > 0) {
+            OwnedPages pages_to_insert = local_kv_allocator->TakeFirst(new_page_count);
+            auto result = kv_prefix_cache_->Insert<ResourceType::Device>(paged_tokens, prefix_pages,
+                                                                         std::move(pages_to_insert));
+            device_node_ref = std::make_unique<DeviceNodeRef>(result.last_node);
+        }
+    }
     // Allocate fresh checkpoint for decode-phase mamba state tracking
     if (hybrid_prefix_cache_ != nullptr && local_mamba_allocator != nullptr) {
         if (!local_mamba_allocator->AllocateCheckpoint()) {
