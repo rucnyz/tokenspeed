@@ -33,7 +33,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import argmax as cute_argmax
 from tokenspeed_kernel.ops.sampling.flashinfer import (
     softmax,
     top_k_renorm_prob,
-    top_k_top_p_sampling_from_logits,
+    top_k_top_p_sampling_from_probs,
     top_p_renorm_prob,
 )
 from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
@@ -55,8 +55,8 @@ from tokenspeed.runtime.sampling.backends.base import (
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import (
     coin_eps,
+    gather_token_logprobs_torch,
     nan_guard_logits,
-    write_output_logprobs,
 )
 from tokenspeed.runtime.utils import crash_on_warnings
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -69,13 +69,13 @@ if TYPE_CHECKING:
 
 
 class FlashInferSamplingBackend(SamplingBackend):
-    """Fast fused backend: single-kernel top_k_top_p_sampling_from_logits
+    """Fast backend: fused softmax(temperature) + top_k_top_p_sampling_from_probs
     for stochastic single-step sampling; cuda chain kernels (greedy +
     rejection) for multi-step verification.
 
-    Scope is deliberately narrow — temperature / top_k / top_p only — so
-    the hot path stays 1 kernel. Requests asking for min_p, penalties, or
-    logit_bias are silently ignored; use `flashinfer_full` if any of those
+    Scope is deliberately narrow — temperature / top_k / top_p only —
+    keeping the hot path to 2 kernels. Requests asking for min_p, penalties,
+    or logit_bias are silently ignored; use `flashinfer_full` if any of those
     matter for the workload.
     """
 
@@ -169,20 +169,22 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._ones_buf = torch.ones(
             (config.max_bs,), dtype=torch.int32, device=config.device
         )
-        self._predict_buf = torch.zeros(
-            (config.max_bs * config.max_draft_tokens_per_req,),
+        # predict + accept_length share one packed backing store.
+        # Layout: [0, max_bs * max_n) is predict, [max_bs * max_n, total)
+        # is accept_length.
+        self._predict_max = config.max_bs * config.max_draft_tokens_per_req
+        self._output_pack_buf = torch.zeros(
+            (self._predict_max + config.max_bs,),
             dtype=torch.int32,
             device=config.device,
         )
-        # Flat layout so [:bs * n].view(bs, n) is contiguous for any bs/n
-        # (required by maybe_broadcast / NCCL).
+        self._predict_buf = self._output_pack_buf[: self._predict_max]
+        self._accept_length_buf = self._output_pack_buf[self._predict_max :]
+        # Flat layout so [:bs * n].view(bs, n) is contiguous for any bs/n.
         self._accept_index_buf = torch.zeros(
             (config.max_bs * config.max_draft_tokens_per_req,),
             dtype=torch.int32,
             device=config.device,
-        )
-        self._accept_length_buf = torch.zeros(
-            (config.max_bs,), dtype=torch.int32, device=config.device
         )
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -256,13 +258,14 @@ class FlashInferSamplingBackend(SamplingBackend):
                 enable_pdl=pdl_enabled(),
             )
 
-            # Fuses softmax + top_k + top_p + sample into one kernel; we only
-            # need to pre-scale by temperature.
             check_nan = self.config.enable_nan_detection and crash_on_warnings()
-            scaled_logits = logits.div_(temperatures.view(-1, 1))
-
-            batch_next_token_ids = top_k_top_p_sampling_from_logits(
-                scaled_logits,
+            probs = softmax(
+                logits,
+                temperature=temperatures.view(-1, 1),
+                enable_pdl=pdl_enabled(),
+            )
+            batch_next_token_ids = top_k_top_p_sampling_from_probs(
+                probs,
                 top_ks,
                 top_ps,
                 filter_apply_order="joint",
@@ -278,8 +281,9 @@ class FlashInferSamplingBackend(SamplingBackend):
         self.maybe_broadcast(sampled)
 
         if self.config.enable_output_logprobs:
-
-            write_output_logprobs(logits_output, logits, sampled)
+            logits_output.next_token_logprobs = gather_token_logprobs_torch(
+                logits, sampled
+            )
 
         bs = logits.shape[0]
 
@@ -304,19 +308,21 @@ class FlashInferSamplingBackend(SamplingBackend):
         )
         accept_length = self._accept_length_buf[:bs]
 
+        logits = nan_guard_logits(
+            logits_output.next_token_logits, self.config.enable_nan_detection
+        )
+
         # Per-draft-position grammar bitmask: buffer shape
         # [bs * num_tokens_per_req, V/32] matches the flat target logits.
         if sampling_info.vocab_mask is not None:
             sampling_info.apply_vocab_mask(
-                logits=logits_output.next_token_logits,
+                logits=logits,
                 vocab_mask=sampling_info.vocab_mask,
             )
 
         if sampling_info.is_all_greedy:
 
-            target_predict = cute_argmax(logits_output.next_token_logits).reshape(
-                bs, num_tokens_per_req
-            )
+            target_predict = cute_argmax(logits).reshape(bs, num_tokens_per_req)
 
             verify_chain_greedy(
                 predicts=predict,
@@ -344,7 +350,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             )
 
             target_probs = softmax(
-                logits_output.next_token_logits,
+                logits,
                 temperature=temperatures,
                 enable_pdl=pdl_enabled(),
             )
@@ -388,12 +394,41 @@ class FlashInferSamplingBackend(SamplingBackend):
             self.maybe_broadcast(predict, accept_index, accept_length)
 
         if self.config.enable_output_logprobs:
-
-            write_output_logprobs(
-                logits_output, logits_output.next_token_logits, predict
+            logits_output.next_token_logprobs = gather_token_logprobs_torch(
+                logits, predict
             )
 
         return predict, accept_length
+
+    def get_packed_output_d2h(
+        self,
+        output_tokens: torch.Tensor,
+        output_lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """One D2H of the packed predict+accept_length region.
+
+        Only applies when both outputs alias into ``_output_pack_buf`` (the
+        verify() path). For ``sample()``, ``output_tokens`` is a fresh
+        argmax/top_k_top_p result and ``output_lengths`` is ``_ones_buf``,
+        neither of which lives in the pack. We fall back to two D2Hs.
+        """
+        if (
+            output_tokens.data_ptr() != self._output_pack_buf.data_ptr()
+            or output_lengths.data_ptr() != self._accept_length_buf.data_ptr()
+        ):
+            return None
+        n_t = output_tokens.numel()
+        n_l = output_lengths.numel()
+        # Copy the whole [0, predict_max + n_l). The gap [n_t, predict_max)
+        # is stale padding (max_bs * max_n  vs.  bs * n) — small enough that
+        # the saved launch beats the wasted bandwidth.
+        size = self._predict_max + n_l
+        cpu_pack = torch.empty(size, dtype=torch.int32, pin_memory=True)
+        cpu_pack.copy_(self._output_pack_buf[:size], non_blocking=True)
+        return (
+            cpu_pack[:n_t].view(output_tokens.shape),
+            cpu_pack[self._predict_max : self._predict_max + n_l],
+        )
 
 
 register_backend("flashinfer", FlashInferSamplingBackend)

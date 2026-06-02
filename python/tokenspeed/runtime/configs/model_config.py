@@ -46,6 +46,7 @@ logger = get_colorful_logger(__name__)
 _DEEPSEEK_V4_ARCHITECTURES = frozenset(
     {
         "DeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLMNextN",
     }
 )
 _MLA_ARCHITECTURES = frozenset(
@@ -90,6 +91,10 @@ def is_deepseek_v4(config: PretrainedConfig) -> bool:
     return resolve_architecture(config) in _DEEPSEEK_V4_ARCHITECTURES
 
 
+def is_deepseek_v4_nextn(config: PretrainedConfig) -> bool:
+    return resolve_architecture(config) == "DeepseekV4ForCausalLMNextN"
+
+
 def configure_deepseek_v4_attention(model_config) -> None:
     """Derive DeepSeek V4's MLA-like dimensions for runtime setup."""
 
@@ -108,6 +113,19 @@ def configure_deepseek_v4_attention(model_config) -> None:
         scaling_factor = rope_scaling["factor"]
         mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
         model_config.scaling = model_config.scaling * mscale * mscale
+
+
+def _derive_num_attention_layers(
+    hf_config: PretrainedConfig,
+    num_hidden_layers: int,
+) -> int:
+    architectures = getattr(hf_config, "architectures", None) or []
+    num_attention_layers = num_hidden_layers
+    if is_deepseek_v4_nextn(hf_config):
+        num_attention_layers = int(getattr(hf_config, "num_nextn_predict_layers", 1))
+    if any(arch in _DOUBLE_ATTENTION_LAYER_ARCHITECTURES for arch in architectures):
+        num_attention_layers = num_hidden_layers * 2
+    return num_attention_layers
 
 
 class ModelConfig:
@@ -158,6 +176,35 @@ class ModelConfig:
         self.is_multimodal_gen = is_multimodal_gen_model(self.hf_config.architectures)
         self.is_image_gen = is_image_gen_model(self.hf_config.architectures)
         self.is_audio_model = is_audio_model(self.hf_config.architectures)
+
+        language_model_only = bool(getattr(server_args, "language_model_only", False))
+        # Target-only flag; never apply to draft / auxiliary checkpoints.
+        apply_language_model_only = language_model_only and not is_draft_worker
+        if apply_language_model_only:
+            if not self.is_multimodal:
+                raise ValueError(
+                    "--language-model-only requires a multimodal model checkpoint."
+                )
+            logger.info(
+                "Running in language-model-only mode: vision/audio encoders will "
+                "be skipped; requests with multimodal inputs will be rejected."
+            )
+        # ``is_multimodal`` is the architectural fact; this is the runtime gate.
+        self.is_multimodal_active = self.is_multimodal and not apply_language_model_only
+        # Cap gpu_memory_utilization for VLMs in mm mode — the vision encoder
+        # needs headroom that the global default doesn't account for.
+        if (
+            self.is_multimodal_active
+            and getattr(server_args, "_gpu_memory_utilization_defaulted", False)
+            and server_args.gpu_memory_utilization > 0.9
+        ):
+            logger.info(
+                "Clamping gpu_memory_utilization %.2f -> 0.9 to leave headroom "
+                "for the vision encoder.",
+                server_args.gpu_memory_utilization,
+            )
+            server_args.gpu_memory_utilization = 0.9
+        self.mm_attention_backend = getattr(server_args, "mm_attention_backend", None)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length
@@ -237,6 +284,12 @@ class ModelConfig:
         else:
             self.attention_arch = AttentionArch.MHA
 
+        self.use_target_verify_forward_mode = (
+            getattr(server_args, "speculative_algorithm", None) is not None
+            and not is_draft_worker
+            and is_deepseek_v4(self.hf_config)
+        )
+
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(
             self.hf_text_config, "num_key_value_heads", None
@@ -254,12 +307,10 @@ class ModelConfig:
         self.num_hidden_layers = getattr(self.hf_text_config, "num_hidden_layers", None)
         if self.num_hidden_layers is None:
             self.num_hidden_layers = self.hf_text_config.num_layers
-        self.num_attention_layers = self.num_hidden_layers
-        if any(
-            arch in _DOUBLE_ATTENTION_LAYER_ARCHITECTURES
-            for arch in self.hf_config.architectures
-        ):
-            self.num_attention_layers = self.num_hidden_layers * 2
+        self.num_attention_layers = _derive_num_attention_layers(
+            self.hf_config,
+            self.num_hidden_layers,
+        )
         if is_draft_worker:
             mtp_layers = getattr(self.hf_text_config, "mtp_num_hidden_layers", None)
             if mtp_layers is not None:

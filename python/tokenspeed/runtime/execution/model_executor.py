@@ -50,7 +50,7 @@ from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
 from tokenspeed.runtime.utils.common import maybe_inference_mode
-from tokenspeed.runtime.utils.env import envs, get_global_server_args
+from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -100,6 +100,7 @@ class ModelExecutorConfig:
     spec_num_steps: int | None = None
     # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
     spec_num_tokens: int | None = None
+    use_target_verify_forward_mode: bool = False
 
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
@@ -153,6 +154,7 @@ class ModelExecutorConfig:
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
+            use_target_verify_forward_mode=model_config.use_target_verify_forward_mode,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
@@ -184,6 +186,7 @@ class ModelExecutor:
         self.token_to_kv_pool = token_to_kv_pool
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        self._layerwise_mamba_cow_done = None
 
         if config.spec_algo is not None:
             max_num_pages_per_req = (
@@ -234,6 +237,12 @@ class ModelExecutor:
             )
             embed, head = self.model_runner.model.get_embed_and_head()
             draft_model_runner.model.set_embed_and_head(embed, head)
+            target_hf = self.model_runner.model_config.hf_config
+            mm_pad_substitute_id = getattr(
+                target_hf, "image_token_id", None
+            ) or getattr(target_hf, "media_placeholder_token_id", None)
+            if mm_pad_substitute_id is not None:
+                self.drafter.set_mm_pad_substitute_id(mm_pad_substitute_id)
             if config.spec_algo in ("EAGLE3",) and hasattr(
                 self.model_runner.model, "set_eagle3_layers_to_capture"
             ):
@@ -307,8 +316,9 @@ class ModelExecutor:
         _mm_model = self.model_runner.model
         if (
             hasattr(_mm_model, "make_encoder_cudagraph_wrapper")
+            and getattr(_mm_model, "is_multimodal_active", True)
             and envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH.get()
-            and get_global_server_args().mm_attention_backend != "flashinfer_cudnn"
+            and self.model_runner.server_args.mm_attention_backend != "flashinfer_cudnn"
         ):
             self.encoder_graph_wrapper = _mm_model.make_encoder_cudagraph_wrapper(
                 _mm_model.mapping
@@ -440,7 +450,9 @@ class ModelExecutor:
         # attention/MoE. Rejoined at wait_bitmask() before apply_mask.
         if self.capturable_grammar is not None:
             n = self.capturable_grammar.max_tokens_per_req
-            is_spec_verify = n > 1 and ctx.forward_mode.is_decode()
+            is_spec_verify = n > 1 and (
+                ctx.forward_mode.is_decode() or ctx.forward_mode.is_target_verify()
+            )
             slice_ = (
                 self.input_buffers.input_ids_buf[: bs * n] if is_spec_verify else None
             )
@@ -823,6 +835,10 @@ class ModelExecutor:
         ranks do. The MoE all-to-all is a collective that requires ALL
         ranks to participate.
         """
+        graph_forward_mode = ForwardMode.decode_or_target_verify(
+            has_drafter=self.drafter is not None,
+            use_target_verify=self.config.use_target_verify_forward_mode,
+        )
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -830,7 +846,7 @@ class ModelExecutor:
             bs=0,
             num_extends=0,
             input_num_tokens=0,
-            forward_mode=ForwardMode.DECODE,
+            forward_mode=graph_forward_mode,
             global_num_tokens=global_num_tokens,
             global_bs=global_bs,
             all_decode_or_idle=all_decode_or_idle,
@@ -882,25 +898,29 @@ class ModelExecutor:
         # NCCL collectives. Idle ranks must match those collectives:
         # 1 first-step forward + (spec_num_steps - 1) multi-step decode forwards.
         if self.drafter is not None:
-            draft_ctx = ForwardContext(
-                attn_backend=self.drafter.attn_backend,
-                token_to_kv_pool=self.drafter.token_to_kv_pool,
-                req_to_page=self.drafter.req_to_page,
-                bs=0,
-                num_extends=0,
-                input_num_tokens=0,
-                forward_mode=ForwardMode.IDLE,
-                global_num_tokens=global_num_tokens,
-                global_bs=global_bs,
-                all_decode_or_idle=all_decode_or_idle,
-            )
-            for _ in range(self.drafter.spec_num_steps):
+            for step_idx in range(self.drafter.spec_num_steps):
+                # Mirror active rank's catch-up step: when all non-idle ranks
+                # are decoding, step 0 sizes collectives from bs/global_bs.
+                draft_ctx = ForwardContext(
+                    attn_backend=self.drafter.attn_backend,
+                    token_to_kv_pool=self.drafter.token_to_kv_pool,
+                    req_to_page=self.drafter.req_to_page,
+                    bs=0,
+                    num_extends=0,
+                    input_num_tokens=0,
+                    forward_mode=ForwardMode.IDLE,
+                    global_num_tokens=global_num_tokens,
+                    global_bs=global_bs,
+                    all_decode_or_idle=all_decode_or_idle,
+                    draft_first_step_reduce=(step_idx == 0 and all_decode_or_idle),
+                )
                 self.drafter.draft_model_runner.forward(
                     draft_ctx,
                     input_ids=empty,
                     positions=empty,
                     out_cache_loc=empty,
                     input_lengths=empty,
+                    spec_step_idx=step_idx,
                 )
 
     def update_block_table(self, forward_op) -> ModelExecutionResult:
@@ -983,6 +1003,67 @@ class ModelExecutor:
                     mask_1d, hist_dev, vcl
                 )
 
+    def set_layerwise_mamba_cow_done(
+        self, cow_by_src: dict[int, list[int]] | None
+    ) -> None:
+        self._layerwise_mamba_cow_done = (
+            {
+                int(src): {int(dst) for dst in dsts}
+                for src, dsts in cow_by_src.items()
+                if dsts
+            }
+            if cow_by_src
+            else None
+        )
+
+    def _skip_completed_layerwise_mamba_cow(
+        self, forward_op, bs: int
+    ) -> torch.Tensor | None:
+        cow_done = self._layerwise_mamba_cow_done
+        self._layerwise_mamba_cow_done = None
+        if not cow_done or not getattr(self.input_buffers, "has_mamba", False):
+            return None
+        cow_src_indices = getattr(forward_op, "mamba_cow_src_indices", None)
+        working_indices = getattr(forward_op, "mamba_pool_indices", None)
+        if cow_src_indices is None or working_indices is None:
+            return None
+
+        cow_src_indices = list(cow_src_indices)[:bs]
+        working_indices = list(working_indices)[:bs]
+        skipped_mask = [False] * bs
+        changed = False
+        for i, (cow_src, working) in enumerate(zip(cow_src_indices, working_indices)):
+            cow_src = int(cow_src)
+            working = int(working)
+            if working in cow_done.get(cow_src, set()):
+                cow_src_indices[i] = -1
+                skipped_mask[i] = True
+                changed = True
+        if not changed:
+            return None
+
+        self.input_buffers._mamba_cow_src_indices_cpu[:bs].copy_(
+            torch.as_tensor(cow_src_indices, dtype=torch.int32)
+        )
+        cow_src_buf = self.input_buffers.mamba_cow_src_indices_buf
+        cow_src_buf[:bs].copy_(
+            self.input_buffers._mamba_cow_src_indices_cpu[:bs], non_blocking=True
+        )
+        return torch.tensor(skipped_mask, dtype=torch.bool, device=cow_src_buf.device)
+
+    @staticmethod
+    def _mamba_retract_reset_mask(
+        mamba_cow_src: torch.Tensor,
+        bs: int,
+        skipped_layerwise_cow_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        reset_mask = mamba_cow_src[:bs] >= 0
+        if skipped_layerwise_cow_mask is not None:
+            reset_mask = reset_mask | skipped_layerwise_cow_mask[:bs].to(
+                device=reset_mask.device, dtype=torch.bool
+            )
+        return reset_mask
+
     def execute_forward_op(
         self,
         forward_op,
@@ -1009,11 +1090,15 @@ class ModelExecutor:
             torch.cuda.current_stream().wait_stream(self.execution_stream)
             self.execution_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.execution_stream):
+            bs = len(forward_op.request_ids)
             self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
                 req_to_page=self.req_to_page,
                 total_tokens=total_tokens,
+            )
+            skipped_layerwise_cow_mask = self._skip_completed_layerwise_mamba_cow(
+                forward_op, bs
             )
             self._active_positions_override = self._build_mrope_positions_override(
                 forward_op=forward_op,
@@ -1021,8 +1106,12 @@ class ModelExecutor:
                 total_tokens=total_tokens,
             )
 
-            bs = len(forward_op.request_ids)
-            forward_mode = ForwardMode.from_num_extends(num_extends, bs)
+            forward_mode = ForwardMode.from_num_extends(
+                num_extends,
+                bs,
+                has_drafter=self.drafter is not None,
+                use_target_verify=self.config.use_target_verify_forward_mode,
+            )
 
             if num_extends <= 0:
                 self._prev_decode_bs = bs
@@ -1049,7 +1138,11 @@ class ModelExecutor:
                         )
                 elif has_retract:
                     if hasattr(self.attn_backend, "reset_current_inputs"):
-                        retract_mask = mamba_cow_src[:bs] >= 0
+                        retract_mask = self._mamba_retract_reset_mask(
+                            mamba_cow_src,
+                            bs,
+                            skipped_layerwise_cow_mask,
+                        )
                         self.attn_backend.reset_current_inputs(
                             self.input_buffers.req_pool_indices_buf[:bs][retract_mask],
                             mamba_pool_indices[:bs][retract_mask],
@@ -1226,8 +1319,32 @@ class ModelExecutor:
                 )
 
             with nvtx_range("output_d2h", color="green"):
-                output_tokens = output_tokens.to("cpu", non_blocking=True)
-                output_lengths = output_lengths.to("cpu", non_blocking=True)
+                # Defensive clamp into the valid vocab range (kept from the
+                # pre-pack path). An out-of-range token id -- e.g. a stale/corrupt
+                # value surfaced by the intermittent spec-decode decode-state race
+                # -- would otherwise reach the detokenizer, whose HF
+                # tokenizer.decode raises a fatal OverflowError on ids outside
+                # [0, vocab) and tears down the whole server process tree.
+                # It must run on-GPU *before* the non_blocking D2H: clamping the
+                # CPU result afterwards would race the in-flight copy. In-place
+                # (clamp_) so output_tokens keeps aliasing _output_pack_buf and
+                # the get_packed_output_d2h data_ptr fast-path still fires -- and
+                # in-place on the forward's inference tensors is only legal inside
+                # inference mode, so re-enter it (maybe_inference_mode mirrors the
+                # forward and reduces to no_grad when inference mode is disabled,
+                # where output_tokens isn't an inference tensor anyway).
+                vocab_size = self.runtime_states.vocab_size
+                with maybe_inference_mode():
+                    output_tokens.clamp_(0, vocab_size - 1)
+
+                packed = self.sampling_backend.get_packed_output_d2h(
+                    output_tokens, output_lengths
+                )
+                if packed is not None:
+                    output_tokens, output_lengths = packed
+                else:
+                    output_tokens = output_tokens.to("cpu", non_blocking=True)
+                    output_lengths = output_lengths.to("cpu", non_blocking=True)
 
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)

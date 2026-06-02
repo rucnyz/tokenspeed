@@ -52,6 +52,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     pool_to_paged_cache_groups,
     pool_to_prefix_cache_adjunct_spec,
     pop_common_cache_event_payloads,
+    should_use_overlap_schedule,
 )
 from tokenspeed.runtime.execution.distributed_initializer import (
     DistributedConfig,
@@ -300,8 +301,8 @@ class EventLoop:
             )
 
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
-
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
+        self._paged_cache_groups = paged_cache_groups
         prefix_cache_adjunct = None
         required_groups = token_to_kv_pool.prefix_cache_required_group_ids
         if required_groups is not None and server_args.enable_prefix_caching:
@@ -336,7 +337,8 @@ class EventLoop:
             "Scheduler config: page_size=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
-            "mamba_pool_total_chunks=%s enable_mamba=%s",
+            "mamba_pool_total_chunks=%s enable_mamba=%s "
+            "disable_prefix_cache=%s paged_cache_groups=%s",
             scheduler_cfg.page_size,
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
@@ -347,6 +349,8 @@ class EventLoop:
             self.dp_size,
             mamba_pool_total_chunks,
             has_mamba,
+            scheduler_cfg.disable_prefix_cache,
+            [group.group_id for group in paged_cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)
         if attn_tp_rank == 0:
@@ -641,7 +645,7 @@ class EventLoop:
                 )
 
     def _get_multimodal_context_for_forward(self, forward_op):
-        if not self.model_config.is_multimodal:
+        if not self.model_config.is_multimodal_active:
             return None
 
         num_extends = forward_op.num_extends()
@@ -665,15 +669,57 @@ class EventLoop:
             extend_seq_lens=list(forward_op.input_lengths[:num_extends]),
         )
 
+    def _build_mamba_layerwise_cow(
+        self, execution_plan, forward_op
+    ) -> dict[int, list[int]]:
+        if forward_op is None:
+            return {}
+        loaded_mamba_slots: set[int] = set()
+        for cache_op in execution_plan.cache:
+            if not isinstance(cache_op, Cache.LoadBackOp):
+                continue
+            dst_by_kind = getattr(cache_op, "dst_pages_by_kind", None)
+            if dst_by_kind is None:
+                dst_groups = getattr(cache_op, "dst_pages", [])
+            else:
+                dst_groups = dst_by_kind.get(CacheKind.MAMBA.value, [])
+            for dst_pages in dst_groups:
+                loaded_mamba_slots.update(int(page) for page in dst_pages)
+        if not loaded_mamba_slots:
+            return {}
+
+        cow_src_indices = getattr(forward_op, "mamba_cow_src_indices", None)
+        working_indices = getattr(forward_op, "mamba_pool_indices", None)
+        if cow_src_indices is None or working_indices is None:
+            return {}
+
+        cow_by_src: dict[int, list[int]] = {}
+        for cow_src, working in zip(list(cow_src_indices), list(working_indices)):
+            cow_src = int(cow_src)
+            working = int(working)
+            if cow_src < 0 or working < 0 or cow_src not in loaded_mamba_slots:
+                continue
+            cow_dsts = cow_by_src.setdefault(cow_src, [])
+            if working not in cow_dsts:
+                cow_dsts.append(working)
+        return cow_by_src
+
     def _submit_cache_ops(self, execution_plan) -> None:
         if self.memory_executor is None:
             return
-        self.memory_executor.submit_plan(
-            execution_plan, producer_stream=self.model_executor.execution_stream
+        forward_op = self._get_forward_op(execution_plan)
+        mamba_layerwise_cow = self._build_mamba_layerwise_cow(
+            execution_plan, forward_op
         )
+        if mamba_layerwise_cow:
+            self.model_executor.set_layerwise_mamba_cow_done(mamba_layerwise_cow)
+            self.memory_executor.set_mamba_layerwise_cow(mamba_layerwise_cow)
+        self.memory_executor.submit_plan(execution_plan)
         for op in execution_plan.cache:
-            if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
+            if isinstance(op, Cache.WriteBackOp):
                 self._num_inflight_cache_ops += len(op.op_ids)
+            elif isinstance(op, Cache.LoadBackOp):
+                continue
             elif isinstance(op, (Cache.PrefetchOp, Cache.BackUpOp)):
                 self._num_inflight_cache_ops += 1
             else:
@@ -704,21 +750,6 @@ class EventLoop:
             self.memory_executor.set_consumer(
                 kind, consumer_indices if consumer_indices else -1
             )
-        has_mamba_loadback = bool(consumer_indices_by_kind.get(CacheKind.MAMBA))
-        # Fence WriteBack against this iter's ``set_kv_buffer``: the
-        # scheduler can re-allocate a freed-but-not-yet-written-back slot
-        # to a new prefill / decode within the same iter. ``set_kv_buffer``
-        # runs before any ``wait_until`` in attention, so nothing else
-        # orders writeback's reads against the new writes. Cheap when
-        # write_stream is idle.
-        host_exec = getattr(self.memory_executor, "host_exec", None)
-        if host_exec is not None:
-            self.model_executor.execution_stream.wait_stream(host_exec.write_stream)
-            if has_mamba_loadback:
-                # Mamba COW runs before the layerwise waits in mamba forward and
-                # reads the freshly loaded tree slot into the request-local
-                # working slot. Fence load_stream here so COW cannot race H->D.
-                self.model_executor.execution_stream.wait_stream(host_exec.load_stream)
 
     def _flush_mamba_retract_states(self, forward_op) -> None:
         """Copy draft->working mamba states when retract occurred (no forward scheduled)."""
@@ -882,6 +913,10 @@ class EventLoop:
         forward_mode = ForwardMode.from_num_extends(
             forward_op.num_extends(),
             len(forward_op.request_ids),
+            has_drafter=self.server_args.speculative_algorithm is not None,
+            use_target_verify=(
+                self.model_executor.config.use_target_verify_forward_mode
+            ),
         )
         self.request_handler._profile_batch_predicate(forward_mode)
 
@@ -958,6 +993,10 @@ class EventLoop:
             forward_mode = ForwardMode.from_num_extends(
                 forward_op.num_extends(),
                 batch_size,
+                has_drafter=self.server_args.speculative_algorithm is not None,
+                use_target_verify=(
+                    self.model_executor.config.use_target_verify_forward_mode
+                ),
             )
 
         self._dp_local_info[0, 0] = num_tokens
@@ -974,7 +1013,13 @@ class EventLoop:
         any_rank_has_work = max(global_num_tokens) > 0
         need_idle_forward = num_tokens == 0 and any_rank_has_work
         all_decode_or_idle = all(
-            ForwardMode(mode).is_decode_or_idle() for mode in global_forward_mode
+            mode
+            in (
+                int(ForwardMode.DECODE),
+                int(ForwardMode.IDLE),
+                int(ForwardMode.TARGET_VERIFY),
+            )
+            for mode in global_forward_mode
         )
         return DpForwardMetadata(
             global_num_tokens=global_num_tokens,
@@ -1273,11 +1318,13 @@ def run_event_loop(
             }
         )
 
-        # Prefill nodes have no steady-state decode stream to overlap over;
-        # overlap scheduling adds complexity with negligible benefit, so always
-        # fall back to the non-overlapping loop for prefill instances.
-        is_prefill_instance = server_args.disaggregation_mode == "prefill"
-        if not server_args.disable_overlap_schedule and not is_prefill_instance:
+        use_overlap = should_use_overlap_schedule(
+            disable_overlap_schedule=server_args.disable_overlap_schedule,
+            disaggregation_mode=server_args.disaggregation_mode,
+            speculative_algorithm=server_args.speculative_algorithm,
+            paged_cache_groups=getattr(event_loop, "_paged_cache_groups", ()),
+        )
+        if use_overlap:
             event_loop.event_loop_overlap()
         else:
             event_loop.event_loop()
