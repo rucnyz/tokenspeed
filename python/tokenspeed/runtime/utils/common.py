@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import pickle
+import platform as platform_module
 import random
 import re
 import resource
@@ -171,15 +172,35 @@ def set_numa_memory_policy(device_id: int) -> None:
 
     node = numa_memory_nodes[device_id]
 
-    libc_name = ctypes.util.find_library("c")
-    if not libc_name:
+    # glibc's libc.so.6 does not export set_mempolicy() directly; it must be
+    # invoked through the syscall() wrapper. SYS_set_mempolicy is 238 on x86_64
+    # and 237 on aarch64.
+    machine = platform_module.machine()
+    sys_set_mempolicy = {"x86_64": 238, "aarch64": 237}.get(machine)
+    if sys_set_mempolicy is None:
         return
-    libc = ctypes.CDLL(libc_name, use_errno=True)
 
-    # nodemask is a bitmask with one bit per NUMA node
-    nodemask = ctypes.c_ulong(1 << node)
-    maxnode = ctypes.c_ulong(node + 2)
-    ret = libc.set_mempolicy(ctypes.c_int(2), ctypes.byref(nodemask), maxnode)  # MPOL_BIND = 2
+    try:
+        libc_name = ctypes.util.find_library("c")
+        if not libc_name:
+            return
+        libc = ctypes.CDLL(libc_name, use_errno=True)
+        libc.syscall.restype = ctypes.c_long
+
+        nodemask = ctypes.c_ulong(1 << node)
+        maxnode = ctypes.c_ulong(node + 2)
+        ret = libc.syscall(
+            ctypes.c_long(sys_set_mempolicy),
+            ctypes.c_int(2),  # MPOL_BIND
+            ctypes.byref(nodemask),
+            maxnode,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "set_mempolicy syscall unavailable for device %d: %s", device_id, exc
+        )
+        return
+
     if ret != 0:
         errno = ctypes.get_errno()
         logger.warning(
