@@ -73,6 +73,12 @@ struct PrefixCacheAdjunctSpec {
     std::vector<std::string> required_groups{};
 };
 
+struct AdmissionConfig {
+    double high_watermark{0.95};
+    std::int32_t cooldown_cycles{3};
+    std::int32_t max_retract_count{3};
+};
+
 struct SchedulerConfig {
     std::int32_t page_size{};
     struct {
@@ -96,6 +102,8 @@ struct SchedulerConfig {
     std::int32_t prefetch_threshold{4};  // num pages
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
+
+    std::optional<AdmissionConfig> admission{};
 
     std::int32_t num_pages_reserved_for_retracted_or_running{};
     Role role{Role::kFused};

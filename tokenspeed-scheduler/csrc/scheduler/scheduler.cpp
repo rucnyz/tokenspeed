@@ -330,6 +330,10 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     }
     std::erase_if(requests_, [](const auto& req) { return req.second->template Is<fsm::Finished>(); });
 
+    for (auto& [id, req] : requests_) {
+        req->TickCycle();
+    }
+
     std::vector<Request*> candidates;
     for (auto& [id, req] : requests_) {
         if (!req->Is<fsm::Draining>() && !req->Is<fsm::Prefetching>() && !req->Is<fsm::Retracting>() &&

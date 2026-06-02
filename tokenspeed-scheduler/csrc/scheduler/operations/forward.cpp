@@ -552,12 +552,11 @@ std::tuple<std::vector<ForwardOperation>, std::variant<std::vector<LoadBackOpera
 Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     auto priority = [&](const Request* req) -> int {
         if (req->Is<fsm::Prefilling>()) return 1;
-        if (req->Is<fsm::Submitted>()) return 2;
         if (req->Is<fsm::Decoding>() || req->Is<fsm::PrefillDone>()) {
-            // Decode-first if mixed-batch is enabled; prefill-first otherwise.
-            return config_.enable_mixed_prefill_decode ? 0 : 3;
+            return config_.enable_mixed_prefill_decode ? 0 : 4;
         }
-        if (req->Is<fsm::Retracted>()) return 4;
+        if (req->Is<fsm::Retracted>()) return 2;
+        if (req->Is<fsm::Submitted>()) return 3;
         return 9;
     };
     // TP-determinism: tie-break on Request::Id() so the relative order within a
@@ -570,7 +569,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     std::sort(candidates.begin(), candidates.end(), [&](const auto& a, const auto& b) {
         int pa = priority(a), pb = priority(b);
         if (pa != pb) return pa < pb;
-        if (pa == 2) {
+        if (pa == 3) {
             std::int32_t ma = a->PrefixMatchDepth(), mb = b->PrefixMatchDepth();
             if (ma != mb) return ma > mb;
         }
@@ -601,7 +600,14 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                 push_op(applyEventAndGenerateOp(request, *ev));
             }
         } else if (request->Is<fsm::Submitted>() || request->Is<fsm::PrefetchDone>()) {
-            // PrefetchDone: host cache populated; treat same as Submitted for forward scheduling.
+            {
+                std::int32_t prefix_depth = request->Is<fsm::Submitted>() ? request->PrefixMatchDepth() : 0;
+                std::int32_t prefill_pages = std::max(1, (request->PrefillSize() - prefix_depth * config_.page_size
+                                                          + config_.page_size - 1) / config_.page_size);
+                if (!admission_controller_.ShouldAdmit(device_allocator_.AvailablePages(), prefill_pages)) {
+                    continue;
+                }
+            }
             std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
 
             if (auto ev = schedulePrefillFirstChunk(request, token_budget, decode_input_tokens,
@@ -641,10 +647,12 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
 
     // If all active decode requests failed, device memory is exhausted: retract the longest one.
     if (ops.empty() && !candidates.empty()) {
+        const std::int32_t cooldown = admission_controller_.Config().cooldown_cycles;
+        const std::int32_t max_retracts = admission_controller_.Config().max_retract_count;
         std::vector<Request*> retract_candidates;
         for (Request* req : candidates) {
             if ((req->Is<fsm::Decoding>() || (req->Is<fsm::PrefillDone>() && config_.role != Role::kD)) &&
-                config_.role != Role::kP) {
+                config_.role != Role::kP && req->CyclesSinceLastRetract() >= cooldown) {
                 retract_candidates.push_back(req);
             }
         }
@@ -652,11 +660,18 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             Request* victim =
                 *std::max_element(retract_candidates.begin(), retract_candidates.end(),
                                   [](const Request* a, const Request* b) { return a->TokenSize() < b->TokenSize(); });
-            std::vector<WriteBackOperation> wb_ops;
-            if (auto op = newRetractOperation(victim)) {
-                wb_ops.push_back(std::move(*op));
+            if (victim->RetractCount() >= max_retracts) {
+                spdlog::warn("[Scheduler] Request {} exceeded max retract count ({}), aborting",
+                             victim->Id(), max_retracts);
+                victim->Apply(fsm::AbortEvent{});
+            } else {
+                victim->IncrementRetractCount();
+                std::vector<WriteBackOperation> wb_ops;
+                if (auto op = newRetractOperation(victim)) {
+                    wb_ops.push_back(std::move(*op));
+                }
+                return {std::vector<ForwardOperation>{}, std::move(wb_ops)};
             }
-            return {std::vector<ForwardOperation>{}, std::move(wb_ops)};
         }
     }
 

@@ -238,6 +238,11 @@ public:
             state_);
     }
 
+    std::int32_t RetractCount() const { return retract_count_; }
+    std::int32_t CyclesSinceLastRetract() const { return cycles_since_last_retract_; }
+    void IncrementRetractCount() { retract_count_++; cycles_since_last_retract_ = 0; }
+    void TickCycle() { cycles_since_last_retract_++; }
+
     std::int32_t GetReserveNumTokensInNextScheduleEvent() const {
         return std::visit(Overloaded{
             []<typename T>(const T& s) -> std::int32_t
@@ -288,6 +293,8 @@ private:
     std::int32_t page_size_;
     fsm::State state_;
     StorageInfo storage_info_;
+    std::int32_t retract_count_{0};
+    std::int32_t cycles_since_last_retract_{100};
 };
 
 using ConstRequestVector = std::vector<const Request*>;

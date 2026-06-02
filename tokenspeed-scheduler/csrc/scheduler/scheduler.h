@@ -36,6 +36,7 @@
 #include "scheduler/execution_event.h"
 #include "scheduler/kv_cache_events.h"
 
+#include "scheduler/admission_controller.h"
 #include "resource/allocator/page_allocator.h"
 #include "resource/allocator/paged_cache_group.h"
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
@@ -143,6 +144,8 @@ private:
     std::unordered_map<std::string, std::unique_ptr<Request>> requests_;
     std::unordered_map<cache_op_id, CacheOpSpec> cache_op_tracker_;
     std::vector<KvCacheEvent> kv_events_;
+    // TODO: configurable
+    AdmissionController admission_controller_{AdmissionConfig{}, config_.device_allocator.total_pages};
     // Stats
     SchedulerStats stats_;
 };
