@@ -542,30 +542,34 @@ def causal_conv1d_fn(
     if metadata is None:
 
         def num_program(META, seqlens):
+            device = META["x_ptr"].device
             nums = -(-seqlens // META["BLOCK_M"])  # ceil-div, numpy array
             tot = int(nums.sum())
+            mlist_len = tot
 
-            mlist = np.repeat(np.arange(len(nums)), nums)
-            # offsetlist[i] = local chunk index within its sequence
-            offsetlist = np.arange(tot) - np.repeat(np.cumsum(nums) - nums, nums)
-            mlist_len = mlist.shape[0]
+            nums_gpu = torch.as_tensor(nums, dtype=torch.int32, device=device)
+            mlist = torch.repeat_interleave(
+                torch.arange(len(nums), device=device, dtype=torch.int32), nums_gpu
+            )
+            starts = torch.cumsum(nums_gpu, dim=0) - nums_gpu
+            offsetlist = torch.arange(tot, device=device, dtype=torch.int32) - torch.repeat_interleave(starts, nums_gpu)
 
             if META["batch_ptr"].nelement() < mlist_len:
                 newlen = mlist_len + 1
-                META["batch_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
-                META["token_chunk_offset_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
+                META["batch_ptr"] = torch.full(
+                    (newlen,), PAD_SLOT_ID, dtype=torch.int32, device=device
+                )
+                META["token_chunk_offset_ptr"] = torch.full(
+                    (newlen,), PAD_SLOT_ID, dtype=torch.int32, device=device
+                )
+            elif META["batch_ptr"].device != device:
+                META["batch_ptr"] = META["batch_ptr"].to(device)
+                META["token_chunk_offset_ptr"] = META["token_chunk_offset_ptr"].to(
+                    device
+                )
 
-            combined_np = np.stack([mlist, offsetlist]).astype(np.int32, copy=False)
-            combined_cpu = torch.from_numpy(combined_np).pin_memory()
-            META["batch_ptr"][:mlist_len].copy_(combined_cpu[0], non_blocking=True)
-            META["token_chunk_offset_ptr"][:mlist_len].copy_(
-                combined_cpu[1], non_blocking=True
-            )
-
-            META["batch_ptr"] = META["batch_ptr"].to(META["x_ptr"].device)
-            META["token_chunk_offset_ptr"] = META["token_chunk_offset_ptr"].to(
-                META["x_ptr"].device
-            )
+            META["batch_ptr"][:mlist_len] = mlist
+            META["token_chunk_offset_ptr"][:mlist_len] = offsetlist
             return tot
 
     else:
