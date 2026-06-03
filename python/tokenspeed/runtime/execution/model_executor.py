@@ -706,6 +706,7 @@ class ModelExecutor:
         bs = self._prev_decode_bs
         if bs <= 0:
             return
+        self._prev_decode_bs = 0
 
         backend = getattr(self.attn_backend, "linear_attn_backend", self.attn_backend)
         pool = getattr(backend, "pool", None)
@@ -1178,6 +1179,8 @@ class ModelExecutor:
 
             if num_extends <= 0:
                 self._prev_decode_bs = bs
+            else:
+                self._prev_decode_bs = 0
 
             if self.runtime_states.mamba_pool is not None and (
                 num_extends > 0 or has_retract
