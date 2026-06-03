@@ -52,6 +52,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     pool_to_paged_cache_groups,
     pool_to_prefix_cache_adjunct_spec,
     pop_common_cache_event_payloads,
+    should_use_overlap_schedule,
 )
 from tokenspeed.runtime.execution.distributed_initializer import (
     DistributedConfig,
@@ -260,13 +261,10 @@ class EventLoop:
             mamba_l2_layout=server_args.mamba_l2_layout,
             mamba_l2_io_backend=server_args.mamba_l2_io_backend,
         )
-        is_deepseek_v4_pool = (
-            type(token_to_kv_pool).__name__ == "DeepseekV4TokenToKVPool"
-        )
-        if is_deepseek_v4_pool:
+        if not token_to_kv_pool.supports_hierarchical_kv_cache:
             if server_args.enable_kvstore:
                 raise NotImplementedError(
-                    "DeepSeek V4 baseline does not support hierarchical cache "
+                    "This KV cache pool does not support hierarchical cache "
                     "(kvstore); pass --disable-kvstore."
                 )
             self.memory_executor = None
@@ -300,8 +298,8 @@ class EventLoop:
             )
 
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
-
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
+        self._paged_cache_groups = paged_cache_groups
         prefix_cache_adjunct = None
         required_groups = token_to_kv_pool.prefix_cache_required_group_ids
         if required_groups is not None and server_args.enable_prefix_caching:
@@ -336,7 +334,8 @@ class EventLoop:
             "Scheduler config: page_size=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
-            "mamba_pool_total_chunks=%s enable_mamba=%s",
+            "mamba_pool_total_chunks=%s enable_mamba=%s "
+            "disable_prefix_cache=%s paged_cache_groups=%s",
             scheduler_cfg.page_size,
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
@@ -347,8 +346,11 @@ class EventLoop:
             self.dp_size,
             mamba_pool_total_chunks,
             has_mamba,
+            scheduler_cfg.disable_prefix_cache,
+            [group.group_id for group in paged_cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)
+        token_to_kv_pool.bind_paged_cache_scheduler(self.scheduler)
         if attn_tp_rank == 0:
             self.kv_event_publisher = EventPublisherFactory.create(
                 server_args.kv_events_config,
@@ -598,6 +600,7 @@ class EventLoop:
                     self.model_executor.device,
                 )
                 self.pd_kv_transfer.execute(forward_op)
+                self.model_executor.reset_remote_prefill_mamba_inputs(forward_op)
                 return None, None
             else:
                 # Path 3b: decode batch — normal forward
@@ -635,6 +638,7 @@ class EventLoop:
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
                         grammar_inputs=grammar_inputs,
                         multimodal_context=multimodal_context,
+                        capture_next_input_ids=True,
                         **stats,
                     ),
                     self.pd_kv_transfer.store_prefill_token,
@@ -909,6 +913,10 @@ class EventLoop:
         forward_mode = ForwardMode.from_num_extends(
             forward_op.num_extends(),
             len(forward_op.request_ids),
+            has_drafter=self.server_args.speculative_algorithm is not None,
+            use_target_verify=(
+                self.model_executor.config.use_target_verify_forward_mode
+            ),
         )
         self.request_handler._profile_batch_predicate(forward_mode)
 
@@ -948,6 +956,15 @@ class EventLoop:
                 bootstrap_token = event.bootstrap_token
 
                 self.output_processor.on_remote_prefill_done(req_id, bootstrap_token)
+                if isinstance(self.pd_kv_transfer, DisaggDecodeExecutor):
+                    candidate_info = self.pd_kv_transfer.pop_remote_spec_candidate_ids(
+                        req_id
+                    )
+                    if candidate_info is not None:
+                        req_pool_idx, candidate_ids = candidate_info
+                        self.model_executor.write_remote_spec_candidate_ids(
+                            req_pool_idx, candidate_ids
+                        )
 
         return processed
 
@@ -985,6 +1002,10 @@ class EventLoop:
             forward_mode = ForwardMode.from_num_extends(
                 forward_op.num_extends(),
                 batch_size,
+                has_drafter=self.server_args.speculative_algorithm is not None,
+                use_target_verify=(
+                    self.model_executor.config.use_target_verify_forward_mode
+                ),
             )
 
         self._dp_local_info[0, 0] = num_tokens
@@ -1001,7 +1022,13 @@ class EventLoop:
         any_rank_has_work = max(global_num_tokens) > 0
         need_idle_forward = num_tokens == 0 and any_rank_has_work
         all_decode_or_idle = all(
-            ForwardMode(mode).is_decode_or_idle() for mode in global_forward_mode
+            mode
+            in (
+                int(ForwardMode.DECODE),
+                int(ForwardMode.IDLE),
+                int(ForwardMode.TARGET_VERIFY),
+            )
+            for mode in global_forward_mode
         )
         return DpForwardMetadata(
             global_num_tokens=global_num_tokens,
@@ -1300,11 +1327,13 @@ def run_event_loop(
             }
         )
 
-        # Prefill nodes have no steady-state decode stream to overlap over;
-        # overlap scheduling adds complexity with negligible benefit, so always
-        # fall back to the non-overlapping loop for prefill instances.
-        is_prefill_instance = server_args.disaggregation_mode == "prefill"
-        if not server_args.disable_overlap_schedule and not is_prefill_instance:
+        use_overlap = should_use_overlap_schedule(
+            disable_overlap_schedule=server_args.disable_overlap_schedule,
+            disaggregation_mode=server_args.disaggregation_mode,
+            speculative_algorithm=server_args.speculative_algorithm,
+            paged_cache_groups=getattr(event_loop, "_paged_cache_groups", ()),
+        )
+        if use_overlap:
             event_loop.event_loop_overlap()
         else:
             event_loop.event_loop()
