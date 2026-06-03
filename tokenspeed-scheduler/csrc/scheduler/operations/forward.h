@@ -37,9 +37,8 @@ struct ForwardOperationBase {
     std::int32_t input_length;
     // All pages currently occupied by this request (existing + newly allocated).
     std::vector<int32_t> occupied_pages;
-    // Index into occupied_pages where newly allocated pages begin.
+    // Slice of occupied_pages to copy into the runtime request table.
     std::int32_t begin;
-    // Number of newly allocated pages (starting at occupied_pages[begin]).
     std::int32_t size;
 
     std::int32_t prefill_length;

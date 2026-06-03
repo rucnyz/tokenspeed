@@ -75,14 +75,28 @@ void AddUniqueNode(std::vector<TreeNode*>& nodes, TreeNode* node) {
     }
 }
 
+std::int32_t FirstChangedPage(const std::vector<std::int32_t>& before, const std::vector<std::int32_t>& after) {
+    std::size_t i = 0;
+    while (i < before.size() && i < after.size() && before[i] == after[i]) ++i;
+    return static_cast<std::int32_t>(i);
+}
+
+struct StableMatch {
+    MatchResult match;
+    std::unique_ptr<DeviceNodeRef> device_lock;
+    std::unique_ptr<HostNodeRef> host_lock;
+};
+
 }  // namespace
 
 std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFirstChunk(
     Request* request, std::int32_t remaining, std::int32_t decode_input_tokens, bool disable_l2_cache,
-    std::map<std::string, std::int32_t>& simulated_free) {
+    std::map<std::string, std::int32_t>& simulated_free, const MatchResult* stable_match) {
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
-    MatchResult match_result = hybrid_prefix_cache_ ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true))
-                                                    : kv_prefix_cache_.Match(request->GetFullPagedTokens(true));
+    MatchResult match_result = stable_match != nullptr
+                                   ? *stable_match
+                                   : (hybrid_prefix_cache_ ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true))
+                                                           : kv_prefix_cache_.Match(request->GetFullPagedTokens(true)));
     std::int32_t loadback_tokens = 0;
     std::int32_t unscheduled = 0;
     std::vector<TreeNode*> loadback_diff;
@@ -395,9 +409,10 @@ std::optional<WriteBackOperation> Scheduler::newRetractOperation(Request* retrac
 template <typename Event>
     requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> || std::same_as<Event, fsm::SchedulePrefillEvent>)
 static PrefillOperation applyPrefillEvent(Request* request, Event event) {
-    std::int32_t begin = static_cast<std::int32_t>(request->GetOccupiedPages().size());
+    std::vector<std::int32_t> old_pages = request->GetOccupiedPages();
     request->Apply(event);
     std::vector<std::int32_t> all_pages = request->GetOccupiedPages();
+    std::int32_t begin = FirstChangedPage(old_pages, all_pages);
     std::int32_t sz = static_cast<std::int32_t>(all_pages.size()) - begin;
 
     auto info = request->GetPrefillInfo();
@@ -460,9 +475,10 @@ template <typename Event>
     requires(std::same_as<Event, fsm::ScheduleDecodeEvent> ||
              std::same_as<Event, fsm::ScheduleDecodeFromRetractedEvent>)
 static DecodeOperation applyDecodeEvent(Request* request, Event event, std::int32_t decode_input_tokens) {
-    std::int32_t begin = static_cast<std::int32_t>(request->GetOccupiedPages().size());
+    std::vector<std::int32_t> old_pages = request->GetOccupiedPages();
     request->Apply(std::move(event));
     std::vector<std::int32_t> all_pages = request->GetOccupiedPages();
+    std::int32_t begin = FirstChangedPage(old_pages, all_pages);
     std::int32_t sz = static_cast<std::int32_t>(all_pages.size()) - begin;
 
     auto op = DecodeOperation{{
@@ -585,6 +601,20 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     std::vector<LoadBackOperation> loadback_ops;
     auto simulated_free =
         hybrid_prefix_cache_ ? hybrid_prefix_cache_->InitialSimulatedFree() : std::map<std::string, std::int32_t>{};
+    std::unordered_map<Request*, StableMatch> stable_matches;
+    for (Request* request : candidates) {
+        if (!request->Is<fsm::Submitted>() && !request->Is<fsm::PrefetchDone>()) continue;
+        MatchResult match = hybrid_prefix_cache_ ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true))
+                                                 : kv_prefix_cache_.Match(request->GetFullPagedTokens(true));
+        StableMatch stable{.match = std::move(match)};
+        if (stable.match.device.last_node != nullptr && !stable.match.device.last_node->IsRoot()) {
+            stable.device_lock = std::make_unique<DeviceNodeRef>(stable.match.device.last_node);
+        }
+        if (stable.match.host.last_node != nullptr && !stable.match.host.last_node->IsRoot()) {
+            stable.host_lock = std::make_unique<HostNodeRef>(stable.match.host.last_node);
+        }
+        stable_matches.emplace(request, std::move(stable));
+    }
     for (Request* request : candidates) {
         if (token_budget <= 0 || config_.max_batch_size == ops.size()) break;
 
@@ -597,8 +627,10 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             // PrefetchDone: host cache populated; treat same as Submitted for forward scheduling.
             std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
 
+            auto match = stable_matches.find(request);
+            const MatchResult* stable_match = match == stable_matches.end() ? nullptr : &match->second.match;
             if (auto ev = schedulePrefillFirstChunk(request, token_budget, decode_input_tokens,
-                                                    config_.disable_l2_cache, simulated_free)) {
+                                                    config_.disable_l2_cache, simulated_free, stable_match)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
                 std::vector<TreeNode*> mamba_loadback_nodes = ev->GetMambaLoadbackNodes();
                 push_op(applyEventAndGenerateOp(request, std::move(*ev)), true);

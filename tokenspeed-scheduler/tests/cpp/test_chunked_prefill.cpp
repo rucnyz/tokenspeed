@@ -102,6 +102,51 @@ TEST_F(ChunkedPrefillTestSuite, CompletedChunk_IsVisibleToPrefixCacheWithoutHybr
     EXPECT_EQ(fwd->extend_prefix_lens[0], 4);
 }
 
+TEST_F(ChunkedPrefillTestSuite, SamePlanPublishedChunk_IsNotVisibleToNewFirstChunk) {
+    Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2, 3, 4, 5, 6}});
+    PlanOnce();  // r1 chunk 1
+
+    Submit(RequestSpec{.request_id = "r2", .tokens = {1, 2, 3, 4, 5, 6}});
+    auto plan = PlanOnce();  // r1 chunk 2 publishes chunk 1, then r2 starts in the same plan.
+    auto* fwd = GetForwardOp(plan);
+    ASSERT_NE(fwd, nullptr);
+    ASSERT_EQ(fwd->request_ids.size(), 2u);
+
+    std::size_t r2_index = fwd->request_ids.size();
+    for (std::size_t i = 0; i < fwd->request_ids.size(); ++i) {
+        if (fwd->request_ids[i] == "r2") r2_index = i;
+    }
+    ASSERT_LT(r2_index, fwd->request_ids.size());
+    EXPECT_EQ(fwd->extend_prefix_lens[r2_index], 0);
+}
+
+TEST_F(ChunkedPrefillTestSuite, PrefixDedup_RewritesRequestTableFromFirstChangedPage) {
+    Submit(MakeRequestSpec("warm", 2));
+    PlanOnce();  // Submitted -> PrefillDone, final chunk not published.
+    PlanOnce();  // PrefillDone -> Decoding.
+    SendForwardDone("warm", {42});
+    Submit(MakeRequestSpec("reuse", 4));
+
+    auto first_plan = PlanOnce();
+    auto* first = GetForwardOp(first_plan);
+    ASSERT_NE(first, nullptr);
+    ASSERT_EQ(first->occupied_pages.size(), 1u);
+    ASSERT_GE(first->occupied_pages[0].size(), 2u);
+    const auto local_first_page = first->occupied_pages[0][0];
+
+    SendFinish("warm");
+
+    auto second_plan = PlanOnce();
+    auto* second = GetForwardOp(second_plan);
+    ASSERT_NE(second, nullptr);
+    ASSERT_EQ(second->occupied_pages.size(), 1u);
+    ASSERT_GE(second->occupied_pages[0].size(), 2u);
+
+    EXPECT_EQ(second->begins[0], 0);
+    EXPECT_EQ(second->sizes[0], static_cast<std::int32_t>(second->occupied_pages[0].size()));
+    EXPECT_NE(second->occupied_pages[0][0], local_first_page);
+}
+
 TEST_F(ChunkedPrefillTestSuite, FinalChunk_IsNotPublishedOnDecodeTransitionWithoutHybridCache) {
     Submit(MakeRequestSpec("warm", 4));  // 8 prompt tokens, two 4-token chunks
     PlanOnce();                          // chunk 1
