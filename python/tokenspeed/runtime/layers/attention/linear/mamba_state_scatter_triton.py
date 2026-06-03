@@ -246,6 +246,124 @@ def fused_mamba_state_copy(
 
 
 @triton.jit
+def _mamba_state_gather_copy_kernel(
+    src_ptr,
+    dst_ptr,
+    src_indices_ptr,  # [num_valid]
+    dst_indices_ptr,  # [num_valid]
+    elem_per_entry: tl.constexpr,
+    src_req_stride,
+    dst_req_stride,
+    src_size,
+    dst_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Cross-tensor gather-scatter: dst[dst_idx[i]] = src[src_idx[i]].
+
+    Unlike _mamba_state_snapshot_kernel (single-pool self-copy), src and dst are
+    two independent tensors and may have different dtypes; tl.store casts the
+    loaded data to the destination dtype automatically. Out-of-range indices are
+    skipped inside the kernel.
+
+    Grid: (num_valid, ceil(elem_per_entry / BLOCK_SIZE)).
+    """
+    pid_req = tl.program_id(0)
+    pid_block = tl.program_id(1).to(tl.int64)
+
+    src_idx = tl.load(src_indices_ptr + pid_req).to(tl.int64)
+    dst_idx = tl.load(dst_indices_ptr + pid_req).to(tl.int64)
+
+    # Bounds check to avoid illegal memory access
+    if not (
+        (src_idx >= 0)
+        & (src_idx < src_size)
+        & (dst_idx >= 0)
+        & (dst_idx < dst_size)
+    ):
+        return
+
+    src_offset = src_idx * src_req_stride
+    dst_offset = dst_idx * dst_req_stride
+
+    start = pid_block * BLOCK_SIZE
+    offsets = start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < elem_per_entry
+
+    data = tl.load(src_ptr + src_offset + offsets, mask=mask)
+    tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
+
+
+def fused_mamba_state_gather_copy(
+    dst: torch.Tensor,  # [dst_size, *state_shape]
+    src: torch.Tensor,  # [src_size, *state_shape]
+    dst_indices: torch.Tensor,  # [num_valid]
+    src_indices: torch.Tensor,  # [num_valid]
+):
+    """Cross-tensor gather-scatter copy: dst[dst_indices[i]] = src[src_indices[i]].
+
+    Replaces the eager ``dst[dst_indices] = src[src_indices].to(dst.dtype)``
+    pattern (which launches separate aten::index / aten::index_put_ / dtype-cast
+    kernels) with a single fused Triton kernel. ``src`` and ``dst`` may differ in
+    dtype; the store path casts to ``dst.dtype`` automatically. Out-of-range
+    indices are skipped inside the kernel.
+
+    Args:
+        dst: Destination state tensor [dst_size, *state_shape], must be contiguous.
+        src: Source state tensor [src_size, *state_shape], must be contiguous.
+            Per-entry element count must match ``dst``.
+        dst_indices: Destination slot indices [num_valid], int32/int64.
+        src_indices: Source slot indices [num_valid], int32/int64.
+    """
+    num_valid = dst_indices.shape[0]
+    if num_valid == 0:
+        return
+
+    if not (dst.is_cuda and src.is_cuda):
+        raise ValueError(
+            "fused_mamba_state_gather_copy only supports CUDA tensors."
+        )
+    if not dst.is_contiguous():
+        raise ValueError("dst tensor must be contiguous")
+    if not src.is_contiguous():
+        raise ValueError("src tensor must be contiguous")
+    if dst.ndim < 1 or src.ndim < 1:
+        raise ValueError("dst/src must be at least 1D")
+    if src_indices.shape[0] != dst_indices.shape[0]:
+        raise ValueError(
+            f"indices length mismatch: {src_indices.shape[0]} vs {dst_indices.shape[0]}"
+        )
+
+    dst_size = dst.shape[0]
+    src_size = src.shape[0]
+    elem_per_entry = dst.numel() // dst_size
+    src_elem_per_entry = src.numel() // src_size
+    if elem_per_entry != src_elem_per_entry:
+        raise ValueError(
+            f"per-entry element mismatch: dst {elem_per_entry} vs src {src_elem_per_entry}"
+        )
+
+    dst_indices = dst_indices.to(torch.int32).contiguous()
+    src_indices = src_indices.to(torch.int32).contiguous()
+
+    BLOCK_SIZE = 8192
+    grid = (num_valid, triton.cdiv(elem_per_entry, BLOCK_SIZE))
+
+    _mamba_state_gather_copy_kernel[grid](
+        src,
+        dst,
+        src_indices,
+        dst_indices,
+        elem_per_entry,
+        src.stride(0),
+        dst.stride(0),
+        src_size,
+        dst_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+    )
+
+
+@triton.jit
 def _mamba_state_zero_kernel(
     pool_ptr,
     indices_ptr,  # [bs] — indices to zero; negative values are skipped

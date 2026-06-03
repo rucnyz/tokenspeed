@@ -36,6 +36,10 @@ from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_update,
 )
 from tokenspeed.runtime.layers.attention.linear.chunk import chunk_gated_delta_rule
+from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (
+    fused_mamba_state_copy,
+    fused_mamba_state_gather_copy,
+)
 from tokenspeed.runtime.layers.attention.linear.chunk_delta_h import (
     CHUNK_SIZE as FLA_CHUNK_SIZE,
 )
@@ -1130,17 +1134,24 @@ class MambaAttnBackend(AttentionBackend):
                     raise RuntimeError(
                         "Missing intermediate mamba states for branching track"
                     )
-                ssm_states[self.forward_metadata.track_ssm_h_dst] = h.squeeze(0)[
-                    self.forward_metadata.track_ssm_h_src
-                ].to(ssm_states.dtype, copy=False)
+                fused_mamba_state_gather_copy(
+                    ssm_states,
+                    h.squeeze(0),
+                    self.forward_metadata.track_ssm_h_dst,
+                    self.forward_metadata.track_ssm_h_src,
+                )
 
             if need_final_track:
-                conv_states[self.forward_metadata.track_ssm_final_dst] = conv_states[
-                    self.forward_metadata.track_ssm_final_src
-                ]
-                ssm_states[self.forward_metadata.track_ssm_final_dst] = ssm_states[
-                    self.forward_metadata.track_ssm_final_src
-                ]
+                fused_mamba_state_copy(
+                    conv_states.unsqueeze(0),
+                    self.forward_metadata.track_ssm_final_src,
+                    self.forward_metadata.track_ssm_final_dst,
+                )
+                fused_mamba_state_copy(
+                    ssm_states.unsqueeze(0),
+                    self.forward_metadata.track_ssm_final_src,
+                    self.forward_metadata.track_ssm_final_dst,
+                )
 
         return core_attn_out
 
