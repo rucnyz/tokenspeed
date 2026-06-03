@@ -25,12 +25,81 @@
 # SOFTWARE.
 
 
+from dataclasses import dataclass
+
 import numpy as np
 import torch
 import triton
 import triton.language as tl
 
 PAD_SLOT_ID = -1
+
+# Triton block size for the varlen causal-conv1d forward kernel. Must stay in
+# sync with the BLOCK_M passed at the kernel launch below; the per-program
+# schedule (batch_ptr/token_chunk_offset_ptr) is derived from it.
+CONV1D_BLOCK_M = 8
+
+
+@dataclass
+class CausalConv1dMetadata:
+    """Pre-computed per-program schedule for ``causal_conv1d_fn``.
+    """
+
+    cu_seqlen: int
+    nums_dict: dict
+    batch_ptr: torch.Tensor
+    token_chunk_offset_ptr: torch.Tensor
+
+
+def build_causal_conv1d_metadata(
+    seqlens,
+    device: torch.device,
+    block_m: int = CONV1D_BLOCK_M,
+) -> CausalConv1dMetadata:
+    """Compute the conv1d program schedule once for reuse across layers.
+
+    ``seqlens`` must be CPU data (numpy array or CPU tensor) so the program
+    count is obtained without a GPU->CPU sync. The resulting batch_ptr /
+    token_chunk_offset_ptr are filled with a single async (pinned) HtoD copy
+    that is amortized over every conv1d layer in the forward.
+    """
+    seqlens = np.asarray(seqlens)
+    cu_seqlen = int(seqlens.sum())
+
+    nums = -(-seqlens // block_m)  # ceil-div, numpy array
+    tot = int(nums.sum())
+    mlist = np.repeat(np.arange(len(nums)), nums)
+    offsetlist = np.arange(tot) - np.repeat(np.cumsum(nums) - nums, nums)
+    mlist_len = int(mlist.shape[0])
+
+    batch_ptr = torch.full(
+        (mlist_len + 1,), PAD_SLOT_ID, dtype=torch.int32, device=device
+    )
+    token_chunk_offset_ptr = torch.full(
+        (mlist_len + 1,), PAD_SLOT_ID, dtype=torch.int32, device=device
+    )
+
+    combined_np = np.stack([mlist, offsetlist]).astype(np.int32, copy=False)
+    combined_cpu = torch.from_numpy(combined_np).pin_memory()
+    batch_ptr[:mlist_len].copy_(combined_cpu[0], non_blocking=True)
+    token_chunk_offset_ptr[:mlist_len].copy_(combined_cpu[1], non_blocking=True)
+
+    nums_dict = {
+        block_m: {
+            "tot": tot,
+            "mlist": None,
+            "mlist_len": mlist_len,
+            "offsetlist": None,
+            "batch_ptr": batch_ptr,
+            "token_chunk_offset_ptr": token_chunk_offset_ptr,
+        }
+    }
+    return CausalConv1dMetadata(
+        cu_seqlen=cu_seqlen,
+        nums_dict=nums_dict,
+        batch_ptr=batch_ptr,
+        token_chunk_offset_ptr=token_chunk_offset_ptr,
+    )
 
 
 @triton.jit()
@@ -542,18 +611,14 @@ def causal_conv1d_fn(
     if metadata is None:
 
         def num_program(META, seqlens):
-            device = META["x_ptr"].device
             nums = -(-seqlens // META["BLOCK_M"])  # ceil-div, numpy array
             tot = int(nums.sum())
-            mlist_len = tot
 
-            nums_gpu = torch.as_tensor(nums, dtype=torch.int32, device=device)
-            mlist = torch.repeat_interleave(
-                torch.arange(len(nums), device=device, dtype=torch.int32), nums_gpu
-            )
-            starts = torch.cumsum(nums_gpu, dim=0) - nums_gpu
-            offsetlist = torch.arange(tot, device=device, dtype=torch.int32) - torch.repeat_interleave(starts, nums_gpu)
+            mlist = np.repeat(np.arange(len(nums)), nums)
+            offsetlist = np.arange(tot) - np.repeat(np.cumsum(nums) - nums, nums)
+            mlist_len = mlist.shape[0]
 
+            device = META["x_ptr"].device
             if META["batch_ptr"].nelement() < mlist_len:
                 newlen = mlist_len + 1
                 META["batch_ptr"] = torch.full(
@@ -562,14 +627,13 @@ def causal_conv1d_fn(
                 META["token_chunk_offset_ptr"] = torch.full(
                     (newlen,), PAD_SLOT_ID, dtype=torch.int32, device=device
                 )
-            elif META["batch_ptr"].device != device:
-                META["batch_ptr"] = META["batch_ptr"].to(device)
-                META["token_chunk_offset_ptr"] = META["token_chunk_offset_ptr"].to(
-                    device
-                )
 
-            META["batch_ptr"][:mlist_len] = mlist
-            META["token_chunk_offset_ptr"][:mlist_len] = offsetlist
+            combined_np = np.stack([mlist, offsetlist]).astype(np.int32, copy=False)
+            combined_cpu = torch.from_numpy(combined_np).pin_memory()
+            META["batch_ptr"][:mlist_len].copy_(combined_cpu[0], non_blocking=True)
+            META["token_chunk_offset_ptr"][:mlist_len].copy_(
+                combined_cpu[1], non_blocking=True
+            )
             return tot
 
     else:
@@ -648,7 +712,7 @@ def causal_conv1d_fn(
         IS_CONTINUOUS_BATCHING=cache_indices is not None,
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
-        BLOCK_M=8,
+        BLOCK_M=CONV1D_BLOCK_M,
         BLOCK_N=256,
         num_stages=2,
     )

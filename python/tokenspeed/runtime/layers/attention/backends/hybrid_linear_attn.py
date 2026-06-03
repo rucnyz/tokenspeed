@@ -30,6 +30,8 @@ import torch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+    CausalConv1dMetadata,
+    build_causal_conv1d_metadata,
     causal_conv1d_fn,
     causal_conv1d_update,
 )
@@ -60,6 +62,7 @@ class MambaForwardMetadata:
     mamba_req_pool_indices: Optional[torch.Tensor] = None
     extend_prefix_lens: Optional[torch.Tensor] = None
     extend_seq_lens_cpu: Optional[torch.Tensor] = None
+    conv_metadata: Optional[CausalConv1dMetadata] = None
     # Pre-computed src/dst indices for extracting Mamba prefix-cache snapshots.
     track_ssm_h_src: Optional[torch.Tensor] = None
     track_ssm_h_dst: Optional[torch.Tensor] = None
@@ -449,6 +452,7 @@ class MambaAttnBackend(AttentionBackend):
 
         mamba_output_indices = None
         extend_seq_lens_cpu = None
+        conv_metadata = None
         if is_target_verify:
             draft_token_num = int(
                 kwargs.get("tokens_per_req", self.speculative_num_draft_tokens)
@@ -508,6 +512,10 @@ class MambaAttnBackend(AttentionBackend):
                     torch.cumsum(extend_lens, dim=0, out=query_start_loc[1:])
                     extend_seq_lens_cpu = extend_lens.to(device="cpu")
                 set_total_chunks_hint(extend_seq_lens_cpu, query_start_loc)
+                if extend_seq_lens_cpu is not None:
+                    conv_metadata = build_causal_conv1d_metadata(
+                        extend_seq_lens_cpu, self.device
+                    )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
@@ -577,6 +585,7 @@ class MambaAttnBackend(AttentionBackend):
             mamba_req_pool_indices=req_pool_indices[:bs],
             extend_prefix_lens=kwargs.get("extend_prefix_lens"),
             extend_seq_lens_cpu=extend_seq_lens_cpu,
+            conv_metadata=conv_metadata,
             track_ssm_h_src=track_ssm_h_src,
             track_ssm_h_dst=track_ssm_h_dst,
             track_conv_indices=track_conv_indices,
@@ -1033,6 +1042,7 @@ class MambaAttnBackend(AttentionBackend):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=extend_seq_lens_cpu,
+                metadata=self.forward_metadata.conv_metadata,
             ).transpose(0, 1)[:seq_len]
 
         key_split_dim = key_dim // attn_tp_size
