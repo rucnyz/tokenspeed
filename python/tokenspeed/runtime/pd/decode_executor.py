@@ -242,3 +242,10 @@ class DisaggDecodeExecutor:
                 runtime_states.reset_states(
                     extend_request_pool_indices, extend_prefix_lens
                 )
+        # Back-edge: order the forward (default/current) stream AFTER the
+        # valid_cache_lengths write on execution_stream. Without it the
+        # overlap-scheduled forward reads valid_cache_lengths before the write
+        # lands -> stale seq_len on a rank -> mismatched collective size ->
+        # symmetric 8/8 spin-hang. Mirrors the confirmed fix in
+        # model_executor.reset_valid_cache_length.
+        torch.cuda.current_stream().wait_stream(execution_stream)

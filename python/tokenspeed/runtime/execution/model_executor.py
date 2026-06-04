@@ -1065,6 +1065,14 @@ class ModelExecutor:
                     mask_1d, hist_dev, vcl
                 )
 
+        # Order the forward (default/current) stream AFTER the valid_cache_lengths
+        # write that just ran on execution_stream. Without this back-edge the
+        # overlap-scheduled forward can read valid_cache_lengths before the write
+        # lands -> a rank gets a stale seq_len -> it enters the next collective
+        # with a mismatched size -> all ranks spin (symmetric 8/8 hang). Mirrors
+        # the bidirectional wait_stream used when consuming runtime state above.
+        torch.cuda.current_stream().wait_stream(self.execution_stream)
+
     def set_layerwise_mamba_cow_done(
         self, cow_by_src: dict[int, list[int]] | None
     ) -> None:
