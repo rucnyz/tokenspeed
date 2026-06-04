@@ -53,7 +53,6 @@ DEFAULT_REASONING_PARSER = "passthrough"
 DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
 DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
 DEFAULT_SMG_LOG_LEVEL = "warn"
-DEFAULT_SMG_PROMETHEUS_PORT = 8413
 # smg reliability knobs we always want disabled when launched under
 # ts serve. These are tokenspeed-internal defaults: not surfaced via
 # the ts CLI, not routed through split_argv.
@@ -164,19 +163,22 @@ def _gateway_args_with_default_log_level(gateway_args: list[str]) -> list[str]:
 
 
 def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[str]:
-    """Pin the smg Prometheus exporter to ``DEFAULT_SMG_PROMETHEUS_PORT``.
+    """Bind the smg Prometheus exporter to a freshly allocated free port.
 
-    smg's own default (``29000``) collides easily when multiple ``ts serve``
-    instances share a host or when a previous run hasn't released the
-    port yet — the gateway then exits early and the tokenizer
-    registration job never runs, surfacing later as
-    ``tokenizer_not_found`` on the first request. Pinning a tokenspeed-
-    specific default keeps the port stable for our deployments while
-    still allowing an explicit override.
+    smg's own default (``29000``) — and any *fixed* port — collides when
+    multiple ``ts serve`` instances share a host, or when a previous run
+    left the port in ``TIME_WAIT`` (smg binds without ``SO_REUSEADDR``, so
+    the bind panics with ``AddrInUse`` even though no process holds it).
+    A dead metrics server makes the gateway exit during startup, the
+    tokenizer registration job never runs, and the first request surfaces
+    ``tokenizer_not_found`` / ``no worker available``. Allocating a fresh
+    free port per launch (like the engine and control ports) avoids every
+    collision; callers that need a stable scrape target can still pass an
+    explicit ``--prometheus-port``.
     """
     if "--prometheus-port" in gateway_args:
         return gateway_args
-    return [*gateway_args, "--prometheus-port", str(DEFAULT_SMG_PROMETHEUS_PORT)]
+    return [*gateway_args, "--prometheus-port", str(get_free_port())]
 
 
 def _user_model_id(gateway_args: list[str]) -> str | None:
