@@ -95,6 +95,7 @@ FUSED_PRE_ROUTED = (
 )
 
 # Weight format values used by moe_fused(weight_format=...).
+WEIGHT_FP16 = "fp16"  # dense bfloat16/float16 weights
 WEIGHT_FP8 = "fp8"  # FP8 block-scaled weights
 WEIGHT_MXFP4 = "mxfp4"  # MXFP4 block-scaled weights
 WEIGHT_NVFP4 = "nvfp4"  # NVFP4 block-scaled weights (CuteDSL)
@@ -159,7 +160,13 @@ def _moe_fused_format_signature(
     *,
     fp8_scale_granularity: str = "block",
 ):
-    if weight_format == WEIGHT_FP8:
+    if weight_format == WEIGHT_FP16:
+        if storage_dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError(
+                "MoE fused fp16 weight_format requires bf16/fp16 activation dtype"
+            )
+        weight = dense_tensor_format(storage_dtype)
+    elif weight_format == WEIGHT_FP8:
         weight = tensor_format("scaled-fp8", torch.float8_e4m3fn, scale=_FP8_SCALE)
     elif weight_format == WEIGHT_NVFP4:
         weight = tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE)
@@ -324,6 +331,8 @@ def moe_fused(
         weight_format: Weight tensor encoding used for the expert weights.
             Supported values are:
 
+            * ``"fp16"``: dense bfloat16 or float16 weights with no scale
+              tensor. The concrete dtype follows ``dtype``.
             * ``"fp8"``: FP8 E4M3 weights with float32 block scales.
               Fused MoE kernels currently register this as a fixed
               ``block_shape=(128, 128)`` format.

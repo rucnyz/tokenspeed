@@ -50,8 +50,24 @@ _MXFP4_SCALE = ScaleFormat(
     granularity="block",
     block_shape=(32,),
 )
+_TRTLLM_FP16_FUSED_FORMAT_SIGNATURES = frozenset(
+    {
+        format_signature(
+            x=dense_tensor_format(torch.bfloat16),
+            weight=dense_tensor_format(torch.bfloat16),
+        )
+    }
+)
 _CUTLASS_FUSED_FORMAT_SIGNATURES = frozenset(
     {
+        format_signature(
+            x=dense_tensor_format(torch.bfloat16),
+            weight=dense_tensor_format(torch.bfloat16),
+        ),
+        format_signature(
+            x=dense_tensor_format(torch.float16),
+            weight=dense_tensor_format(torch.float16),
+        ),
         format_signature(
             x=dense_tensor_format(torch.bfloat16),
             weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
@@ -111,6 +127,7 @@ cutlass_fused_moe = error_fn
 fp4_quantize = error_fn
 mxfp8_quantize = error_fn
 nvfp4_block_scale_interleave = error_fn
+trtllm_bf16_moe = error_fn
 trtllm_fp4_block_scale_moe = error_fn
 autotune = None
 scaled_fp4_grouped_quantize = error_fn
@@ -128,6 +145,7 @@ if platform.is_nvidia:
             fp4_quantize,
             mxfp8_quantize,
             nvfp4_block_scale_interleave,
+            trtllm_bf16_moe,
             trtllm_fp4_block_scale_moe,
         )
     except ImportError:
@@ -166,6 +184,20 @@ if platform.is_nvidia:
         from flashinfer.fused_moe.core import convert_to_block_layout
     except ImportError:
         pass
+
+if trtllm_bf16_moe is not error_fn:
+    trtllm_bf16_moe = register_kernel(
+        "moe",
+        "fused",
+        name="flashinfer_trtllm_bf16_fused_moe",
+        features={"self_routing"},
+        solution="trtllm",
+        capability=_NVIDIA_CAPABILITY,
+        signatures=_TRTLLM_FP16_FUSED_FORMAT_SIGNATURES,
+        traits={},
+        priority=Priority.SPECIALIZED,
+        tags={"throughput"},
+    )(trtllm_bf16_moe)
 
 if cutlass_fused_moe is not error_fn:
     flashinfer_cutlass_fused_moe = register_kernel(

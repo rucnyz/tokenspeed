@@ -33,6 +33,11 @@ from tokenspeed.runtime.layers.quantization import (
 from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
 
 _AUTO_IMPL_PREFERENCE = {
+    "fp16": (
+        "flashinfer_trtllm",
+        "flashinfer_cutlass",
+        "triton",
+    ),
     "nvfp4": (
         "flashinfer_trtllm",
         "flashinfer_cutedsl",
@@ -55,7 +60,7 @@ def _normalize_quant_kind(quant_config: object, prefix: str = "") -> str:
         prefix=prefix,
         ignored_layers=getattr(quant_config, "ignored_layers", []),
     ):
-        raise RuntimeError("Unquantized MoE backends are no longer supported")
+        return "fp16"
 
     # ModelOpt FP4 quantization
     if isinstance(quant_config, Nvfp4Config):
@@ -90,7 +95,7 @@ def _resolve_impl_candidates(quant_kind: str) -> tuple[str, ...]:
     auto_candidates = _AUTO_IMPL_PREFERENCE.get(quant_kind, ())
     platform = current_platform()
     if backend.is_auto() and platform.is_amd:
-        if quant_kind == "fp8":
+        if quant_kind in {"fp16", "fp8"}:
             auto_candidates = tuple(
                 impl for impl in auto_candidates if impl == "triton"
             )

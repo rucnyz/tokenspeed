@@ -25,6 +25,18 @@ from importlib import import_module
 from tokenspeed.runtime.layers.moe.core.registry import register_backend_family
 
 _BACKEND_SPECS = {
+    ("fp16", "triton"): (
+        "tokenspeed.runtime.layers.moe.backends.fp16.triton",
+        "Fp16TritonBackend",
+    ),
+    ("fp16", "flashinfer_cutlass"): (
+        "tokenspeed.runtime.layers.moe.backends.fp16.flashinfer_cutlass",
+        "Fp16FlashinferCutlassBackend",
+    ),
+    ("fp16", "flashinfer_trtllm"): (
+        "tokenspeed.runtime.layers.moe.backends.fp16.flashinfer_trtllm",
+        "Fp16FlashinferTrtllmBackend",
+    ),
     ("fp8", "triton"): (
         "tokenspeed.runtime.layers.moe.backends.fp8.triton",
         "Fp8TritonBackend",
