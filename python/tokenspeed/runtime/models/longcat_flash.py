@@ -47,7 +47,7 @@ from tokenspeed.runtime.layers.moe.checkpoint import (
 from tokenspeed.runtime.layers.moe.checkpoint import (
     build_moe_checkpoint_loader as _build_moe_checkpoint_loader,
 )
-from tokenspeed.runtime.layers.moe.layer import MoELayer as _MoELayer
+from tokenspeed.runtime.layers.moe.expert import MoELayer as _MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK as _TopK
 from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat as _TopKOutputFormat
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType as _RoutingMethodType

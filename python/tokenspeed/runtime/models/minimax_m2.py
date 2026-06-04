@@ -83,7 +83,7 @@ _is_nvidia = current_platform().is_nvidia
 if _is_nvidia:
     from tokenspeed_kernel.ops.routing.cuda import fp32_router_gemm
 
-from tokenspeed.runtime.layers.moe.layer import MoELayer as _MoELayer
+from tokenspeed.runtime.layers.moe.expert import MoELayer as _MoELayer
 
 MoELayer = _MoELayer
 

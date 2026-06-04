@@ -118,7 +118,7 @@ from tokenspeed.runtime.layers.moe.checkpoint import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
-from tokenspeed.runtime.layers.moe.layer import MoELayer
+from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import (
     BypassedTopKOutput,
     StandardTopKOutput,

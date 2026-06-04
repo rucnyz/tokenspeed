@@ -29,7 +29,7 @@ def __getattr__(name: str):
 
         return ExpertCheckpointSchema
     if name == "MoELayer":
-        from tokenspeed.runtime.layers.moe.layer import MoELayer
+        from tokenspeed.runtime.layers.moe.expert import MoELayer
 
         return MoELayer
     raise AttributeError(name)
