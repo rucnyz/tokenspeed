@@ -23,13 +23,12 @@ from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
-from tokenspeed.runtime.layers.moe.backends.triton_weights import (
-    attach_dense_weight_pair,
-    register_block_scale_inverses,
+from tokenspeed.runtime.layers.moe.backends.weights import (
+    create_moe_weight_pair,
 )
 from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
 from tokenspeed.runtime.layers.quantization import Fp8Config
-from tokenspeed.runtime.utils import next_power_of_2
+from tokenspeed.runtime.utils import next_power_of_2, set_weight_attrs
 
 _FI_CUTLASS_MIN_BLOCK_SCALE = 1e-10
 _FI_CUTLASS_TUNE_MIN_TOKENS = 8192
@@ -38,6 +37,62 @@ _FI_CUTLASS_TUNE_MIN_TOKENS = 8192
 def _swap_w13_to_w31(tensor: torch.Tensor) -> torch.Tensor:
     gate, up = tensor.chunk(2, dim=1)
     return torch.cat((up, gate), dim=1).contiguous()
+
+
+def _attach_dense_weight_pair(
+    backend: MoEBackend,
+    layer: nn.Module,
+    *,
+    with_bias: bool = False,
+    params_dtype: torch.dtype,
+) -> int:
+    ispp = backend.spec.intermediate_size // backend.spec.tp_size
+    create_moe_weight_pair(
+        backend,
+        layer,
+        backend.spec.num_local_experts,
+        backend.spec.hidden_size,
+        ispp,
+        params_dtype,
+        with_bias=with_bias,
+    )
+    return ispp
+
+
+def _register_block_scale_inverses(
+    backend: MoEBackend,
+    layer: nn.Module,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+    block_shape: tuple[int, int],
+) -> None:
+    block_n, block_k = block_shape
+    w13_weight_scale = torch.nn.Parameter(
+        torch.ones(
+            num_local_experts,
+            2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
+            (hidden_size + block_k - 1) // block_k,
+            dtype=torch.float32,
+        ),
+        requires_grad=False,
+    )
+    w2_weight_scale = torch.nn.Parameter(
+        torch.ones(
+            num_local_experts,
+            (hidden_size + block_n - 1) // block_n,
+            (intermediate_size_per_partition + block_k - 1) // block_k,
+            dtype=torch.float32,
+        ),
+        requires_grad=False,
+    )
+    layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+    layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+
+    weight_loader = backend._make_weight_loader()
+    set_weight_attrs(w13_weight_scale, {"weight_loader": weight_loader})
+    set_weight_attrs(w2_weight_scale, {"weight_loader": weight_loader})
 
 
 class Fp8FlashinferCutlassBackend(MoEBackend):
@@ -77,13 +132,13 @@ class Fp8FlashinferCutlassBackend(MoEBackend):
     def create_layer_weights(
         self, layer: nn.Module, *, with_bias: bool = False
     ) -> None:
-        ispp = attach_dense_weight_pair(
+        ispp = _attach_dense_weight_pair(
             self,
             layer,
             with_bias=with_bias,
             params_dtype=torch.float8_e4m3fn,
         )
-        register_block_scale_inverses(
+        _register_block_scale_inverses(
             self,
             layer,
             num_local_experts=self.spec.num_local_experts,

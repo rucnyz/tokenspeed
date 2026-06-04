@@ -255,7 +255,7 @@ _AUTO_SITES = _collect_call_sites(_SEARCH_DIR)
 # expected_kernel_name, oracle-dependent num_tokens branching, etc.)
 _MANUAL_CALL_SITES: list[CallSite] = [
     # -- MoE --
-    # triton_common.py: partial(tokenspeed_kernel.moe_experts, **_experts_common)
+    # fp8/triton.py: partial(tokenspeed_kernel.moe_experts, **experts_common)
     (
         "moe",
         "experts",
@@ -264,9 +264,9 @@ _MANUAL_CALL_SITES: list[CallSite] = [
         {},
         None,
         "triton_moe_fused_experts",
-        "manual:triton_common/experts",
+        "manual:fp8_triton/experts",
     ),
-    # triton_common.py: moe_combine(..., expected_kernel_name=expected_combine_kernel)
+    # fp8/triton.py: moe_combine(..., expected_kernel_name=expected_combine_kernel)
     (
         "moe",
         "combine",
@@ -275,7 +275,7 @@ _MANUAL_CALL_SITES: list[CallSite] = [
         {"num_tokens": 128, "comm_strategy": None},
         None,
         "triton_moe_sum_reduce",
-        "manual:triton_common/combine_large",
+        "manual:fp8_triton/combine_large",
     ),
     (
         "moe",
@@ -285,7 +285,7 @@ _MANUAL_CALL_SITES: list[CallSite] = [
         {"num_tokens": 8, "comm_strategy": None},
         None,
         "torch_compile_moe_sum_reduce",
-        "manual:triton_common/combine_small",
+        "manual:fp8_triton/combine_small",
     ),
 ]
 
