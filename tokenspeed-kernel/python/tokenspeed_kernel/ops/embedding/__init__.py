@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
+from tokenspeed_kernel.backends import load_builtin_kernels
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -116,6 +117,7 @@ def apply_rope(
         query=dense_tensor_format(query.dtype),
         key=dense_tensor_format(key.dtype),
     )
+    load_builtin_kernels("embedding")
     kernel = select_kernel(
         "embedding",
         "rope",
@@ -171,8 +173,3 @@ def apply_rope(
 
 
 __all__ = ["FusedSetKVBufferArg", "apply_rope"]
-
-
-# Backend registration (side-effect imports).
-import tokenspeed_kernel.ops.embedding.cuda  # noqa: E402,F401
-import tokenspeed_kernel.ops.embedding.triton  # noqa: E402,F401

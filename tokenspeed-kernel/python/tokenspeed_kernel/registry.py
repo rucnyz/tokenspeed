@@ -441,20 +441,10 @@ def describe_kernel(name: str) -> str:
     return "\n".join(lines)
 
 
-def load_builtin_kernels() -> None:
-    import sys
+def load_builtin_kernels(families=None) -> None:
+    from tokenspeed_kernel.backends import load_builtin_kernels as _load_builtins
 
-    if not KernelRegistry.get().list_kernels():
-        # Registry was reset; clear cached ops modules so decorators re-run.
-        for key in list(sys.modules.keys()):
-            if key.startswith("tokenspeed_kernel.ops.") or key.startswith(
-                "tokenspeed_kernel.numerics.reference."
-            ):
-                del sys.modules[key]
-    import tokenspeed_kernel.ops.embedding  # noqa: F401
-    import tokenspeed_kernel.ops.gemm  # noqa: F401
-    import tokenspeed_kernel.ops.moe  # noqa: F401
-    import tokenspeed_kernel.ops.quantization  # noqa: F401
+    _load_builtins(families)
 
 
 def error_fn(*args, **kwargs):

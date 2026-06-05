@@ -22,14 +22,8 @@ from __future__ import annotations
 
 import logging
 
-# Backend registration (side-effect imports)
-import tokenspeed_kernel.numerics.reference.gemm  # noqa: F401
-import tokenspeed_kernel.ops.gemm.deep_gemm  # noqa: F401
-import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
-import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
-import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import torch
-from tokenspeed_kernel.platform import Platform
+from tokenspeed_kernel.backends import load_builtin_kernels
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import (
@@ -43,8 +37,16 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["mm"]
 
-_platform = Platform.get()
-_fp8_dtype = _platform.fp8e4m3fn.dtype
+
+def _current_platform():
+    from tokenspeed_kernel.platform import Platform
+
+    return Platform.get()
+
+
+def _fp8_dtype():
+    return _current_platform().fp8e4m3fn.dtype
+
 
 # Kernels that natively fuse a bias-vector add inside their GEMM kernel.
 # For any kernel not listed here, ``mm`` applies the bias with a post-GEMM
@@ -101,7 +103,7 @@ def _gemm_format_signature(
             granularity="block",
             block_shape=tuple(block_size),
         )
-        a_storage_dtype = _fp8_dtype if A_scales is None else A.dtype
+        a_storage_dtype = _fp8_dtype() if A_scales is None else A.dtype
         return format_signature(
             a=tensor_format("mxfp8", a_storage_dtype, scale=scale),
             b=tensor_format("mxfp8", B.dtype, scale=scale),
@@ -172,7 +174,7 @@ def _online_quantize_mxfp8(
             block_k,
             column_major_scales=True,
             scale_tma_aligned=True,
-            scale_ue8m0=_platform.is_blackwell_plus,
+            scale_ue8m0=_current_platform().is_blackwell_plus,
         )
     elif kernel_name == "flashinfer_mm_fp8_blockscale":
         from tokenspeed_kernel.ops.gemm.fp8_utils import (
@@ -262,6 +264,7 @@ def mm(
     )
     select_dtype = signature.storage_dtype_for("a") or A.dtype
 
+    load_builtin_kernels("gemm")
     kernel = select_kernel(
         "gemm",
         "mm",

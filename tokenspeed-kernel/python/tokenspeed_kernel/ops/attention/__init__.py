@@ -22,14 +22,8 @@ from __future__ import annotations
 
 import math
 
-# Backend registration (side-effect imports)
-import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
-import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
-import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
-import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
-from tokenspeed_kernel.ops.attention.flash_attn import mha_decode_scheduler_metadata
+from tokenspeed_kernel.backends import load_builtin_kernels
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -52,6 +46,15 @@ __all__ = [
 ]
 
 LSE_LN = math.log2(math.e)
+
+
+def mha_decode_scheduler_metadata(**kwargs):
+    load_builtin_kernels("attention")
+    from tokenspeed_kernel.ops.attention.flash_attn import (
+        mha_decode_scheduler_metadata as _impl,
+    )
+
+    return _impl(**kwargs)
 
 
 def mha_prefill(
@@ -103,6 +106,7 @@ def mha_prefill(
         "return_lse": return_lse,
     }
     signature = _attention_format_signature(q=q, k=k, v=v)
+    load_builtin_kernels("attention")
     kernel = select_kernel(
         "attention",
         "mha_prefill",
@@ -206,6 +210,7 @@ def mha_extend_with_kvcache(
         "return_lse": return_lse,
     }
     signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
+    load_builtin_kernels("attention")
     kernel = select_kernel(
         "attention",
         "mha_extend_with_kvcache",
@@ -311,6 +316,7 @@ def mha_decode_with_kvcache(
         "return_lse": return_lse,
     }
     signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
+    load_builtin_kernels("attention")
     kernel = select_kernel(
         "attention",
         "mha_decode_with_kvcache",
@@ -393,6 +399,7 @@ def mha_merge_state(
         "head_dim": out_a.shape[-1],
     }
     signature = _attention_format_signature(out_a=out_a, out_b=out_b)
+    load_builtin_kernels("attention")
     kernel = select_kernel(
         "attention",
         "mha_merge_state",

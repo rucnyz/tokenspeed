@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Literal
 
 import torch
+from tokenspeed_kernel.backends import load_builtin_kernels
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -69,6 +70,7 @@ def quantize_fp8(
         "has_scale": scale is not None,
     }
     signature = format_signature(x=dense_tensor_format(x.dtype))
+    load_builtin_kernels("quantization")
     kernel = select_kernel(
         "quantization",
         "fp8",
@@ -149,6 +151,7 @@ def quantize_fp8_with_scale(
         "scale_encoding": scale_encoding,
     }
     signature = format_signature(x=dense_tensor_format(x.dtype))
+    load_builtin_kernels("quantization")
     kernel = select_kernel(
         "quantization",
         "fp8_with_scale",
@@ -208,6 +211,7 @@ def quantize_mxfp8(
 
     traits = {}
     signature = format_signature(x=dense_tensor_format(x.dtype))
+    load_builtin_kernels("quantization")
     kernel = select_kernel(
         "quantization",
         "mxfp8",
@@ -269,6 +273,7 @@ def quantize_nvfp4(
         "has_scale": scale is not None,
     }
     signature = format_signature(x=dense_tensor_format(x.dtype))
+    load_builtin_kernels("quantization")
     kernel = select_kernel(
         "quantization",
         "nvfp4",
@@ -341,6 +346,7 @@ def quantize_mxfp4(
         "scale_encoding": "ue8m0",
     }
     signature = format_signature(x=dense_tensor_format(x.dtype))
+    load_builtin_kernels("quantization")
     kernel = select_kernel(
         "quantization",
         "mxfp4",
@@ -368,9 +374,3 @@ def quantize_mxfp4(
             scale_layout=scale_layout,
             enable_pdl=enable_pdl,
         )
-
-
-# Backend registration (side-effect imports).
-import tokenspeed_kernel.ops.quantization.flashinfer  # noqa: E402,F401
-import tokenspeed_kernel.ops.quantization.triton  # noqa: E402,F401
-import tokenspeed_kernel.ops.quantization.trtllm  # noqa: E402,F401
