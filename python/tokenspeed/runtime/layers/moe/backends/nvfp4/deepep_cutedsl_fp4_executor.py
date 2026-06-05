@@ -28,6 +28,9 @@ which is incompatible with FP4 weights.
 
 import torch
 
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.moe.backends.nvfp4.cutedsl_moe_masked import (
     cutedsl_moe_masked,
@@ -76,10 +79,6 @@ class DeepEPCuteDslFp4Executor:
     def _get_dispatcher(self) -> DeepEPDispatcher:
         if self._dispatcher is not None:
             return self._dispatcher
-
-        from tokenspeed.runtime.distributed.process_group_manager import (
-            process_group_manager as pg_manager,
-        )
 
         mapping = global_server_args_dict["mapping"]
         config = EPConfig(

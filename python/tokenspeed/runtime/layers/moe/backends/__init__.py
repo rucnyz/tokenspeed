@@ -20,55 +20,49 @@
 
 from __future__ import annotations
 
-from importlib import import_module
-
+from tokenspeed.runtime.layers.moe.backends.fp8.flashinfer_cutlass import (
+    Fp8FlashinferCutlassBackend,
+)
+from tokenspeed.runtime.layers.moe.backends.fp8.triton import Fp8TritonBackend
+from tokenspeed.runtime.layers.moe.backends.fp16.flashinfer_cutlass import (
+    Fp16FlashinferCutlassBackend,
+)
+from tokenspeed.runtime.layers.moe.backends.fp16.flashinfer_trtllm import (
+    Fp16FlashinferTrtllmBackend,
+)
+from tokenspeed.runtime.layers.moe.backends.fp16.triton import Fp16TritonBackend
+from tokenspeed.runtime.layers.moe.backends.mxfp4.flashinfer import (
+    Mxfp4FlashinferMxfp4Backend,
+)
+from tokenspeed.runtime.layers.moe.backends.mxfp4.gluon_kernel import (
+    Mxfp4GluonKernelBackend,
+)
+from tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel import (
+    Mxfp4TritonKernelBackend,
+)
+from tokenspeed.runtime.layers.moe.backends.nvfp4.flashinfer_cutedsl import (
+    Nvfp4FlashinferCuteDslBackend,
+)
+from tokenspeed.runtime.layers.moe.backends.nvfp4.flashinfer_cutlass import (
+    Nvfp4FlashinferCutlassBackend,
+)
+from tokenspeed.runtime.layers.moe.backends.nvfp4.flashinfer_trtllm import (
+    Nvfp4FlashinferTrtllmBackend,
+)
 from tokenspeed.runtime.layers.moe.core.registry import register_backend_family
 
 _BACKEND_SPECS = {
-    ("fp16", "triton"): (
-        "tokenspeed.runtime.layers.moe.backends.fp16.triton",
-        "Fp16TritonBackend",
-    ),
-    ("fp16", "flashinfer_cutlass"): (
-        "tokenspeed.runtime.layers.moe.backends.fp16.flashinfer_cutlass",
-        "Fp16FlashinferCutlassBackend",
-    ),
-    ("fp16", "flashinfer_trtllm"): (
-        "tokenspeed.runtime.layers.moe.backends.fp16.flashinfer_trtllm",
-        "Fp16FlashinferTrtllmBackend",
-    ),
-    ("fp8", "triton"): (
-        "tokenspeed.runtime.layers.moe.backends.fp8.triton",
-        "Fp8TritonBackend",
-    ),
-    ("fp8", "flashinfer_cutlass"): (
-        "tokenspeed.runtime.layers.moe.backends.fp8.flashinfer_cutlass",
-        "Fp8FlashinferCutlassBackend",
-    ),
-    ("nvfp4", "flashinfer_cutlass"): (
-        "tokenspeed.runtime.layers.moe.backends.nvfp4.flashinfer_cutlass",
-        "Nvfp4FlashinferCutlassBackend",
-    ),
-    ("nvfp4", "flashinfer_cutedsl"): (
-        "tokenspeed.runtime.layers.moe.backends.nvfp4.flashinfer_cutedsl",
-        "Nvfp4FlashinferCuteDslBackend",
-    ),
-    ("nvfp4", "flashinfer_trtllm"): (
-        "tokenspeed.runtime.layers.moe.backends.nvfp4.flashinfer_trtllm",
-        "Nvfp4FlashinferTrtllmBackend",
-    ),
-    ("mxfp4", "flashinfer_mxfp4"): (
-        "tokenspeed.runtime.layers.moe.backends.mxfp4.flashinfer",
-        "Mxfp4FlashinferMxfp4Backend",
-    ),
-    ("mxfp4", "triton_kernel"): (
-        "tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel",
-        "Mxfp4TritonKernelBackend",
-    ),
-    ("mxfp4", "gluon_kernel"): (
-        "tokenspeed.runtime.layers.moe.backends.mxfp4.gluon_kernel",
-        "Mxfp4GluonKernelBackend",
-    ),
+    ("fp16", "triton"): Fp16TritonBackend,
+    ("fp16", "flashinfer_cutlass"): Fp16FlashinferCutlassBackend,
+    ("fp16", "flashinfer_trtllm"): Fp16FlashinferTrtllmBackend,
+    ("fp8", "triton"): Fp8TritonBackend,
+    ("fp8", "flashinfer_cutlass"): Fp8FlashinferCutlassBackend,
+    ("nvfp4", "flashinfer_cutlass"): Nvfp4FlashinferCutlassBackend,
+    ("nvfp4", "flashinfer_cutedsl"): Nvfp4FlashinferCuteDslBackend,
+    ("nvfp4", "flashinfer_trtllm"): Nvfp4FlashinferTrtllmBackend,
+    ("mxfp4", "flashinfer_mxfp4"): Mxfp4FlashinferMxfp4Backend,
+    ("mxfp4", "triton_kernel"): Mxfp4TritonKernelBackend,
+    ("mxfp4", "gluon_kernel"): Mxfp4GluonKernelBackend,
 }
 _REGISTERED = set()
 
@@ -78,7 +72,6 @@ def ensure_backend_family_registered(quant: str, impl: str) -> None:
     if key in _REGISTERED:
         return
 
-    module_name, class_name = _BACKEND_SPECS[key]
-    backend_cls = getattr(import_module(module_name), class_name)
+    backend_cls = _BACKEND_SPECS[key]
     register_backend_family(quant=quant, impl=impl, cls=backend_cls)
     _REGISTERED.add(key)

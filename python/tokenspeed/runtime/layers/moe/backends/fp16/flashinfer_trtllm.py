@@ -22,6 +22,14 @@ from __future__ import annotations
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.moe.flashinfer import (
+    _maybe_get_cached_w3_w1_permute_indices,
+)
+from tokenspeed_kernel.ops.moe.flashinfer import autotune as flashinfer_autotune
+from tokenspeed_kernel.ops.moe.flashinfer import (
+    convert_to_block_layout,
+    get_w2_permute_indices_with_cache,
+)
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -88,12 +96,6 @@ class Fp16FlashinferTrtllmBackend(MoEBackend):
         )
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        from tokenspeed_kernel.ops.moe.flashinfer import (
-            _maybe_get_cached_w3_w1_permute_indices,
-            convert_to_block_layout,
-            get_w2_permute_indices_with_cache,
-        )
-
         cache_permute_indices: dict = {}
         num_experts = layer.w13_weight.shape[0]
         epilogue_tile_m = 128
@@ -224,14 +226,7 @@ class Fp16FlashinferTrtllmBackend(MoEBackend):
         top_k = topk_output.topk_config.top_k
         router_logits = topk_output.router_logits
 
-        try:
-            from tokenspeed_kernel.ops.moe.flashinfer import (
-                autotune as flashinfer_autotune,
-            )
-        except ImportError:
-            flashinfer_autotune = None
-
-        if not self._autotuned and flashinfer_autotune is not None:
+        if not self._autotuned:
             with flashinfer_autotune():
                 self._call_trtllm_kernel(
                     router_logits, x, layer, top_k, do_finalize=True

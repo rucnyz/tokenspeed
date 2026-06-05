@@ -21,25 +21,11 @@
 """Masked grouped MoE computation using FlashInfer CuteDSL for NVFP4."""
 
 import torch
-from tokenspeed_kernel.registry import error_fn
-
-try:
-    from tokenspeed_kernel.ops.moe.flashinfer import (
-        grouped_gemm_nt_masked,
-        scaled_fp4_grouped_quantize,
-        silu_and_mul_scaled_nvfp4_experts_quantize,
-    )
-
-    _cutedsl_masked_available = all(
-        fn is not error_fn
-        for fn in (
-            grouped_gemm_nt_masked,
-            scaled_fp4_grouped_quantize,
-            silu_and_mul_scaled_nvfp4_experts_quantize,
-        )
-    )
-except ImportError:
-    _cutedsl_masked_available = False
+from tokenspeed_kernel.ops.moe.flashinfer import (
+    grouped_gemm_nt_masked,
+    scaled_fp4_grouped_quantize,
+    silu_and_mul_scaled_nvfp4_experts_quantize,
+)
 
 
 def _get_cute_dtype(t: torch.Tensor) -> str:
@@ -81,12 +67,6 @@ def cutedsl_moe_masked(
         w2_alpha: Per-expert alpha [num_experts], float32.
         masked_m: Per-expert token count [num_experts].
     """
-    if not _cutedsl_masked_available:
-        raise ImportError(
-            "flashinfer CuteDSL masked grouped GEMM is unavailable. "
-            "Install a flashinfer build with cute_dsl support."
-        )
-
     if input_global_scale is not None and not input_global_scale.is_contiguous():
         input_global_scale = input_global_scale.contiguous()
     if not a2_global_scale.is_contiguous():

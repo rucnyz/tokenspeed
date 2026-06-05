@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
+from tokenspeed.runtime.utils import set_weight_attrs
 
 MXFP4_BLOCK = 32
 
@@ -36,8 +37,6 @@ def create_mxfp4_weights(
     ispp_padded: int,
     with_bias: bool = False,
 ) -> None:
-    from tokenspeed.runtime.utils import set_weight_attrs
-
     # Fused gate_up_proj (column parallel)
     w13_weight = torch.nn.Parameter(
         torch.zeros(
@@ -124,8 +123,6 @@ def _per_tensor_input_scale_loader(
 
 
 def create_mxfp4_fp8_input_scales(layer: nn.Module, num_local_experts: int) -> None:
-    from tokenspeed.runtime.utils import set_weight_attrs
-
     w13 = nn.Parameter(
         torch.zeros(num_local_experts, dtype=torch.float32),
         requires_grad=False,

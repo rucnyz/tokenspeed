@@ -22,6 +22,17 @@ from __future__ import annotations
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.moe.flashinfer import (
+    _maybe_get_cached_w3_w1_permute_indices,
+)
+from tokenspeed_kernel.ops.moe.flashinfer import autotune as flashinfer_autotune
+from tokenspeed_kernel.ops.moe.flashinfer import (
+    get_w2_permute_indices_with_cache,
+)
+from tokenspeed_kernel.ops.quantization.flashinfer import (
+    mxfp8_quantize,
+    nvfp4_block_scale_interleave,
+)
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from torch.nn.parameter import Parameter
@@ -34,6 +45,8 @@ from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import (
 from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
 from tokenspeed.runtime.layers.quantization import Mxfp4Config
+from tokenspeed.runtime.utils import next_power_of_2, round_up
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 _flashinfer_mxfp4_permute_indices_cache: dict[tuple[str, torch.Size], torch.Tensor] = {}
 _flashinfer_mxfp4_permute_indices_device_cache: dict[
@@ -49,11 +62,6 @@ def _get_flashinfer_mxfp4_device_permute_indices(
     *,
     kind: str = "w2",
 ) -> torch.Tensor:
-    from tokenspeed_kernel.ops.moe.flashinfer import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        get_w2_permute_indices_with_cache,
-    )
-
     extra_args = {} if num_elts_per_sf is None else {"num_elts_per_sf": num_elts_per_sf}
     if kind == "w13":
         permute_indices = _maybe_get_cached_w3_w1_permute_indices(
@@ -158,8 +166,6 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
         quant_config: object,
         routing_config: dict | None = None,
     ):
-        from tokenspeed.runtime.utils.env import global_server_args_dict
-
         del routing_config
         self.key = key
         self.spec = spec
@@ -187,8 +193,6 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
     def create_layer_weights(
         self, layer: nn.Module, *, with_bias: bool = False
     ) -> None:
-        from tokenspeed.runtime.utils import round_up
-
         hidden = self.spec.hidden_size
         ispp = self.spec.intermediate_size // self.spec.tp_size
 
@@ -212,10 +216,6 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
         )
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        from tokenspeed_kernel.ops.quantization.flashinfer import (
-            nvfp4_block_scale_interleave,
-        )
-
         sf_block_size = MXFP4_BLOCK
         num_experts = self.spec.num_local_experts
         ispp_padded = self._ispp_padded
@@ -374,8 +374,6 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
         torch.cuda.empty_cache()
 
     def _call_kernel(self, router_logits, x_quant, x_scale, layer, top_k, output):
-        from tokenspeed.runtime.utils import next_power_of_2
-
         num_local = self.spec.num_local_experts
         local_offset = self.spec.ep_rank * num_local
         return tokenspeed_kernel.moe_fused(
@@ -445,8 +443,6 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
                     value=0.0,
                 )
         elif self._mxfp4_precision == "default":
-            from tokenspeed_kernel.ops.quantization.flashinfer import mxfp8_quantize
-
             x_quant, x_scale = mxfp8_quantize(x, False, alignment=hidden_padded)
             x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
         else:
@@ -468,18 +464,11 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
             num_tokens, h_dim, dtype=torch.bfloat16, device=x_quant.device
         )
 
-        try:
-            from tokenspeed_kernel.ops.moe.flashinfer import (
-                autotune as flashinfer_autotune,
-            )
-        except ImportError:
-            flashinfer_autotune = None
-
         # Autotune on first call to pre-compile all kernel variants.
         # Equivalent to tokenspeed's _flashinfer_autotune() which runs a dummy
         # forward inside autotune() context. Without this, calls with new
         # token counts trigger JIT compilation that desyncs TP ranks.
-        if not self._autotuned and flashinfer_autotune is not None:
+        if not self._autotuned:
             with flashinfer_autotune():
                 self._call_kernel(router_logits, x_quant, x_scale, layer, top_k, output)
             self._autotuned = True

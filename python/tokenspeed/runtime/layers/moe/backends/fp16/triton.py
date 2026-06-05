@@ -27,6 +27,7 @@ import torch
 import triton.language as tl
 from torch import nn
 
+from tokenspeed.runtime.layers.activation import silu_and_mul
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
 from tokenspeed.runtime.layers.moe.backends.triton_config import (
     try_get_optimal_moe_config,
@@ -116,8 +117,6 @@ def _triton_forward(
     hidden_states: torch.Tensor,
     topk_output: object,
 ) -> torch.Tensor:
-    from tokenspeed.runtime.layers.activation import silu_and_mul
-
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
 
     topk_ids = topk_output.topk_ids

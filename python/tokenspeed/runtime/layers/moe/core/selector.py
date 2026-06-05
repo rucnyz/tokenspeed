@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.layers.moe.backends import ensure_backend_family_registered
 from tokenspeed.runtime.layers.moe.core.registry import get_backend_cls
 from tokenspeed.runtime.layers.moe.core.types import BackendKey, MoELayerSpec
 from tokenspeed.runtime.layers.moe.utils import get_moe_backend
@@ -124,8 +125,6 @@ def select_backend(
     quant_config: object,
     routing_config: dict | None = None,
 ):
-    from tokenspeed.runtime.layers.moe.backends import ensure_backend_family_registered
-
     quant_kind = _normalize_quant_kind(quant_config, prefix=spec.prefix)
     arch = _detect_arch()
     tried = []

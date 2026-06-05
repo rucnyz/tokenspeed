@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.moe.flashinfer import ActivationType
+from tokenspeed_kernel.ops.moe.flashinfer import autotune as flashinfer_autotune
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -29,6 +31,7 @@ from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
 from tokenspeed.runtime.layers.moe.backends.weights import create_moe_weight_pair
 from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
 from tokenspeed.runtime.utils import next_power_of_2
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 class Fp16FlashinferCutlassBackend(MoEBackend):
@@ -41,8 +44,6 @@ class Fp16FlashinferCutlassBackend(MoEBackend):
         quant_config: object,
         routing_config: dict | None = None,
     ):
-        from tokenspeed.runtime.utils.env import global_server_args_dict
-
         del quant_config, routing_config
         self.key = key
         self.spec = spec
@@ -84,10 +85,6 @@ class Fp16FlashinferCutlassBackend(MoEBackend):
             del temp_w
 
     def _call_cutlass_kernel(self, x, layer, topk_output):
-        from tokenspeed_kernel.ops.moe.flashinfer import (
-            ActivationType,
-        )
-
         return tokenspeed_kernel.moe_fused(
             input=x,
             token_selected_experts=topk_output.topk_ids.to(torch.int),
@@ -127,14 +124,7 @@ class Fp16FlashinferCutlassBackend(MoEBackend):
             return x.new_empty(0, self.spec.hidden_size)
         assert x.dtype in (torch.bfloat16, torch.float16)
 
-        try:
-            from tokenspeed_kernel.ops.moe.flashinfer import (
-                autotune as flashinfer_autotune,
-            )
-        except ImportError:
-            flashinfer_autotune = None
-
-        if not self._autotuned and flashinfer_autotune is not None:
+        if not self._autotuned:
             with flashinfer_autotune():
                 self._call_cutlass_kernel(x, layer, topk_output)
             self._autotuned = True

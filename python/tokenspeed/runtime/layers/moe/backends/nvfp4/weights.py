@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
+from tokenspeed.runtime.utils import set_weight_attrs
 
 
 def swizzle_blockscale(scales: torch.Tensor) -> torch.Tensor:
@@ -80,8 +81,6 @@ def create_fp4_weights(
     ispp: int,
     group_size: int,
 ) -> None:
-    from tokenspeed.runtime.utils import set_weight_attrs
-
     # FP4 packed weights: 2 FP4 values per uint8 byte
     # w13 = gate_up_proj: [num_experts, 2*intermediate, hidden//2]
     w13_weight = torch.nn.Parameter(

@@ -22,28 +22,31 @@ from __future__ import annotations
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.moe.flashinfer import autotune as flashinfer_autotune
+from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
+from tokenspeed.runtime.layers.moe.backends.nvfp4.deepep_cutedsl_fp4_executor import (
+    DeepEPCuteDslFp4Executor,
+)
 from tokenspeed.runtime.layers.moe.backends.nvfp4.weights import (
     create_fp4_weights,
     finalize_common_flashinfer_weights,
     interleave_gate_up_chunks,
 )
 from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
+from tokenspeed.runtime.layers.moe.topk import select_experts
 from tokenspeed.runtime.layers.quantization import Nvfp4Config
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 def quantize_cutedsl_input(
     x: torch.Tensor, input_global_scale: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from tokenspeed_kernel.ops.quantization.flashinfer import (
-        fp4_quantize as _fp4_quantize,
-    )
-
-    x_fp4, x_scale = _fp4_quantize(
+    x_fp4, x_scale = fp4_quantize(
         x,
         global_scale=input_global_scale,
         sf_vec_size=16,
@@ -54,8 +57,6 @@ def quantize_cutedsl_input(
 
 
 def get_cutedsl_graph_wrapper_capacity_hint() -> int:
-    from tokenspeed.runtime.utils.env import global_server_args_dict
-
     if global_server_args_dict.get("enforce_eager", False):
         return 0
 
@@ -172,10 +173,6 @@ class Nvfp4FlashinferCuteDslBackend(MoEBackend):
 
     def _get_deepep_executor(self, layer: nn.Module):
         if self._deepep_executor is None:
-            from tokenspeed.runtime.layers.moe.backends.nvfp4.deepep_cutedsl_fp4_executor import (
-                DeepEPCuteDslFp4Executor,
-            )
-
             self._deepep_executor = DeepEPCuteDslFp4Executor(
                 top_k=self.spec.top_k,
                 num_experts=self.spec.num_experts,
@@ -203,8 +200,6 @@ class Nvfp4FlashinferCuteDslBackend(MoEBackend):
                 max_num_tokens_per_gpu,
             )
 
-        from tokenspeed_kernel.ops.moe.flashinfer import autotune as flashinfer_autotune
-
         # After dispatch, some ranks may receive 0 tokens. The
         # CuteDSL wrapper cannot handle empty input, so return an empty
         # tensor directly.
@@ -215,8 +210,6 @@ class Nvfp4FlashinferCuteDslBackend(MoEBackend):
             topk_ids = topk_output.topk_ids.to(torch.int32)
             topk_weights = topk_output.topk_weights
         else:
-            from tokenspeed.runtime.layers.moe.topk import select_experts
-
             result = select_experts(
                 hidden_states=hidden_states,
                 router_logits=topk_output.router_logits,

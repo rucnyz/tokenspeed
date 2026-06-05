@@ -29,6 +29,7 @@ from tokenspeed_kernel.numerics.reference.moe import _mask_topk_ids_padded_regio
 from tokenspeed_kernel.ops.moe import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
+    transform_select_experts_inputs,
 )
 
 from tokenspeed.runtime.moe.distribution_recorder import (
@@ -226,8 +227,6 @@ def select_experts(
     apply_routed_scaling_factor_on_output = (
         topk_config.apply_routed_scaling_factor_on_output
     )
-
-    from tokenspeed_kernel.ops.moe import transform_select_experts_inputs
 
     router_logits, correction_bias = transform_select_experts_inputs(
         router_logits=router_logits,

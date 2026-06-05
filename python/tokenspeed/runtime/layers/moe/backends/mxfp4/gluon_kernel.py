@@ -20,8 +20,14 @@
 
 from __future__ import annotations
 
+import os
+
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.moe.gluon import (
+    _extract_gluon_raw_w,
+    shuffle_weight_for_gluon_dot_layout,
+)
 from tokenspeed_kernel.ops.moe.triton_kernels import (
     FlexCtx,
     InFlexData,
@@ -86,14 +92,6 @@ def _pad_w2_to_block_n(layer: nn.Module, block_n: int) -> None:
 
 
 def _attach_gluon_bpreshuffle(layer: nn.Module) -> None:
-    try:
-        from tokenspeed_kernel.ops.moe.gluon import (
-            _extract_gluon_raw_w,
-            shuffle_weight_for_gluon_dot_layout,
-        )
-    except ImportError:
-        return
-
     targets = (
         ("w13_weight_triton_tensor", None),
         ("w2_weight_triton_tensor", getattr(layer, "_w2_logical_n", None)),
@@ -124,8 +122,6 @@ class Mxfp4GluonKernelBackend(Mxfp4TritonKernelBackend):
 
     @classmethod
     def supports(cls, spec: MoELayerSpec, quant_config: object) -> bool:
-        import os
-
         if not isinstance(quant_config, Mxfp4Config):
             return False
         if should_ignore_quant_layer(

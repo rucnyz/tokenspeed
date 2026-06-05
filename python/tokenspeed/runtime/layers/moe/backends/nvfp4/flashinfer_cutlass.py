@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.moe.flashinfer import ActivationType
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -84,10 +85,6 @@ class Nvfp4FlashinferCutlassBackend(MoEBackend):
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
         del num_global_tokens, max_num_tokens_per_gpu
-        from tokenspeed_kernel.ops.moe.flashinfer import (
-            ActivationType,
-        )
-
         x = hidden_states
         output_dtype = torch.bfloat16
         output_col = x.shape[1]

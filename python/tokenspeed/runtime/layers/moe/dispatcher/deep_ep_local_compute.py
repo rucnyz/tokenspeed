@@ -21,6 +21,7 @@
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.activation.cuda import silu_and_mul_fuse_block_quant
 from tokenspeed_kernel.ops.activation.flashinfer import silu_and_mul
 from tokenspeed_kernel.ops.gemm.deep_gemm import (
     m_grouped_fp8_gemm_nt_contiguous,
@@ -209,8 +210,6 @@ class DeepExecutor:
             self.inter_size_x2 // 2 // self.scale_block_size,
             device,
         )
-
-        from tokenspeed_kernel.ops.activation.cuda import silu_and_mul_fuse_block_quant
 
         activation, activation_scale = silu_and_mul_fuse_block_quant(
             gate_up_output,
