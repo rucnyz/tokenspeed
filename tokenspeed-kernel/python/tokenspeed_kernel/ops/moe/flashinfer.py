@@ -44,14 +44,12 @@ convert_to_block_layout = error_fn
 if platform.is_nvidia:
     from flashinfer import (
         cutlass_fused_moe,
+        scaled_fp4_grouped_quantize,
+        silu_and_mul_scaled_nvfp4_experts_quantize,
         trtllm_bf16_moe,
         trtllm_fp4_block_scale_moe,
     )
     from flashinfer.autotuner import autotune
-    from flashinfer.cute_dsl import (
-        scaled_fp4_grouped_quantize,
-        silu_and_mul_scaled_nvfp4_experts_quantize,
-    )
     from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
     from flashinfer.fused_moe import CuteDslMoEWrapper
     from flashinfer.fused_moe.core import (
