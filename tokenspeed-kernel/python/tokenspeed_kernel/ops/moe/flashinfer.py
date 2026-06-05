@@ -26,9 +26,6 @@ from tokenspeed_kernel.registry import error_fn
 platform = current_platform()
 
 cutlass_fused_moe = error_fn
-fp4_quantize = error_fn
-mxfp8_quantize = error_fn
-nvfp4_block_scale_interleave = error_fn
 trtllm_bf16_moe = error_fn
 trtllm_fp4_block_scale_moe = error_fn
 flashinfer_cutlass_fused_moe = error_fn
@@ -47,9 +44,6 @@ convert_to_block_layout = error_fn
 if platform.is_nvidia:
     from flashinfer import (
         cutlass_fused_moe,
-        fp4_quantize,
-        mxfp8_quantize,
-        nvfp4_block_scale_interleave,
         trtllm_bf16_moe,
         trtllm_fp4_block_scale_moe,
     )
