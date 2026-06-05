@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Lazy loading for built-in kernel registration modules."""
+"""Built-in core kernel registration modules."""
 
 from __future__ import annotations
 
@@ -31,39 +31,11 @@ __all__ = ["load_builtin_kernels", "reset_builtin_kernel_load_state"]
 
 
 _BUILTIN_MODULES_BY_FAMILY: dict[str, tuple[str, ...]] = {
-    "attention": (
-        "tokenspeed_kernel.ops.attention.cuda",
-        "tokenspeed_kernel.ops.attention.flash_attn",
-        "tokenspeed_kernel.ops.attention.flashinfer",
-        "tokenspeed_kernel.ops.attention.gluon",
-        "tokenspeed_kernel.ops.attention.triton",
-    ),
-    "embedding": (
-        "tokenspeed_kernel.ops.embedding.cuda",
-        "tokenspeed_kernel.ops.embedding.triton",
-    ),
-    "gemm": (
-        "tokenspeed_kernel.numerics.reference.gemm",
-        "tokenspeed_kernel.ops.gemm.deep_gemm",
-        "tokenspeed_kernel.ops.gemm.flashinfer",
-        "tokenspeed_kernel.ops.gemm.triton",
-        "tokenspeed_kernel.ops.gemm.trtllm",
-    ),
-    "moe": (
-        "tokenspeed_kernel.numerics.reference.moe",
-        "tokenspeed_kernel.ops.moe.cuda",
-        "tokenspeed_kernel.ops.moe.deepep",
-        "tokenspeed_kernel.ops.moe.flashinfer",
-        "tokenspeed_kernel.ops.moe.gluon",
-        "tokenspeed_kernel.ops.moe.triton",
-        "tokenspeed_kernel.ops.moe.triton_kernels",
-        "tokenspeed_kernel.ops.moe.trtllm",
-    ),
-    "quantization": (
-        "tokenspeed_kernel.ops.quantization.flashinfer",
-        "tokenspeed_kernel.ops.quantization.triton",
-        "tokenspeed_kernel.ops.quantization.trtllm",
-    ),
+    "attention": ("tokenspeed_kernel.ops.attention.triton",),
+    "embedding": ("tokenspeed_kernel.ops.embedding.triton",),
+    "gemm": ("tokenspeed_kernel.numerics.reference.gemm",),
+    "moe": ("tokenspeed_kernel.numerics.reference.moe",),
+    "quantization": ("tokenspeed_kernel.ops.quantization.triton",),
 }
 
 _LOCK = RLock()
@@ -106,14 +78,13 @@ def _all_families_loaded(families: tuple[str, ...]) -> bool:
 def load_builtin_kernels(families: str | Iterable[str] | None = None) -> None:
     """Import built-in registration modules for one or more op families.
 
-    This is intentionally separate from importing public API packages. Built-in
-    modules perform platform detection and optional vendor-library imports, so
-    they are loaded only when an API call needs them or tests request them.
+    This helper is kept for tools and tests that work with the registry
+    without importing the public op packages first. Vendor-specific kernels are
+    registered through plugin entry points instead of this built-in list.
     """
 
     family_names = _normalize_families(families)
-    # Hot path for every op call after first use. Registry resets clear this
-    # state via reset_builtin_kernel_load_state(), so no registry scan is needed.
+    # Avoid repeated imports for CLI and test paths that call this more than once.
     if _all_families_loaded(family_names):
         return
 

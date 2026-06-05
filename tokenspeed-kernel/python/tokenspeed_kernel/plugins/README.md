@@ -25,6 +25,32 @@ itself.
 Loading is **fully explicit** — importing `tokenspeed_kernel` or
 `tokenspeed_kernel.plugins` does **not** trigger discovery on its own.
 
+## Built-in vendor wheels
+
+The in-tree vendor kernels are published as plugin wheels that match the
+core package version:
+
+```text
+tokenspeed-kernel
+|-- [nvidia] -> tokenspeed-kernel-nvidia[registration]
+|-- [amd]    -> tokenspeed-kernel-amd[registration]
+`-- [all]    -> both vendor plugin wheels
+
+tokenspeed-kernel-nvidia
+`-- [registration] -> tokenspeed-kernel
+
+tokenspeed-kernel-amd
+`-- [registration] -> tokenspeed-kernel
+```
+
+`pip install tokenspeed-kernel` installs only the core API and vendor-neutral
+kernels. Install `tokenspeed-kernel[nvidia]`, `tokenspeed-kernel[amd]`, or
+`tokenspeed-kernel[all]` when the core package should also pull in built-in
+vendor plugins. Installing a vendor wheel directly, such as
+`pip install tokenspeed-kernel-amd`, installs that wheel's kernel code and
+vendor dependencies but does not depend on `tokenspeed-kernel`; use its
+`[registration]` extra when it should also install the core registration host.
+
 ## Example plugin
 
 A minimal out-of-tree package that contributes a custom decode-attention
@@ -32,9 +58,9 @@ kernel for NVIDIA Hopper.
 
 ```
 my-kernels-plugin/
-├── pyproject.toml
-└── my_kernels_plugin/
-    └── __init__.py
+|-- pyproject.toml
+`-- my_kernels_plugin/
+    `-- __init__.py
 ```
 
 `my_kernels_plugin/__init__.py`:

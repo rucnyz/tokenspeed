@@ -23,7 +23,6 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel.backends import load_builtin_kernels
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -49,7 +48,6 @@ LSE_LN = math.log2(math.e)
 
 
 def mha_decode_scheduler_metadata(**kwargs):
-    load_builtin_kernels("attention")
     from tokenspeed_kernel.ops.attention.flash_attn import (
         mha_decode_scheduler_metadata as _impl,
     )
@@ -106,7 +104,6 @@ def mha_prefill(
         "return_lse": return_lse,
     }
     signature = _attention_format_signature(q=q, k=k, v=v)
-    load_builtin_kernels("attention")
     kernel = select_kernel(
         "attention",
         "mha_prefill",
@@ -210,7 +207,6 @@ def mha_extend_with_kvcache(
         "return_lse": return_lse,
     }
     signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
-    load_builtin_kernels("attention")
     kernel = select_kernel(
         "attention",
         "mha_extend_with_kvcache",
@@ -316,7 +312,6 @@ def mha_decode_with_kvcache(
         "return_lse": return_lse,
     }
     signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
-    load_builtin_kernels("attention")
     kernel = select_kernel(
         "attention",
         "mha_decode_with_kvcache",
@@ -399,7 +394,6 @@ def mha_merge_state(
         "head_dim": out_a.shape[-1],
     }
     signature = _attention_format_signature(out_a=out_a, out_b=out_b)
-    load_builtin_kernels("attention")
     kernel = select_kernel(
         "attention",
         "mha_merge_state",
@@ -436,3 +430,7 @@ def mha_merge_state(
             lse_b=lse_b,
             lse_scale_log2=lse_scale_log2,
         )
+
+
+# Core backend registration (side-effect import).
+import tokenspeed_kernel.ops.attention.triton  # noqa: E402,F401

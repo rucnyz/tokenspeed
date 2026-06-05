@@ -49,6 +49,25 @@ THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
 BASE_VERSION = "0.1.0"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm"}
+PACKAGE_ENV = "TOKENSPEED_KERNEL_PACKAGE"
+VALID_PACKAGES = {"core", "nvidia", "amd"}
+DIST_NAMES = {
+    "core": "tokenspeed-kernel",
+    "nvidia": "tokenspeed-kernel-nvidia",
+    "amd": "tokenspeed-kernel-amd",
+}
+PLUGIN_ENTRY_POINTS = {
+    "nvidia": {
+        "tokenspeed_kernel.plugins": [
+            "nvidia=tokenspeed_kernel_nvidia:register",
+        ],
+    },
+    "amd": {
+        "tokenspeed_kernel.plugins": [
+            "amd=tokenspeed_kernel_amd:register",
+        ],
+    },
+}
 
 # CUDA kernels source and output directories
 CUDA_CSRC_DIR = THIRDPARTY_DIR / "cuda" / "csrc"
@@ -56,6 +75,172 @@ CUDA_OBJS_DIR = THIRDPARTY_DIR / "cuda" / "objs"
 
 # JIT kernels source directory (no pre-compilation, just need sources available)
 JIT_CSRC_DIR = THIRDPARTY_DIR / "jit_kernel" / "csrc"
+
+
+# Keep these packaging filters in sync with the vendor registration modules below.
+# They include each plugin entry point's side-effect imports plus helper modules
+# those imports need at runtime.
+NVIDIA_PACKAGE_PREFIXES = (
+    "tokenspeed_kernel.ops.attention.cuda",
+    "tokenspeed_kernel.ops.attention.flash_attn",
+    "tokenspeed_kernel.ops.attention.flash_mla",
+    "tokenspeed_kernel.ops.attention.flashinfer",
+    "tokenspeed_kernel.ops.attention.tokenspeed_mla",
+    "tokenspeed_kernel.thirdparty.cuda",
+    "tokenspeed_kernel.thirdparty.cute_dsl",
+    "tokenspeed_kernel.thirdparty.deep_ep",
+    "tokenspeed_kernel.thirdparty.deep_gemm",
+    "tokenspeed_kernel.thirdparty.fast_hadamard_transform",
+    "tokenspeed_kernel.thirdparty.trtllm",
+)
+NVIDIA_MODULES = (
+    "tokenspeed_kernel.ops.activation.cuda",
+    "tokenspeed_kernel.ops.activation.flashinfer",
+    "tokenspeed_kernel.ops.activation.triton",
+    "tokenspeed_kernel.ops.communication.flashinfer",
+    "tokenspeed_kernel.ops.communication.nccl",
+    "tokenspeed_kernel.ops.communication.trtllm",
+    "tokenspeed_kernel.ops.embedding.cuda",
+    "tokenspeed_kernel.ops.embedding.flashinfer",
+    "tokenspeed_kernel.ops.gemm.cute_dsl",
+    "tokenspeed_kernel.ops.gemm.deep_gemm",
+    "tokenspeed_kernel.ops.gemm.flashinfer",
+    "tokenspeed_kernel.ops.gemm.fp8_utils",
+    "tokenspeed_kernel.ops.gemm.triton",
+    "tokenspeed_kernel.ops.gemm.trtllm",
+    "tokenspeed_kernel.ops.kvcache.cuda",
+    "tokenspeed_kernel.ops.layernorm.cuda",
+    "tokenspeed_kernel.ops.layernorm.flashinfer",
+    "tokenspeed_kernel.ops.moe.cuda",
+    "tokenspeed_kernel.ops.moe.deepep",
+    "tokenspeed_kernel.ops.moe.flashinfer",
+    "tokenspeed_kernel.ops.moe.expert_location_dispatch",
+    "tokenspeed_kernel.ops.moe.triton",
+    "tokenspeed_kernel.ops.moe.triton_kernels",
+    "tokenspeed_kernel.ops.moe.trtllm",
+    "tokenspeed_kernel.ops.quantization.cuda",
+    "tokenspeed_kernel.ops.quantization.flashinfer",
+    "tokenspeed_kernel.ops.quantization.trtllm",
+    "tokenspeed_kernel.ops.routing.cuda",
+    "tokenspeed_kernel.ops.sampling.cuda",
+    "tokenspeed_kernel.ops.sampling.cute_dsl",
+    "tokenspeed_kernel.ops.sampling.flashinfer",
+)
+AMD_PACKAGE_PREFIXES = ("tokenspeed_kernel.ops.attention.gluon",)
+AMD_MODULES = (
+    "tokenspeed_kernel.ops.communication.iris",
+    "tokenspeed_kernel.ops.moe.gluon",
+    "tokenspeed_kernel.ops.moe.expert_location_dispatch",
+)
+VENDOR_PACKAGE_PREFIXES = NVIDIA_PACKAGE_PREFIXES + AMD_PACKAGE_PREFIXES
+VENDOR_MODULES = NVIDIA_MODULES + AMD_MODULES
+VENDOR_PLUGIN_PREFIXES = (
+    "tokenspeed_kernel_nvidia",
+    "tokenspeed_kernel_amd",
+)
+
+
+def _has_prefix(name: str, prefixes: tuple[str, ...]) -> bool:
+    return any(name == prefix or name.startswith(prefix + ".") for prefix in prefixes)
+
+
+def _parent_packages(modules: tuple[str, ...]) -> set[str]:
+    return {module.rsplit(".", 1)[0] for module in modules}
+
+
+def _selected_package() -> str:
+    package = os.environ.get(PACKAGE_ENV, "core").strip().lower() or "core"
+    if package not in VALID_PACKAGES:
+        valid = ", ".join(sorted(VALID_PACKAGES))
+        raise RuntimeError(f"{PACKAGE_ENV} must be one of: {valid}")
+    return package
+
+
+def _package_name() -> str:
+    return DIST_NAMES[_selected_package()]
+
+
+def _include_module(module_name: str) -> bool:
+    package = _selected_package()
+    if package == "core":
+        return not (
+            _has_prefix(module_name, VENDOR_PACKAGE_PREFIXES)
+            or module_name in VENDOR_MODULES
+            or _has_prefix(module_name, VENDOR_PLUGIN_PREFIXES)
+        )
+    if package == "nvidia":
+        return (
+            _has_prefix(module_name, ("tokenspeed_kernel_nvidia",))
+            or _has_prefix(module_name, NVIDIA_PACKAGE_PREFIXES)
+            or module_name in NVIDIA_MODULES
+        )
+    if package == "amd":
+        return (
+            _has_prefix(module_name, ("tokenspeed_kernel_amd",))
+            or _has_prefix(module_name, AMD_PACKAGE_PREFIXES)
+            or module_name in AMD_MODULES
+        )
+    return False
+
+
+def _selected_packages() -> list[str]:
+    package = _selected_package()
+    packages = find_packages(where=str(ROOT))
+    if package == "core":
+        return [
+            name
+            for name in packages
+            if not _has_prefix(name, VENDOR_PACKAGE_PREFIXES)
+            and not _has_prefix(name, VENDOR_PLUGIN_PREFIXES)
+        ]
+
+    if package == "nvidia":
+        parents = _parent_packages(NVIDIA_MODULES)
+        return [
+            name
+            for name in packages
+            if _has_prefix(name, ("tokenspeed_kernel_nvidia",))
+            or _has_prefix(name, NVIDIA_PACKAGE_PREFIXES)
+            or name in parents
+        ]
+
+    parents = _parent_packages(AMD_MODULES)
+    return [
+        name
+        for name in packages
+        if _has_prefix(name, ("tokenspeed_kernel_amd",))
+        or _has_prefix(name, AMD_PACKAGE_PREFIXES)
+        or name in parents
+    ]
+
+
+def _selected_package_data() -> dict[str, list[str]]:
+    if _selected_package() == "nvidia":
+        return {"tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"]}
+    return {}
+
+
+def _registration_requirement() -> str:
+    return f"tokenspeed-kernel=={_package_version()}"
+
+
+def _selected_extras_require() -> dict[str, list[str]]:
+    package = _selected_package()
+    if package == "core":
+        version = _package_version()
+        nvidia = f"tokenspeed-kernel-nvidia[registration]=={version}"
+        amd = f"tokenspeed-kernel-amd[registration]=={version}"
+        return {
+            "nvidia": [nvidia],
+            "amd": [amd],
+            "all": [nvidia, amd],
+        }
+    return {"registration": [_registration_requirement()]}
+
+
+def _selected_entry_points() -> dict[str, list[str]]:
+    return PLUGIN_ENTRY_POINTS.get(_selected_package(), {})
+
 
 CUDA_HOME = os.environ.get("CUDA_HOME", "/usr/local/cuda")
 NVCC = os.environ.get("FLASHINFER_NVCC", f"{CUDA_HOME}/bin/nvcc")
@@ -216,11 +401,16 @@ def _read_requirements(path: Path, seen=None) -> list[str]:
 
 
 def _selected_install_requires() -> list[str]:
-    backend = _selected_backend()
+    package = _selected_package()
+    requirement_files = {
+        "core": ("common.txt",),
+        "nvidia": ("cuda-thirdparty.txt",),
+        "amd": ("rocm-thirdparty.txt",),
+    }[package]
+
     requirements = []
-    requirements.extend(
-        _read_requirements(REQUIREMENTS_DIR / f"{backend}-thirdparty.txt")
-    )
+    for requirement_file in requirement_files:
+        requirements.extend(_read_requirements(REQUIREMENTS_DIR / requirement_file))
 
     deduped = []
     seen = set()
@@ -761,6 +951,13 @@ class BuildNative(Command):
         pass
 
     def run(self):
+        if os.environ.get("TOKENSPEED_KERNEL_SKIP_NATIVE_BUILD"):
+            print("TOKENSPEED_KERNEL_SKIP_NATIVE_BUILD set; skipping native build")
+            return
+        if _selected_package() != "nvidia":
+            print(f"{_package_name()} does not build CUDA native kernels")
+            return
+
         backend = _selected_backend()
         _install_backend_build_requirements(getattr(self, "verbose", False))
         if backend != "cuda":
@@ -789,19 +986,30 @@ class DevelopWithBuild(develop):
 class BuildPyWithBuild(build_py):
     """Ensure kernels and vendored deps are built for regular installs."""
 
+    def find_package_modules(self, package, package_dir):
+        modules = super().find_package_modules(package, package_dir)
+        filtered = []
+        for pkg, module, filename in modules:
+            module_name = pkg if module == "__init__" else f"{pkg}.{module}"
+            if _include_module(module_name):
+                filtered.append((pkg, module, filename))
+        return filtered
+
     def run(self):
         self.run_command("build_native")
         super().run()
 
 
 setup(
-    name="tokenspeed_kernel",
+    name=_package_name(),
     version=_package_version(),
+    license_files=["LICENSE", "THIRDPARTYNOTICES"],
     install_requires=_selected_install_requires(),
-    packages=find_packages(),
-    package_data={
-        "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
-    },
+    extras_require=_selected_extras_require(),
+    entry_points=_selected_entry_points(),
+    package_dir={"": str(ROOT)},
+    packages=_selected_packages(),
+    package_data=_selected_package_data(),
     cmdclass={
         "build_native": BuildNative,
         "build_ext": BuildKernels,

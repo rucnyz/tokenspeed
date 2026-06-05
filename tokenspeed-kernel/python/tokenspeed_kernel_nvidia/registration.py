@@ -18,27 +18,23 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""Plugin entry point for NVIDIA TokenSpeed kernels."""
+
 from __future__ import annotations
 
-import os
-import subprocess
+import importlib
 import sys
-from pathlib import Path
 
-_PYTHON_DIR = Path(__file__).resolve().parent.parent / "python"
-
-
-_VENDOR_BACKEND_PREFIXES = (
+_REGISTRATION_MODULES = (
     "tokenspeed_kernel.ops.activation.cuda",
     "tokenspeed_kernel.ops.activation.flashinfer",
+    "tokenspeed_kernel.ops.activation.triton",
     "tokenspeed_kernel.ops.attention.cuda",
     "tokenspeed_kernel.ops.attention.flash_attn",
     "tokenspeed_kernel.ops.attention.flash_mla",
     "tokenspeed_kernel.ops.attention.flashinfer",
-    "tokenspeed_kernel.ops.attention.gluon",
     "tokenspeed_kernel.ops.attention.tokenspeed_mla",
     "tokenspeed_kernel.ops.communication.flashinfer",
-    "tokenspeed_kernel.ops.communication.iris",
     "tokenspeed_kernel.ops.communication.nccl",
     "tokenspeed_kernel.ops.communication.trtllm",
     "tokenspeed_kernel.ops.embedding.cuda",
@@ -46,7 +42,6 @@ _VENDOR_BACKEND_PREFIXES = (
     "tokenspeed_kernel.ops.gemm.cute_dsl",
     "tokenspeed_kernel.ops.gemm.deep_gemm",
     "tokenspeed_kernel.ops.gemm.flashinfer",
-    "tokenspeed_kernel.ops.gemm.fp8_utils",
     "tokenspeed_kernel.ops.gemm.triton",
     "tokenspeed_kernel.ops.gemm.trtllm",
     "tokenspeed_kernel.ops.kvcache.cuda",
@@ -55,7 +50,6 @@ _VENDOR_BACKEND_PREFIXES = (
     "tokenspeed_kernel.ops.moe.cuda",
     "tokenspeed_kernel.ops.moe.deepep",
     "tokenspeed_kernel.ops.moe.flashinfer",
-    "tokenspeed_kernel.ops.moe.gluon",
     "tokenspeed_kernel.ops.moe.triton",
     "tokenspeed_kernel.ops.moe.triton_kernels",
     "tokenspeed_kernel.ops.moe.trtllm",
@@ -66,78 +60,15 @@ _VENDOR_BACKEND_PREFIXES = (
     "tokenspeed_kernel.ops.sampling.cuda",
     "tokenspeed_kernel.ops.sampling.cute_dsl",
     "tokenspeed_kernel.ops.sampling.flashinfer",
-    "tokenspeed_kernel.thirdparty.cuda",
-    "tokenspeed_kernel.thirdparty.cute_dsl",
-    "tokenspeed_kernel.thirdparty.deep_ep",
-    "tokenspeed_kernel.thirdparty.deep_gemm",
-    "tokenspeed_kernel.thirdparty.fast_hadamard_transform",
-    "tokenspeed_kernel.thirdparty.trtllm",
-    "tokenspeed_kernel_nvidia",
-    "tokenspeed_kernel_amd",
 )
-_VENDOR_EXTERNAL_MODULES = {
-    "deep_ep",
-    "deep_gemm",
-    "flash_attn",
-    "flash_attn_interface",
-    "flashinfer",
-    "triton_kernels",
-    "trtllm_kernel",
-}
 
 
-def _run_import_check(script: str) -> None:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = (
-        str(_PYTHON_DIR)
-        if not env.get("PYTHONPATH")
-        else f"{_PYTHON_DIR}{os.pathsep}{env['PYTHONPATH']}"
-    )
-    subprocess.run(
-        [sys.executable, "-c", script],
-        env=env,
-        text=True,
-        check=True,
-    )
+def register() -> None:
+    """Register NVIDIA kernels by importing their registration modules."""
 
-
-def _vendor_check_script(imports: str) -> str:
-    return f"""
-import sys
-try:
-    import torch  # noqa: F401
-except ImportError:
-    raise SystemExit(0)
-
-vendor_backend_prefixes = {_VENDOR_BACKEND_PREFIXES!r}
-vendor_external_modules = {_VENDOR_EXTERNAL_MODULES!r}
-before = set(sys.modules)
-{imports}
-from tokenspeed_kernel.registry import KernelRegistry
-loaded = set(sys.modules) - before
-
-unexpected = [
-    name
-    for name in loaded
-    if name.startswith(vendor_backend_prefixes) or name in vendor_external_modules
-]
-assert unexpected == [], unexpected
-assert KernelRegistry.get().list_kernels()
-"""
-
-
-def test_top_level_import_does_not_load_vendor_modules() -> None:
-    _run_import_check(_vendor_check_script("""
-import tokenspeed_kernel
-assert callable(tokenspeed_kernel.mm)
-"""))
-
-
-def test_public_op_imports_register_only_core_backends() -> None:
-    _run_import_check(_vendor_check_script("""
-import tokenspeed_kernel.ops.attention
-import tokenspeed_kernel.ops.embedding
-import tokenspeed_kernel.ops.gemm
-import tokenspeed_kernel.ops.moe
-import tokenspeed_kernel.ops.quantization
-"""))
+    for module_name in _REGISTRATION_MODULES:
+        module = sys.modules.get(module_name)
+        if module is None:
+            importlib.import_module(module_name)
+        else:
+            importlib.reload(module)

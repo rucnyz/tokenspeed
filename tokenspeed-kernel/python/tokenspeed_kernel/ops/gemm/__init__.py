@@ -23,7 +23,6 @@ from __future__ import annotations
 import logging
 
 import torch
-from tokenspeed_kernel.backends import load_builtin_kernels
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import (
@@ -263,8 +262,6 @@ def mm(
         A, B, A_scales, B_scales, out_dtype, quant, block_size
     )
     select_dtype = signature.storage_dtype_for("a") or A.dtype
-
-    load_builtin_kernels("gemm")
     kernel = select_kernel(
         "gemm",
         "mm",
@@ -311,3 +308,7 @@ def mm(
     if bias is not None and not fused_bias:
         output = output + bias.to(dtype=output.dtype)
     return output
+
+
+# Core backend registration (side-effect import).
+import tokenspeed_kernel.numerics.reference.gemm  # noqa: E402,F401

@@ -24,7 +24,6 @@ import logging
 from typing import Optional, Set
 
 import torch
-from tokenspeed_kernel.backends import load_builtin_kernels
 from tokenspeed_kernel.ops.moe.expert_location_dispatch import (  # noqa: F401
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
@@ -202,7 +201,6 @@ def moe_route(
     * ``{"grouped": True/False}``: whether grouped expert selection is used.
     """
     signature = _single_dense_tensor_format_signature("logits", dtype)
-    load_builtin_kernels("moe")
     kernel = select_kernel(
         "moe",
         "route",
@@ -228,7 +226,6 @@ def moe_dispatch(
     """
     selection_traits = traits or {"comm_strategy": "local"}
     signature = _moe_dispatch_format_signature(dtype, selection_traits)
-    load_builtin_kernels("moe")
     kernel = select_kernel(
         "moe",
         "dispatch",
@@ -269,7 +266,6 @@ def moe_experts(
         signature = _moe_fused_format_signature(
             dtype, weight_format, fp8_scale_granularity=fp8_scale_granularity
         )
-    load_builtin_kernels("moe")
     kernel = select_kernel(
         "moe",
         "experts",
@@ -291,7 +287,6 @@ def moe_combine(
 ):
     """Combine expert outputs with weighted reduction."""
     signature = _single_dense_tensor_format_signature("x", dtype)
-    load_builtin_kernels("moe")
     kernel = select_kernel(
         "moe",
         "combine",
@@ -341,7 +336,6 @@ def moe_fused(
         dtype, weight_format, fp8_scale_granularity=fp8_scale_granularity
     )
     selection_traits = dict(traits or {})
-    load_builtin_kernels("moe")
     kernel = select_kernel(
         "moe",
         "fused",
@@ -352,3 +346,7 @@ def moe_fused(
     )
 
     return kernel(*args, **kwargs)
+
+
+# Core backend registration (side-effect import).
+import tokenspeed_kernel.numerics.reference.moe  # noqa: E402,F401
