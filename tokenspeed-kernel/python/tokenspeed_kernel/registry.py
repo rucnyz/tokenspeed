@@ -248,6 +248,11 @@ class KernelRegistry:
     def reset(cls) -> None:
         """Reset singleton (for testing)."""
         cls._instance = None
+        try:
+            from tokenspeed_kernel.backends import reset_builtin_kernel_load_state
+        except ImportError:
+            return
+        reset_builtin_kernel_load_state()
 
     # ---- Registration ----
 

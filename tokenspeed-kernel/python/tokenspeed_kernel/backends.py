@@ -99,6 +99,10 @@ def _normalize_families(families: str | Iterable[str] | None) -> tuple[str, ...]
     return tuple(families)
 
 
+def _all_families_loaded(families: tuple[str, ...]) -> bool:
+    return all(family in _LOADED_FAMILIES for family in families)
+
+
 def load_builtin_kernels(families: str | Iterable[str] | None = None) -> None:
     """Import built-in registration modules for one or more op families.
 
@@ -108,12 +112,14 @@ def load_builtin_kernels(families: str | Iterable[str] | None = None) -> None:
     """
 
     family_names = _normalize_families(families)
+    # Hot path for every op call after first use. Registry resets clear this
+    # state via reset_builtin_kernel_load_state(), so no registry scan is needed.
+    if _all_families_loaded(family_names):
+        return
 
     with _LOCK:
-        from tokenspeed_kernel.registry import KernelRegistry
-
-        if not KernelRegistry.get().list_kernels():
-            reset_builtin_kernel_load_state()
+        if _all_families_loaded(family_names):
+            return
 
         for family in family_names:
             try:
