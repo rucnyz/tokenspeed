@@ -23,9 +23,7 @@ import torch
 
 from tokenspeed.runtime.layers.activation import SwigluArg
 from tokenspeed.runtime.layers.moe.core import MoELayerSpec, select_backend
-from tokenspeed.runtime.layers.moe.dispatcher.deep_ep_local_compute import DeepExecutor
 from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
-from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
@@ -174,25 +172,4 @@ class MoELayer(torch.nn.Module):
             num_global_tokens,
             max_num_tokens_per_gpu,
             **kwargs,
-        )
-
-    def construct_executor(self):
-        not_quant = self.quant_config is None or should_ignore_quant_layer(
-            prefix=self.prefix,
-            ignored_layers=getattr(self.quant_config, "ignored_layers", []),
-        )
-        w13_weight_scale = None
-        w2_weight_scale = None
-        if not not_quant:
-            w13_weight_scale = getattr(
-                self, "w13_weight_scale_inv", getattr(self, "w13_weight_scale", None)
-            )
-            w2_weight_scale = getattr(
-                self, "w2_weight_scale_inv", getattr(self, "w2_weight_scale", None)
-            )
-        return DeepExecutor(
-            self.w13_weight,
-            w13_weight_scale,
-            self.w2_weight,
-            w2_weight_scale,
         )
