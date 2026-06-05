@@ -28,15 +28,15 @@ from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
-from tokenspeed.runtime.layers.moe.backends.nvfp4.deepep_cutedsl_fp4_executor import (
-    DeepEPCuteDslFp4Executor,
-)
 from tokenspeed.runtime.layers.moe.backends.nvfp4.weights import (
     create_fp4_weights,
     finalize_common_flashinfer_weights,
     interleave_gate_up_chunks,
 )
 from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
+from tokenspeed.runtime.layers.moe.dispatcher.deep_ep_cutedsl_fp4_executor import (
+    DeepEPCuteDslFp4Executor,
+)
 from tokenspeed.runtime.layers.moe.topk import select_experts
 from tokenspeed.runtime.layers.quantization import Nvfp4Config
 from tokenspeed.runtime.utils.env import global_server_args_dict
