@@ -18,6 +18,31 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from deep_ep.buffer import Buffer
+from __future__ import annotations
 
 __all__ = ["Buffer"]
+
+
+def _raise_deepep_unavailable() -> None:
+    raise ImportError(
+        "DeepEP is not available. Install the `deep_ep` package to use DeepEP "
+        "communication."
+    )
+
+
+class _MissingBufferMeta(type):
+    def __getattr__(cls, name):
+        del name
+        _raise_deepep_unavailable()
+
+
+class _MissingBuffer(metaclass=_MissingBufferMeta):
+    def __init__(self, *args, **kwargs):
+        del args, kwargs
+        _raise_deepep_unavailable()
+
+
+try:
+    from deep_ep.buffer import Buffer
+except ImportError:
+    Buffer = _MissingBuffer

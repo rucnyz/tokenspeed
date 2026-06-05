@@ -29,11 +29,6 @@ from tokenspeed_kernel.signature import format_signatures
 
 logger = logging.getLogger(__name__)
 
-try:
-    from tokenspeed_kernel.thirdparty.deep_ep import Buffer
-except ImportError:
-    Buffer = None  # type: ignore[assignment]
-
 
 def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
