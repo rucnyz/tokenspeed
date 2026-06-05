@@ -288,7 +288,6 @@ class Nvfp4FlashinferTrtllmBackend(MoEBackend):
         max_num_tokens_per_gpu: int,
         do_finalize: bool = True,
     ) -> torch.Tensor:
-        del num_global_tokens, max_num_tokens_per_gpu
         x = hidden_states
         num_tokens = x.shape[0]
 

@@ -220,7 +220,6 @@ class Mxfp4GluonKernelBackend(Mxfp4TritonKernelBackend):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
-        del num_global_tokens, max_num_tokens_per_gpu
         router_logits = topk_output.router_logits
         top_k = topk_output.topk_config.top_k
 

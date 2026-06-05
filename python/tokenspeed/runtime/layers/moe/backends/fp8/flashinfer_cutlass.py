@@ -168,7 +168,6 @@ class Fp8FlashinferCutlassBackend(MoEBackend):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
-        del num_global_tokens, max_num_tokens_per_gpu
         x = hidden_states
         output_dtype = x.dtype
         output_col = x.shape[1]

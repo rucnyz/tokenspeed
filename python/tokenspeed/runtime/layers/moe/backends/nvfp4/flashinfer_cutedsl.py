@@ -293,7 +293,6 @@ class DeepEPCuteDslFp4Executor:
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
-        del num_global_tokens, max_num_tokens_per_gpu
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
         dispatcher = self._get_dispatcher()

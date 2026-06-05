@@ -413,7 +413,6 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
-        del num_global_tokens, max_num_tokens_per_gpu
         x = hidden_states
         hidden_padded = self._hidden_padded
         hidden_original = self._hidden_original

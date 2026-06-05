@@ -109,7 +109,6 @@ class Fp16FlashinferCutlassBackend(MoEBackend):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
-        del num_global_tokens, max_num_tokens_per_gpu
         x = hidden_states
         if x.shape[0] == 0:
             return x.new_empty(0, self.spec.hidden_size)

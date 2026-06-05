@@ -509,7 +509,6 @@ class Fp8TritonBackend(MoEBackend):
         num_global_tokens,
         max_num_tokens_per_gpu,
     ):
-        del num_global_tokens, max_num_tokens_per_gpu
         return _triton_forward(
             self._gate_up_gemm,
             self._down_gemm,
