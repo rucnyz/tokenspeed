@@ -29,9 +29,6 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
 )
-from tokenspeed_kernel.ops.moe.expert_location_dispatch import (
-    ExpertLocationDispatchInfo,
-)
 from tokenspeed_kernel.thirdparty.trtllm import (
     moe_align_block_size as _moe_align_block_size,
 )
@@ -303,25 +300,68 @@ def _biased_grouped_topk_reference(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = 1.0,
     num_token_non_padded: Optional[torch.Tensor] = None,
-    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    logical_to_physical_map: Optional[torch.Tensor] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
-    from tokenspeed_kernel.numerics.reference.moe import biased_grouped_topk_gpu
+    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+    assert (
+        routed_scaling_factor is not None
+    ), "routed_scaling_factor is required for biased_grouped_topk"
 
-    return biased_grouped_topk_gpu(
-        hidden_states,
-        gating_output,
-        correction_bias,
-        topk=topk,
-        renormalize=renormalize,
-        num_expert_group=num_expert_group,
-        topk_group=topk_group,
-        num_fused_shared_experts=num_fused_shared_experts,
-        routed_scaling_factor=routed_scaling_factor,
-        num_token_non_padded=num_token_non_padded,
-        expert_location_dispatch_info=expert_location_dispatch_info,
-        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+    scores = gating_output.sigmoid()
+    num_token = scores.shape[0]
+    num_experts = scores.shape[1]
+    scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
+    group_scores = (
+        scores_for_choice.view(num_token, num_expert_group, -1)
+        .topk(2, dim=-1)[0]
+        .sum(dim=-1)
     )
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[1]
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1)
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
+        .reshape(num_token, -1)
+    )
+    tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
+    _, topk_ids = torch.topk(
+        tmp_scores,
+        k=topk,
+        dim=-1,
+        sorted=(True if num_fused_shared_experts > 0 else False),
+    )
+    topk_weights = scores.gather(1, topk_ids)
+
+    if num_fused_shared_experts:
+        topk_ids[:, -1] = torch.randint(
+            low=num_experts,
+            high=num_experts + num_fused_shared_experts,
+            size=(topk_ids.size(0),),
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
+
+    if renormalize:
+        topk_weights_sum = (
+            topk_weights.sum(dim=-1, keepdim=True)
+            if num_fused_shared_experts == 0
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+        )
+        topk_weights = topk_weights / topk_weights_sum
+        if apply_routed_scaling_factor_on_output:
+            topk_weights *= routed_scaling_factor
+
+    topk_weights = topk_weights.to(torch.float32)
+    topk_ids = topk_ids.to(torch.int32)
+    if logical_to_physical_map is not None:
+        topk_ids = logical_to_physical_map[topk_ids]
+    if num_token_non_padded is not None:
+        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+        topk_ids[indices >= num_token_non_padded, :] = -1
+    return topk_weights, topk_ids
 
 
 def minimax_biased_grouped_topk(
@@ -335,7 +375,7 @@ def minimax_biased_grouped_topk(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = 1.0,
     num_token_non_padded: Optional[torch.Tensor] = None,
-    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    logical_to_physical_map: Optional[torch.Tensor] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
     if (
@@ -350,10 +390,6 @@ def minimax_biased_grouped_topk(
         or num_fused_shared_experts != 0
         or routed_scaling_factor is None
         or num_token_non_padded is not None
-        or (
-            expert_location_dispatch_info is not None
-            and expert_location_dispatch_info.ep_dispatch_algorithm != "static"
-        )
     ):
         return _biased_grouped_topk_reference(
             hidden_states,
@@ -366,7 +402,7 @@ def minimax_biased_grouped_topk(
             num_fused_shared_experts=num_fused_shared_experts,
             routed_scaling_factor=routed_scaling_factor,
             num_token_non_padded=num_token_non_padded,
-            expert_location_dispatch_info=expert_location_dispatch_info,
+            logical_to_physical_map=logical_to_physical_map,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
         )
 
@@ -382,8 +418,8 @@ def minimax_biased_grouped_topk(
 
     block_e = triton.next_power_of_2(num_experts)
     static_map = (
-        expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
-        if expert_location_dispatch_info is not None
+        logical_to_physical_map
+        if logical_to_physical_map is not None
         else correction_bias
     )
     _minimax_biased_grouped_topk_kernel[(num_tokens,)](
@@ -402,7 +438,7 @@ def minimax_biased_grouped_topk(
         routed_scaling_factor=float(routed_scaling_factor),
         renormalize=renormalize,
         apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-        has_static_expert_map=expert_location_dispatch_info is not None,
+        has_static_expert_map=logical_to_physical_map is not None,
         BLOCK_E=block_e,
         TOPK=topk,
         num_warps=1,
