@@ -33,6 +33,9 @@ from tokenspeed_kernel.ops.moe.triton_kernels import (
     layout,
     opt_flags,
     swiglu_fn,
+    triton_kernels_dispatch_gemm,
+    triton_kernels_gemm_combine,
+    triton_kernels_routing,
     wrap_torch_tensor,
 )
 from tokenspeed_kernel.platform import current_platform
@@ -248,15 +251,11 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         top_k = topk_output.topk_config.top_k
         n_tokens = router_logits.shape[0]
 
-        ragged_metadata, gather_indx, scatter_indx, gate_scal = (
-            tokenspeed_kernel.moe_route(
-                router_logits,
-                top_k,
-                sm_first=False,
-                dtype=router_logits.dtype,
-                traits={"output_type": "ragged_metadata"},
-                expected_kernel_name="triton_kernels_routing",
-            )
+        ragged_metadata, gather_indx, scatter_indx, gate_scal = triton_kernels_routing(
+            router_logits,
+            top_k,
+            sm_first=False,
+            dtype=router_logits.dtype,
         )
 
         w13_weight = layer.w13_weight_triton_tensor
@@ -284,7 +283,7 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             gemm1_input = hidden_states
 
         # First GEMM: gate_up projection with fused activation
-        intermediate_cache = tokenspeed_kernel.moe_experts(
+        intermediate_cache = triton_kernels_dispatch_gemm(
             gemm1_input,
             w13_weight,
             w13_bias,
@@ -292,9 +291,6 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             gather_indx=gather_indx,
             precision_config=w13_pc,
             fused_activation=act,
-            dtype=hidden_states.dtype,
-            features={"ragged_metadata", "dispatch_gemm"},
-            expected_kernel_name="triton_kernels_dispatch_gemm",
         )
 
         if self._is_w4a8_fp8:
@@ -308,7 +304,7 @@ class Mxfp4TritonKernelBackend(MoEBackend):
 
         # Second GEMM: down projection with scatter (combine)
         # gammas applies the routing weights (expert contribution weights)
-        return tokenspeed_kernel.moe_experts(
+        return triton_kernels_gemm_combine(
             gemm2_input,
             w2_weight,
             w2_bias,
@@ -318,9 +314,6 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             gammas=gate_scal,
             n_tokens=n_tokens,
             n_expts_act=top_k,
-            dtype=hidden_states.dtype,
-            features={"ragged_metadata", "gemm_combine"},
-            expected_kernel_name="triton_kernels_gemm_combine",
         )
 
 

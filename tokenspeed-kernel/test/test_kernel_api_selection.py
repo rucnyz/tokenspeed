@@ -29,7 +29,6 @@ from typing import Callable
 import pytest
 import tokenspeed_kernel
 import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
-import tokenspeed_kernel.numerics.reference.moe as _moe_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
 import tokenspeed_kernel.ops.attention.flash_attn as _attention_flash_attn
@@ -43,12 +42,6 @@ import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
 import tokenspeed_kernel.ops.gemm.trtllm as _gemm_trtllm
-import tokenspeed_kernel.ops.moe as _moe_pkg
-import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
-import tokenspeed_kernel.ops.moe.deepep as _moe_deepep
-import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
-import tokenspeed_kernel.ops.moe.triton as _moe_triton
-import tokenspeed_kernel.ops.moe.triton_kernels as _moe_triton_kernels
 import torch
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry
@@ -71,14 +64,6 @@ _RELOAD_MODULES = [
     _gemm_triton,
     _gemm_trtllm,
     _gemm_pkg,
-    # MoE registration modules.
-    _moe_reference,
-    _moe_cuda,
-    _moe_deepep,
-    _moe_flashinfer,
-    _moe_triton,
-    _moe_triton_kernels,
-    _moe_pkg,
     # Top-level public API re-exports.
     tokenspeed_kernel,
 ]
@@ -116,10 +101,6 @@ def _is_blackwell_non_sm100(platform: PlatformInfo) -> bool:
 
 def _is_blackwell_plus(platform: PlatformInfo) -> bool:
     return platform.is_blackwell_plus
-
-
-def _is_nvidia(platform: PlatformInfo) -> bool:
-    return platform.is_nvidia
 
 
 def _is_cdna4(platform: PlatformInfo) -> bool:
@@ -330,127 +311,6 @@ def _attention_merge_state() -> object:
     return tokenspeed_kernel.mha_merge_state(out_a, lse_a, out_b, lse_b)
 
 
-def _moe_route_grouped_topk() -> object:
-    return tokenspeed_kernel.moe_route(
-        dtype=torch.bfloat16,
-        traits={
-            "output_type": "topk",
-            "biased": False,
-            "grouped": True,
-            "ep": False,
-        },
-    )
-
-
-def _moe_route_biased_topk() -> object:
-    return tokenspeed_kernel.moe_route(
-        dtype=torch.bfloat16,
-        traits={
-            "output_type": "topk",
-            "biased": True,
-            "grouped": False,
-            "ep": False,
-        },
-    )
-
-
-def _moe_route_ragged_metadata() -> object:
-    return tokenspeed_kernel.moe_route(
-        dtype=torch.bfloat16,
-        traits={"output_type": "ragged_metadata"},
-    )
-
-
-def _moe_dispatch_local() -> object:
-    return tokenspeed_kernel.moe_dispatch(
-        dtype=torch.int32,
-        traits={"comm_strategy": "local"},
-    )
-
-
-def _moe_dispatch_deepep() -> object:
-    return tokenspeed_kernel.moe_dispatch(
-        dtype=torch.bfloat16,
-        traits={"comm_strategy": "deep_ep"},
-    )
-
-
-def _moe_combine_small() -> object:
-    return tokenspeed_kernel.moe_combine(
-        dtype=torch.bfloat16,
-        traits={"num_tokens": 8, "comm_strategy": None},
-    )
-
-
-def _moe_combine_large() -> object:
-    return tokenspeed_kernel.moe_combine(
-        dtype=torch.bfloat16,
-        traits={"num_tokens": 128, "comm_strategy": None},
-    )
-
-
-def _moe_combine_deepep() -> object:
-    return tokenspeed_kernel.moe_combine(
-        dtype=torch.bfloat16,
-        traits={"comm_strategy": "deep_ep"},
-    )
-
-
-def _moe_experts_dispatch_sorted() -> object:
-    return tokenspeed_kernel.moe_experts(
-        dtype=torch.bfloat16,
-        features={"dispatch_sorted"},
-    )
-
-
-def _moe_experts_dispatch_gemm() -> object:
-    return tokenspeed_kernel.moe_experts(
-        dtype=torch.bfloat16,
-        features={"ragged_metadata", "dispatch_gemm"},
-    )
-
-
-def _moe_experts_gemm_combine() -> object:
-    return tokenspeed_kernel.moe_experts(
-        dtype=torch.bfloat16,
-        features={"ragged_metadata", "gemm_combine"},
-    )
-
-
-def _moe_fused_self_routing_mxfp4() -> object:
-    return tokenspeed_kernel.moe_fused(
-        dtype=torch.bfloat16,
-        features={"self_routing"},
-        weight_format="mxfp4",
-    )
-
-
-def _moe_fused_prerouted_nvfp4_cutlass() -> object:
-    return tokenspeed_kernel.moe_fused(
-        dtype=torch.bfloat16,
-        features={"pre_routed"},
-        weight_format="nvfp4",
-        traits={
-            "tp": True,
-            "ep": True,
-            "cuda_graph": False,
-        },
-    )
-
-
-def _moe_fused_prerouted_nvfp4_cutedsl() -> object:
-    return tokenspeed_kernel.moe_fused(
-        dtype=torch.uint8,
-        features={"pre_routed"},
-        weight_format="nvfp4",
-        traits={
-            "tp": False,
-            "ep": True,
-            "cuda_graph": True,
-        },
-    )
-
-
 def _case(
     matches: Callable[[PlatformInfo], bool],
     arch: str,
@@ -625,119 +485,6 @@ _CASES = [
         "mm",
         "cublaslt_mm_nvfp4",
         _mm_nvfp4,
-    ),
-    # MoE API x architecture golden cases.
-    _case(
-        _is_supported_gpu,
-        "supported-gpu",
-        "moe",
-        "route",
-        "torch_compile_grouped_topk",
-        _moe_route_grouped_topk,
-    ),
-    _case(
-        _is_nvidia,
-        "nvidia",
-        "moe",
-        "route",
-        "cuda_routing_flash",
-        _moe_route_biased_topk,
-    ),
-    _case(
-        _is_supported_gpu,
-        "supported-gpu",
-        "moe",
-        "route",
-        "triton_kernels_routing",
-        _moe_route_ragged_metadata,
-    ),
-    _case(
-        _is_supported_gpu,
-        "supported-gpu",
-        "moe",
-        "dispatch",
-        "triton_moe_align_block_size",
-        _moe_dispatch_local,
-    ),
-    _case(
-        _is_supported_gpu,
-        "supported-gpu",
-        "moe",
-        "dispatch",
-        "deepep_moe_scatter",
-        _moe_dispatch_deepep,
-    ),
-    _case(
-        _is_supported_gpu,
-        "supported-gpu",
-        "moe",
-        "combine",
-        "torch_compile_moe_sum_reduce",
-        _moe_combine_small,
-    ),
-    _case(
-        _is_supported_gpu,
-        "supported-gpu",
-        "moe",
-        "combine",
-        "triton_moe_sum_reduce",
-        _moe_combine_large,
-    ),
-    _case(
-        _is_supported_gpu,
-        "supported-gpu",
-        "moe",
-        "combine",
-        "deepep_moe_gather",
-        _moe_combine_deepep,
-    ),
-    _case(
-        _is_supported_gpu,
-        "supported-gpu",
-        "moe",
-        "experts",
-        "triton_moe_fused_experts",
-        _moe_experts_dispatch_sorted,
-    ),
-    _case(
-        _is_supported_gpu,
-        "supported-gpu",
-        "moe",
-        "experts",
-        "triton_kernels_dispatch_gemm",
-        _moe_experts_dispatch_gemm,
-    ),
-    _case(
-        _is_supported_gpu,
-        "supported-gpu",
-        "moe",
-        "experts",
-        "triton_kernels_gemm_combine",
-        _moe_experts_gemm_combine,
-    ),
-    _case(
-        _is_nvidia,
-        "nvidia",
-        "moe",
-        "fused",
-        "flashinfer_trtllm_fp4_fused_moe",
-        _moe_fused_self_routing_mxfp4,
-    ),
-    _case(
-        _is_nvidia,
-        "nvidia",
-        "moe",
-        "fused",
-        "flashinfer_cutlass_fused_moe",
-        _moe_fused_prerouted_nvfp4_cutlass,
-    ),
-    _case(
-        _is_nvidia,
-        "nvidia",
-        "moe",
-        "fused",
-        "flashinfer_cutedsl_nvfp4_fused_moe",
-        _moe_fused_prerouted_nvfp4_cutedsl,
     ),
 ]
 

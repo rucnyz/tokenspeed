@@ -20,14 +20,12 @@
 
 from __future__ import annotations
 
-import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.moe.flashinfer import (
-    _maybe_get_cached_w3_w1_permute_indices,
-)
 from tokenspeed_kernel.ops.moe.flashinfer import autotune as flashinfer_autotune
 from tokenspeed_kernel.ops.moe.flashinfer import (
+    flashinfer_trtllm_fp4_fused_moe,
     get_w2_permute_indices_with_cache,
+    maybe_get_cached_w3_w1_permute_indices,
 )
 from tokenspeed_kernel.ops.quantization.flashinfer import (
     mxfp8_quantize,
@@ -64,7 +62,7 @@ def _get_flashinfer_mxfp4_device_permute_indices(
 ) -> torch.Tensor:
     extra_args = {} if num_elts_per_sf is None else {"num_elts_per_sf": num_elts_per_sf}
     if kind == "w13":
-        permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+        permute_indices = maybe_get_cached_w3_w1_permute_indices(
             _flashinfer_mxfp4_permute_indices_cache,
             x,
             epilogue_tile_m,
@@ -376,7 +374,7 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
     def _call_kernel(self, router_logits, x_quant, x_scale, layer, top_k, output):
         num_local = self.spec.num_local_experts
         local_offset = self.spec.ep_rank * num_local
-        return tokenspeed_kernel.moe_fused(
+        return flashinfer_trtllm_fp4_fused_moe(
             router_logits.to(torch.bfloat16),
             None,
             x_quant,
@@ -405,10 +403,6 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
             True,
             tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
             output=output,
-            dtype=torch.bfloat16,
-            features={"self_routing"},
-            weight_format="mxfp4",
-            expected_kernel_name="flashinfer_trtllm_fp4_fused_moe",
         )[0]
 
     def forward(

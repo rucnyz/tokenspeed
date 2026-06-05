@@ -32,8 +32,6 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
 from tokenspeed_kernel.ops.moe.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
 )
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.thirdparty.trtllm import (
     moe_align_block_size as _moe_align_block_size,
 )
@@ -41,9 +39,11 @@ from tokenspeed_kernel.thirdparty.trtllm import (
 __all__ = [
     "invoke_fused_moe_kernel",
     "moe_align_block_size",
-    "moe_sum_reduce_torch_compile",
     "moe_sum_reduce_triton",
     "stage_deepseek_v4_mega_moe_inputs",
+    "triton_moe_align_block_size",
+    "triton_moe_fused_experts",
+    "triton_moe_sum_reduce",
 ]
 
 padding_size = 128 if bool(int(os.getenv("TOKENSPEED_MOE_PADDING", "0"))) else 0
@@ -324,25 +324,6 @@ def _biased_grouped_topk_reference(
     )
 
 
-@register_kernel(
-    "moe",
-    "route",
-    name="triton_minimax_biased_grouped_topk",
-    solution="triton",
-    signatures=format_signatures("logits", "dense", {torch.float32}),
-    traits={
-        "output_type": frozenset({"topk"}),
-        "biased": frozenset({True}),
-        "grouped": frozenset({True}),
-        "ep": frozenset({True, False}),
-        "num_expert_group": frozenset({1}),
-        "topk_group": frozenset({1}),
-        "topk": frozenset({8}),
-        "num_fused_shared_experts": frozenset({0}),
-    },
-    priority=12,
-    tags={"latency", "portability"},
-)
 def minimax_biased_grouped_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -771,18 +752,6 @@ def _normalize_fp8_group_scale_layout(
     return A_scale
 
 
-@register_kernel(
-    "moe",
-    "experts",
-    name="triton_moe_fused_experts",
-    features={"dispatch_sorted"},
-    solution="triton",
-    signatures=format_signatures(
-        "x", "dense", {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
-    ),
-    priority=Priority.PERFORMANT + 2,
-    tags={"portability"},
-)
 def invoke_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -918,6 +887,9 @@ def invoke_fused_moe_kernel(
     )
 
 
+triton_moe_fused_experts = invoke_fused_moe_kernel
+
+
 # ---------------------------------------------------------------------------
 # Combine (sum reduce)
 # ---------------------------------------------------------------------------
@@ -976,16 +948,6 @@ def _moe_sum_reduce_kernel(
     )
 
 
-@register_kernel(
-    "moe",
-    "combine",
-    name="triton_moe_sum_reduce",
-    solution="triton",
-    signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
-    traits={"comm_strategy": frozenset({None})},
-    priority=Priority.PERFORMANT + 2,
-    tags={"portability"},
-)
 def moe_sum_reduce_triton(
     input: torch.Tensor, output: torch.Tensor, routed_scaling_factor: float
 ):
@@ -1021,20 +983,7 @@ def moe_sum_reduce_triton(
     )
 
 
-@register_kernel(
-    "moe",
-    "combine",
-    name="torch_compile_moe_sum_reduce",
-    solution="reference",
-    signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
-    traits={"comm_strategy": frozenset({None})},
-    priority=Priority.PORTABLE + 1,
-    tags={"portability"},
-)
-@torch.compile
-def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
-    torch.sum(x, dim=1, out=out)
-    out.mul_(routed_scaling_factor)
+triton_moe_sum_reduce = moe_sum_reduce_triton
 
 
 # ---------------------------------------------------------------------------
@@ -1042,18 +991,6 @@ def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
 # ---------------------------------------------------------------------------
 
 
-@register_kernel(
-    "moe",
-    "dispatch",
-    name="triton_moe_align_block_size",
-    solution="triton",
-    signatures=format_signatures("indices", "dense", {torch.int32}),
-    traits={
-        "comm_strategy": frozenset({"local"}),
-    },
-    priority=Priority.PERFORMANT + 2,
-    tags={"portability"},
-)
 def moe_align_block_size(
     topk_ids: torch.Tensor, block_size: int, num_experts: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1127,3 +1064,6 @@ def moe_align_block_size(
     )
 
     return sorted_ids, expert_ids, num_tokens_post_pad
+
+
+triton_moe_align_block_size = moe_align_block_size

@@ -21,7 +21,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
@@ -31,14 +30,6 @@ from tokenspeed_kernel._triton import (
     gluon,
     redirect_triton_to_tokenspeed_triton,
 )
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import (
-    ScaleFormat,
-    dense_tensor_format,
-    format_signature,
-    tensor_format,
-)
 
 with redirect_triton_to_tokenspeed_triton():
     from triton_kernels.matmul import FnSpecs, FusedActivation
@@ -46,16 +37,13 @@ with redirect_triton_to_tokenspeed_triton():
     from triton_kernels.tensor import RaggedTensorMetadata, Tensor
 
 __all__ = [
-    "_gluon_mxfp_fused_moe",
     "_gluon_mxfp_ragged_matmul",
+    "gluon_dispatch_gemm",
     "gluon_mxfp_combine",
+    "gluon_gemm_combine",
+    "gluon_mxfp4_fp8_fused_moe",
     "gluon_mxfp_dispatch_swiglu",
 ]
-
-_GLUON_DISABLE_VALUES = frozenset({"0", "false", "no", "off", "disable", "disabled"})
-_GLUON_DISABLED_ENV = (
-    os.environ.get("TOKENSPEED_MOE_GLUON", "").strip().lower() in _GLUON_DISABLE_VALUES
-)
 
 
 def _as_int32(t):
@@ -4317,79 +4305,6 @@ def _global_scale_passthrough(scale):
     return float(scale)
 
 
-def _kernel_priority() -> int:
-    if _GLUON_DISABLED_ENV:
-        return Priority.PORTABLE + 1  # 5
-    return Priority.SPECIALIZED + 2  # 14
-
-
-_MXFP4_SCALE_FORMAT = ScaleFormat(
-    storage_dtype=torch.uint8,
-    granularity="block",
-    block_shape=(32,),
-)
-_FP8_PER_TENSOR_SCALE_FORMAT = ScaleFormat(
-    storage_dtype=torch.float32,
-    granularity="tensor",
-)
-
-_FUSED_WEIGHT_MXFP4 = tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE_FORMAT)
-
-
-def _experts_fp8_mxfp4_signatures() -> frozenset:
-    return frozenset(
-        {
-            format_signature(
-                x=tensor_format(
-                    "scaled-fp8",
-                    torch.float8_e4m3fn,
-                    scale=_FP8_PER_TENSOR_SCALE_FORMAT,
-                ),
-                weight=_FUSED_WEIGHT_MXFP4,
-            ),
-            format_signature(
-                x=tensor_format(
-                    "scaled-fp8",
-                    torch.float8_e4m3fnuz,
-                    scale=_FP8_PER_TENSOR_SCALE_FORMAT,
-                ),
-                weight=_FUSED_WEIGHT_MXFP4,
-            ),
-            format_signature(
-                x=tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE_FORMAT),
-                weight=_FUSED_WEIGHT_MXFP4,
-            ),
-        }
-    )
-
-
-_common = dict(
-    solution="gluon",
-    signatures=_experts_fp8_mxfp4_signatures(),
-    capability=CapabilityRequirement(
-        vendors=frozenset({"amd"}),
-        min_arch_version=ArchVersion(9, 5),
-        max_arch_version=ArchVersion(9, 5),
-    ),
-    priority=_kernel_priority(),
-    tags={"throughput", "latency"},
-)
-
-
-@register_kernel(
-    "moe",
-    "experts",
-    name="gluon_dispatch_gemm",
-    features={"ragged_metadata", "dispatch_gemm"},
-    **_common,
-)
-@register_kernel(
-    "moe",
-    "experts",
-    name="gluon_gemm_combine",
-    features={"ragged_metadata", "gemm_combine"},
-    **_common,
-)
 def _gluon_mxfp_ragged_matmul(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -4537,53 +4452,11 @@ def _gluon_mxfp_ragged_matmul(
     return
 
 
-_GLUON_FUSED_SIGNATURES = frozenset(
-    {
-        format_signature(
-            x=dense_tensor_format(torch.bfloat16),
-            weight=_FUSED_WEIGHT_MXFP4,
-        ),
-        format_signature(
-            x=dense_tensor_format(torch.float16),
-            weight=_FUSED_WEIGHT_MXFP4,
-        ),
-        format_signature(
-            x=tensor_format(
-                "scaled-fp8",
-                torch.float8_e4m3fn,
-                scale=_FP8_PER_TENSOR_SCALE_FORMAT,
-            ),
-            weight=_FUSED_WEIGHT_MXFP4,
-        ),
-        format_signature(
-            x=tensor_format(
-                "scaled-fp8",
-                torch.float8_e4m3fnuz,
-                scale=_FP8_PER_TENSOR_SCALE_FORMAT,
-            ),
-            weight=_FUSED_WEIGHT_MXFP4,
-        ),
-    }
-)
+gluon_dispatch_gemm = _gluon_mxfp_ragged_matmul
+gluon_gemm_combine = _gluon_mxfp_ragged_matmul
 
 
-@register_kernel(
-    "moe",
-    "fused",
-    name="gluon_mxfp4_fp8_fused_moe",
-    features={"self_routing"},
-    solution="gluon",
-    capability=CapabilityRequirement(
-        vendors=frozenset({"amd"}),
-        min_arch_version=ArchVersion(9, 5),
-        max_arch_version=ArchVersion(9, 5),
-    ),
-    signatures=_GLUON_FUSED_SIGNATURES,
-    traits={"activation_dtype": frozenset({"fp8"})},
-    priority=_kernel_priority(),
-    tags={"throughput", "latency"},
-)
-def _gluon_mxfp_fused_moe(
+def gluon_mxfp4_fp8_fused_moe(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     w13_weight,
@@ -4615,23 +4488,19 @@ def _gluon_mxfp_fused_moe(
         top_k: routing top_k.
         swiglu_alpha / swiglu_limit: SwiGLU activation parameters.
 
-    Lazy-imports the top-level ``moe_route`` / ``moe_experts`` /
-    ``quantize_fp8`` to avoid a circular import (this module is imported
-    by ``tokenspeed_kernel.ops.moe.__init__`` which defines those).
+    Directly calls the routing, dispatch GEMM, and combine GEMM helpers used
+    by this backend.
     """
-    # Lazy imports to avoid the circular dependency described above.
-    from tokenspeed_kernel import quantize_fp8
-    from tokenspeed_kernel.ops.moe import moe_experts, moe_route
+    from tokenspeed_kernel.ops.moe.triton_kernels import triton_kernels_routing
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
 
     n_tokens = router_logits.shape[0]
 
-    ragged_metadata, gather_indx, scatter_indx, gate_scal = moe_route(
+    ragged_metadata, gather_indx, scatter_indx, gate_scal = triton_kernels_routing(
         router_logits,
         top_k,
         sm_first=False,
         dtype=router_logits.dtype,
-        traits={"output_type": "ragged_metadata"},
-        expected_kernel_name="triton_kernels_routing",
     )
 
     act = FusedActivation(
@@ -4648,9 +4517,7 @@ def _gluon_mxfp_fused_moe(
             solution="triton",
         )
 
-    gluon_traits = {"weight_dtype": "mxfp4"}
-
-    intermediate_cache = moe_experts(
+    intermediate_cache = gluon_dispatch_gemm(
         gemm1_input,
         w13_weight,
         w13_bias,
@@ -4658,12 +4525,6 @@ def _gluon_mxfp_fused_moe(
         gather_indx=gather_indx,
         precision_config=w13_precision_config,
         fused_activation=act,
-        dtype=gemm1_input.dtype,
-        weight_format="mxfp4",
-        fp8_scale_granularity="tensor",
-        features={"ragged_metadata", "dispatch_gemm"},
-        traits=gluon_traits,
-        expected_kernel_name="gluon_dispatch_gemm",
         out_quant_scale=w2_act_scale,
     )
 
@@ -4681,7 +4542,7 @@ def _gluon_mxfp_fused_moe(
             solution="triton",
         )
 
-    return moe_experts(
+    return gluon_gemm_combine(
         gemm2_input,
         w2_weight,
         w2_bias,
@@ -4691,10 +4552,4 @@ def _gluon_mxfp_fused_moe(
         gammas=gate_scal,
         n_tokens=n_tokens,
         n_expts_act=top_k,
-        dtype=gemm2_input.dtype,
-        weight_format="mxfp4",
-        fp8_scale_granularity="tensor",
-        features={"ragged_metadata", "gemm_combine"},
-        traits=gluon_traits,
-        expected_kernel_name="gluon_gemm_combine",
     )

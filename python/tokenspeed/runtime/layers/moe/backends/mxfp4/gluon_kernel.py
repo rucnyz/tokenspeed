@@ -22,10 +22,10 @@ from __future__ import annotations
 
 import os
 
-import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.ops.moe.gluon import (
     _extract_gluon_raw_w,
+    gluon_mxfp4_fp8_fused_moe,
     shuffle_weight_for_gluon_dot_layout,
 )
 from tokenspeed_kernel.ops.moe.triton_kernels import (
@@ -227,19 +227,9 @@ class Mxfp4GluonKernelBackend(Mxfp4TritonKernelBackend):
         swiglu_alpha = self._swiglu_arg.alpha if self._swiglu_arg else 1.702
         swiglu_limit = self._swiglu_arg.limit if self._swiglu_arg else 7.0
 
-        # All of routing, dispatch GEMM (with fused SwiGLU + FP8 output
-        # quant) and combine GEMM are encapsulated by the registered
-        # ``gluon_mxfp4_fp8_fused_moe`` kernel.  The ``self_routing``
-        # feature + ``activation_dtype=fp8`` trait + (bf16/fp16 dense or
-        # FP8 per-tensor x, mxfp4 weight) signature uniquely select the
-        # gluon implementation on gfx950.  When ``hidden_states`` is
-        # already FP8 (e.g. fused into an upstream layer), advertise the
-        # per-tensor FP8 input so the matching signature is built.
-        is_fp8_input = hidden_states.dtype in (
-            torch.float8_e4m3fn,
-            torch.float8_e4m3fnuz,
-        )
-        return tokenspeed_kernel.moe_fused(
+        # The concrete Gluon helper owns routing, dispatch GEMM with fused
+        # SwiGLU + FP8 output quantization, and combine GEMM.
+        return gluon_mxfp4_fp8_fused_moe(
             hidden_states,
             router_logits,
             layer.w13_weight_triton_tensor,
@@ -253,12 +243,6 @@ class Mxfp4GluonKernelBackend(Mxfp4TritonKernelBackend):
             top_k=top_k,
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
-            dtype=hidden_states.dtype,
-            weight_format="mxfp4",
-            fp8_scale_granularity="tensor" if is_fp8_input else "block",
-            features={"self_routing"},
-            traits={"activation_dtype": "fp8"},
-            expected_kernel_name="gluon_mxfp4_fp8_fused_moe",
         )
 
 

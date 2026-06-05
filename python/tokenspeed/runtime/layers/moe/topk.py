@@ -23,14 +23,19 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import NamedTuple, Protocol, runtime_checkable
 
-import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.numerics.reference.moe import _mask_topk_ids_padded_region
+from tokenspeed_kernel.numerics.reference.moe import (
+    _mask_topk_ids_padded_region,
+    grouped_topk_gpu,
+    torch_native_fused_topk,
+)
 from tokenspeed_kernel.ops.moe import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
     transform_select_experts_inputs,
 )
+from tokenspeed_kernel.ops.moe.cuda import cuda_routing_flash
+from tokenspeed_kernel.ops.moe.triton import minimax_biased_grouped_topk
 
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
@@ -239,7 +244,7 @@ def select_experts(
         assert topk_group is not None
         assert num_expert_group is not None
         if correction_bias is None:
-            topk_weights, topk_ids = tokenspeed_kernel.moe_route(
+            topk_weights, topk_ids = grouped_topk_gpu(
                 hidden_states,
                 router_logits,
                 topk=top_k,
@@ -251,27 +256,9 @@ def select_experts(
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-                dtype=router_logits.dtype,
-                traits={
-                    "output_type": "topk",
-                    "biased": False,
-                    "grouped": True,
-                    "ep": True,
-                },
-                expected_kernel_name="torch_compile_grouped_topk",
             )
         else:
-            route_traits = {
-                "output_type": "topk",
-                "biased": True,
-                "grouped": True,
-                "ep": True,
-                "num_expert_group": num_expert_group,
-                "topk_group": topk_group,
-                "topk": top_k,
-                "num_fused_shared_experts": num_fused_shared_experts,
-            }
-            topk_weights, topk_ids = tokenspeed_kernel.moe_route(
+            topk_weights, topk_ids = minimax_biased_grouped_topk(
                 hidden_states,
                 router_logits,
                 correction_bias,
@@ -284,28 +271,18 @@ def select_experts(
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-                dtype=router_logits.dtype,
-                traits=route_traits,
             )
     elif torch_native and custom_routing_function is None:
         assert (
             num_token_non_padded is None
         ), "num_token_non_padded is not yet supported in fused_topk_native"
         assert expert_location_dispatch_info is None
-        topk_weights, topk_ids = tokenspeed_kernel.moe_route(
+        topk_weights, topk_ids = torch_native_fused_topk(
             hidden_states,
             router_logits,
             topk=top_k,
             renormalize=renormalize,
             correction_bias=correction_bias,
-            dtype=router_logits.dtype,
-            traits={
-                "output_type": "topk",
-                "biased": False,
-                "grouped": False,
-                "ep": False,
-            },
-            expected_kernel_name="torch_native_fused_topk",
         )
         if apply_routed_scaling_factor_on_output and routed_scaling_factor is not None:
             topk_weights *= routed_scaling_factor
@@ -322,7 +299,7 @@ def select_experts(
             num_tokens, top_k, device=router_logits.device, dtype=torch.float32
         )
         num_real_experts = router_logits.shape[1] - topk_config.zero_expert_num
-        tokenspeed_kernel.moe_route(
+        cuda_routing_flash(
             router_logits,
             correction_bias,
             topk_ids,
@@ -330,29 +307,13 @@ def select_experts(
             num_real_experts,
             routed_scaling_factor,
             False,
-            dtype=router_logits.dtype,
-            traits={
-                "output_type": "topk",
-                "biased": True,
-                "grouped": False,
-                "ep": False,
-            },
-            expected_kernel_name="cuda_routing_flash",
         )
     elif custom_routing_function is None:
-        topk_weights, topk_ids = tokenspeed_kernel.moe_route(
+        topk_weights, topk_ids = torch_native_fused_topk(
             hidden_states,
             router_logits,
             topk=top_k,
             renormalize=renormalize,
-            dtype=router_logits.dtype,
-            traits={
-                "output_type": "topk",
-                "biased": False,
-                "grouped": False,
-                "ep": False,
-            },
-            expected_kernel_name="torch_native_fused_topk",
         )
         if apply_routed_scaling_factor_on_output and routed_scaling_factor is not None:
             topk_weights *= routed_scaling_factor

@@ -31,19 +31,10 @@ import pytest
 
 # GEMM
 import tokenspeed_kernel.numerics.reference.gemm
-import tokenspeed_kernel.numerics.reference.moe as _moe_reference
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.deep_gemm
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
-
-# MoE
-import tokenspeed_kernel.ops.moe as _moe_pkg
-import tokenspeed_kernel.ops.moe.cuda
-import tokenspeed_kernel.ops.moe.deepep
-import tokenspeed_kernel.ops.moe.flashinfer
-import tokenspeed_kernel.ops.moe.triton
-import tokenspeed_kernel.ops.moe.triton_kernels
 import torch
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
@@ -57,14 +48,6 @@ from tokenspeed_kernel.signature import FormatSignature
 # ---------------------------------------------------------------------------
 
 _RELOAD_MODULES = [
-    # MoE
-    _moe_reference,
-    tokenspeed_kernel.ops.moe.cuda,
-    tokenspeed_kernel.ops.moe.triton,
-    tokenspeed_kernel.ops.moe.triton_kernels,
-    tokenspeed_kernel.ops.moe.flashinfer,
-    tokenspeed_kernel.ops.moe.deepep,
-    _moe_pkg,  # re-registers _MoEOracle
     # GEMM
     tokenspeed_kernel.numerics.reference.gemm,
     tokenspeed_kernel.ops.gemm.deep_gemm,
@@ -87,11 +70,6 @@ def _kernel_registry(fresh_registry):
 
 # Maps ``tokenspeed_kernel.<attr>(...)`` to ``(family, mode)``.
 _API_MAP: dict[str, tuple[str, str]] = {
-    "moe_route": ("moe", "route"),
-    "moe_dispatch": ("moe", "dispatch"),
-    "moe_experts": ("moe", "experts"),
-    "moe_combine": ("moe", "combine"),
-    "moe_fused": ("moe", "fused"),
     "mm": ("gemm", "mm"),
 }
 
@@ -253,41 +231,7 @@ _AUTO_SITES = _collect_call_sites(_SEARCH_DIR)
 
 # Call sites that cannot be statically extracted (partial wrappers, variable
 # expected_kernel_name, oracle-dependent num_tokens branching, etc.)
-_MANUAL_CALL_SITES: list[CallSite] = [
-    # -- MoE --
-    # fp8/triton.py: partial(tokenspeed_kernel.moe_experts, **experts_common)
-    (
-        "moe",
-        "experts",
-        torch.bfloat16,
-        {"dispatch_sorted"},
-        {},
-        None,
-        "triton_moe_fused_experts",
-        "manual:fp8_triton/experts",
-    ),
-    # fp8/triton.py: moe_combine(..., expected_kernel_name=expected_combine_kernel)
-    (
-        "moe",
-        "combine",
-        torch.bfloat16,
-        None,
-        {"num_tokens": 128, "comm_strategy": None},
-        None,
-        "triton_moe_sum_reduce",
-        "manual:fp8_triton/combine_large",
-    ),
-    (
-        "moe",
-        "combine",
-        torch.bfloat16,
-        None,
-        {"num_tokens": 8, "comm_strategy": None},
-        None,
-        "torch_compile_moe_sum_reduce",
-        "manual:fp8_triton/combine_small",
-    ),
-]
+_MANUAL_CALL_SITES: list[CallSite] = []
 
 _ALL_SITES = _AUTO_SITES + _MANUAL_CALL_SITES
 
@@ -343,8 +287,6 @@ def _infer_format_signature(
     weight_format: Optional[str],
     spec,
 ) -> FormatSignature:
-    if family == "moe" and mode == "fused":
-        return _moe_pkg._moe_fused_format_signature(dtype, weight_format or "bf16")
     signature = _format_signature_for_any_role(spec, dtype)
     if signature is None:
         pytest.skip(f"Kernel {spec.name!r} has no signature for {dtype}")

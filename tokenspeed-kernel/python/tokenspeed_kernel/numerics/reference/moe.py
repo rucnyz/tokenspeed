@@ -28,33 +28,22 @@ from tokenspeed_kernel.ops.moe.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
-from tokenspeed_kernel.torch_compile import get_compiler_backend
+
+__all__ = [
+    "_mask_topk_ids_padded_region",
+    "biased_grouped_topk_gpu",
+    "fused_topk_bias",
+    "fused_topk_torch_native",
+    "grouped_topk_gpu",
+    "torch_compile_biased_grouped_topk",
+    "torch_native_fused_topk",
+]
 
 # ---------------------------------------------------------------------------
 # Routing kernels
 # ---------------------------------------------------------------------------
 
 
-@register_kernel(
-    "moe",
-    "route",
-    name="torch_compile_fused_topk_bias",
-    solution="reference",
-    signatures=format_signatures(
-        "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
-    ),
-    traits={
-        "output_type": frozenset({"topk"}),
-        "biased": frozenset({True}),
-        "grouped": frozenset({False}),
-        "ep": frozenset({True, False}),
-    },
-    priority=Priority.PORTABLE + 3,
-    tags={"portability", "determinism"},
-)
-@torch.compile(dynamic=True, backend=get_compiler_backend())
 def fused_topk_bias(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -81,23 +70,6 @@ def fused_topk_bias(
     ).to(hidden_states.device)
 
 
-@register_kernel(
-    "moe",
-    "route",
-    name="torch_native_fused_topk",
-    solution="reference",
-    signatures=format_signatures(
-        "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
-    ),
-    traits={
-        "output_type": frozenset({"topk"}),
-        "biased": frozenset({True, False}),
-        "grouped": frozenset({False}),
-        "ep": frozenset({False}),
-    },
-    priority=Priority.PORTABLE + 1,
-    tags={"portability", "determinism"},
-)
 def fused_topk_torch_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -130,6 +102,9 @@ def fused_topk_torch_native(
     return topk_weights, topk_ids
 
 
+torch_native_fused_topk = fused_topk_torch_native
+
+
 def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -141,24 +116,6 @@ def _mask_topk_ids_padded_region(
 
 
 # This is used by the Deepseek V2/V3/R1 series models
-@register_kernel(
-    "moe",
-    "route",
-    name="torch_compile_grouped_topk",
-    solution="reference",
-    signatures=format_signatures(
-        "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
-    ),
-    traits={
-        "output_type": frozenset({"topk"}),
-        "biased": frozenset({False}),
-        "grouped": frozenset({True}),
-        "ep": frozenset({True, False}),
-    },
-    priority=Priority.PORTABLE + 3,
-    tags={"portability", "determinism"},
-)
-@torch.compile(dynamic=True, backend=get_compiler_backend())
 def grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -224,24 +181,6 @@ def grouped_topk_gpu(
     return topk_weights, topk_ids
 
 
-@register_kernel(
-    "moe",
-    "route",
-    name="torch_compile_biased_grouped_topk",
-    solution="reference",
-    signatures=format_signatures(
-        "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
-    ),
-    traits={
-        "output_type": frozenset({"topk"}),
-        "biased": frozenset({True}),
-        "grouped": frozenset({True}),
-        "ep": frozenset({True, False}),
-    },
-    priority=Priority.PORTABLE + 3,
-    tags={"portability", "determinism"},
-)
-@torch.compile(dynamic=True, backend=get_compiler_backend())
 def biased_grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -315,3 +254,6 @@ def biased_grouped_topk_gpu(
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
+
+
+torch_compile_biased_grouped_topk = biased_grouped_topk_gpu

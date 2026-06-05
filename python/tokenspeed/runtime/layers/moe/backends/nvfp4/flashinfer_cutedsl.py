@@ -20,11 +20,11 @@
 
 from __future__ import annotations
 
-import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.ops.communication.deep_ep import DeepEPDispatcher, DeepEPMode
 from tokenspeed_kernel.ops.moe.flashinfer import autotune as flashinfer_autotune
 from tokenspeed_kernel.ops.moe.flashinfer import (
+    cutedsl_nvfp4_fused_moe,
     grouped_gemm_nt_masked,
     scaled_fp4_grouped_quantize,
     silu_and_mul_scaled_nvfp4_experts_quantize,
@@ -407,7 +407,7 @@ class Nvfp4FlashinferCuteDslBackend(MoEBackend):
         use_cuda_graph=False,
         capacity=None,
     ):
-        return tokenspeed_kernel.moe_fused(
+        return cutedsl_nvfp4_fused_moe(
             x_fp4,
             x_scale,
             topk_ids,
@@ -426,15 +426,6 @@ class Nvfp4FlashinferCuteDslBackend(MoEBackend):
             output_dtype=output_dtype,
             use_cuda_graph=use_cuda_graph,
             capacity=capacity,
-            dtype=x_fp4.dtype,
-            features={"pre_routed"},
-            weight_format="nvfp4",
-            traits={
-                "tp": False,
-                "ep": True,
-                "cuda_graph": True,
-            },
-            expected_kernel_name="flashinfer_cutedsl_nvfp4_fused_moe",
         )
 
     def _get_deepep_executor(self, layer: nn.Module):

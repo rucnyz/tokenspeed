@@ -20,10 +20,10 @@
 
 from __future__ import annotations
 
-import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.ops.moe.flashinfer import ActivationType
 from tokenspeed_kernel.ops.moe.flashinfer import autotune as flashinfer_autotune
+from tokenspeed_kernel.ops.moe.flashinfer import flashinfer_cutlass_fused_moe
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -85,7 +85,7 @@ class Fp16FlashinferCutlassBackend(MoEBackend):
             del temp_w
 
     def _call_cutlass_kernel(self, x, layer, topk_output):
-        return tokenspeed_kernel.moe_fused(
+        return flashinfer_cutlass_fused_moe(
             input=x,
             token_selected_experts=topk_output.topk_ids.to(torch.int),
             token_final_scales=topk_output.topk_weights,
@@ -99,15 +99,6 @@ class Fp16FlashinferCutlassBackend(MoEBackend):
             tp_rank=self._tp_rank,
             tune_max_num_tokens=max(8192, next_power_of_2(x.shape[0])),
             activation_type=ActivationType.Swiglu,
-            dtype=x.dtype,
-            features={"pre_routed"},
-            weight_format="fp16",
-            traits={
-                "tp": True,
-                "ep": True,
-                "cuda_graph": False,
-            },
-            expected_kernel_name="flashinfer_cutlass_fused_moe",
         )[0]
 
     def forward(

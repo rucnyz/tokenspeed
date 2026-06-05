@@ -30,13 +30,6 @@ from tokenspeed_kernel.ops.attention import (
     mha_prefill,
 )
 from tokenspeed_kernel.ops.gemm import mm
-from tokenspeed_kernel.ops.moe import (
-    moe_combine,
-    moe_dispatch,
-    moe_experts,
-    moe_fused,
-    moe_route,
-)
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     quantize_fp8_with_scale,
@@ -48,12 +41,6 @@ from tokenspeed_kernel.ops.quantization import (
 __all__ = [
     # gemm
     "mm",
-    # moe
-    "moe_route",
-    "moe_dispatch",
-    "moe_experts",
-    "moe_combine",
-    "moe_fused",
     # attention
     "mha_prefill",
     "mha_extend_with_kvcache",

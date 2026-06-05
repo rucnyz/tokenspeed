@@ -20,15 +20,13 @@
 
 from __future__ import annotations
 
-import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.moe.flashinfer import (
-    _maybe_get_cached_w3_w1_permute_indices,
-)
 from tokenspeed_kernel.ops.moe.flashinfer import autotune as flashinfer_autotune
 from tokenspeed_kernel.ops.moe.flashinfer import (
     convert_to_block_layout,
+    flashinfer_trtllm_bf16_fused_moe,
     get_w2_permute_indices_with_cache,
+    maybe_get_cached_w3_w1_permute_indices,
 )
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
@@ -113,7 +111,7 @@ class Fp16FlashinferTrtllmBackend(MoEBackend):
         new_shape_w2 = None
 
         for idx in range(num_experts):
-            permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+            permute_indices = maybe_get_cached_w3_w1_permute_indices(
                 cache_permute_indices,
                 layer.w13_weight.data[idx].view(torch.uint8),
                 epilogue_tile_m,
@@ -178,7 +176,7 @@ class Fp16FlashinferTrtllmBackend(MoEBackend):
         routing_logits = router_logits.to(self._routing_logits_dtype)
         routing_bias = self._correction_bias
 
-        output = tokenspeed_kernel.moe_fused(
+        output = flashinfer_trtllm_bf16_fused_moe(
             routing_logits=routing_logits,
             routing_bias=routing_bias,
             hidden_states=x,
@@ -195,10 +193,6 @@ class Fp16FlashinferTrtllmBackend(MoEBackend):
             routing_method_type=self._routing_method_type,
             do_finalize=do_finalize,
             tune_max_num_tokens=next_power_of_2(x.shape[0]),
-            dtype=x.dtype,
-            features={"self_routing"},
-            weight_format="fp16",
-            expected_kernel_name="flashinfer_trtllm_bf16_fused_moe",
         )
         if do_finalize:
             return output[0] if isinstance(output, (list, tuple)) else output

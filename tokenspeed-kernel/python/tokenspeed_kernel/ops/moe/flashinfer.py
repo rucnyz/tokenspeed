@@ -20,108 +20,10 @@
 
 from __future__ import annotations
 
-import torch
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
-from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
-from tokenspeed_kernel.signature import (
-    ScaleFormat,
-    dense_tensor_format,
-    format_signature,
-    tensor_format,
-)
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import error_fn
 
 platform = current_platform()
-
-_NVIDIA_CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia"}))
-
-
-_FP8_SCALE = ScaleFormat(
-    storage_dtype=torch.float32,
-    granularity="block",
-    block_shape=(128, 128),
-)
-_NVFP4_SCALE = ScaleFormat(
-    storage_dtype=torch.float32,
-    granularity="block",
-    block_shape=(16,),
-)
-_MXFP4_SCALE = ScaleFormat(
-    storage_dtype=torch.uint8,
-    granularity="block",
-    block_shape=(32,),
-)
-_TRTLLM_FP16_FUSED_FORMAT_SIGNATURES = frozenset(
-    {
-        format_signature(
-            x=dense_tensor_format(torch.bfloat16),
-            weight=dense_tensor_format(torch.bfloat16),
-        )
-    }
-)
-_CUTLASS_FUSED_FORMAT_SIGNATURES = frozenset(
-    {
-        format_signature(
-            x=dense_tensor_format(torch.bfloat16),
-            weight=dense_tensor_format(torch.bfloat16),
-        ),
-        format_signature(
-            x=dense_tensor_format(torch.float16),
-            weight=dense_tensor_format(torch.float16),
-        ),
-        format_signature(
-            x=dense_tensor_format(torch.bfloat16),
-            weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
-        ),
-        format_signature(
-            x=dense_tensor_format(torch.float16),
-            weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
-        ),
-        format_signature(
-            x=dense_tensor_format(torch.bfloat16),
-            weight=tensor_format("scaled-fp8", torch.float8_e4m3fn, scale=_FP8_SCALE),
-        ),
-        format_signature(
-            x=dense_tensor_format(torch.float16),
-            weight=tensor_format("scaled-fp8", torch.float8_e4m3fn, scale=_FP8_SCALE),
-        ),
-        format_signature(
-            x=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
-            weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
-        ),
-        format_signature(
-            x=tensor_format("scaled-fp8", torch.float8_e4m3fn, scale=_FP8_SCALE),
-            weight=tensor_format("scaled-fp8", torch.float8_e4m3fn, scale=_FP8_SCALE),
-        ),
-    }
-)
-_FP4_FUSED_FORMAT_SIGNATURES = frozenset(
-    {
-        format_signature(
-            x=dense_tensor_format(torch.bfloat16),
-            weight=tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE),
-        ),
-        format_signature(
-            x=dense_tensor_format(torch.bfloat16),
-            weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
-        ),
-        format_signature(
-            x=tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE),
-            weight=tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE),
-        ),
-        format_signature(
-            x=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
-            weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
-        ),
-    }
-)
-_CUTEDSL_NVFP4_FORMAT_SIGNATURES = frozenset(
-    {
-        format_signature(
-            x=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
-            weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
-        )
-    }
-)
 
 cutlass_fused_moe = error_fn
 fp4_quantize = error_fn
@@ -129,112 +31,49 @@ mxfp8_quantize = error_fn
 nvfp4_block_scale_interleave = error_fn
 trtllm_bf16_moe = error_fn
 trtllm_fp4_block_scale_moe = error_fn
+flashinfer_cutlass_fused_moe = error_fn
+flashinfer_trtllm_bf16_fused_moe = error_fn
+flashinfer_trtllm_fp4_fused_moe = error_fn
+cutedsl_nvfp4_fused_moe = error_fn
 autotune = None
 scaled_fp4_grouped_quantize = error_fn
 silu_and_mul_scaled_nvfp4_experts_quantize = error_fn
 grouped_gemm_nt_masked = error_fn
 ActivationType = error_fn
-_maybe_get_cached_w3_w1_permute_indices = error_fn
+maybe_get_cached_w3_w1_permute_indices = error_fn
 get_w2_permute_indices_with_cache = error_fn
 convert_to_block_layout = error_fn
 
 if platform.is_nvidia:
-    try:
-        from flashinfer import (
-            cutlass_fused_moe,
-            fp4_quantize,
-            mxfp8_quantize,
-            nvfp4_block_scale_interleave,
-            trtllm_bf16_moe,
-            trtllm_fp4_block_scale_moe,
-        )
-    except ImportError:
-        pass
-
-    try:
-        from flashinfer.autotuner import autotune
-    except ImportError:
-        pass
-
-    try:
-        from flashinfer.cute_dsl import scaled_fp4_grouped_quantize
-    except ImportError:
-        pass
-
-    try:
-        from flashinfer.cute_dsl import silu_and_mul_scaled_nvfp4_experts_quantize
-    except ImportError:
-        pass
-
-    try:
-        from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
-    except ImportError:
-        pass
-
-    try:
-        from flashinfer.fused_moe.core import (
-            ActivationType,
-            _maybe_get_cached_w3_w1_permute_indices,
-            get_w2_permute_indices_with_cache,
-        )
-    except ImportError:
-        pass
-
-    try:
-        from flashinfer.fused_moe.core import convert_to_block_layout
-    except ImportError:
-        pass
-
-if trtllm_bf16_moe is not error_fn:
-    trtllm_bf16_moe = register_kernel(
-        "moe",
-        "fused",
-        name="flashinfer_trtllm_bf16_fused_moe",
-        features={"self_routing"},
-        solution="trtllm",
-        capability=_NVIDIA_CAPABILITY,
-        signatures=_TRTLLM_FP16_FUSED_FORMAT_SIGNATURES,
-        traits={},
-        priority=Priority.SPECIALIZED,
-        tags={"throughput"},
-    )(trtllm_bf16_moe)
-
-if cutlass_fused_moe is not error_fn:
-    flashinfer_cutlass_fused_moe = register_kernel(
-        "moe",
-        "fused",
-        name="flashinfer_cutlass_fused_moe",
-        features={"pre_routed"},
-        solution="flashinfer",
-        capability=_NVIDIA_CAPABILITY,
-        signatures=_CUTLASS_FUSED_FORMAT_SIGNATURES,
-        traits={
-            "tp": frozenset({True, False}),
-            "ep": frozenset({True, False}),
-            "cuda_graph": frozenset({False}),
-        },
-        priority=Priority.SPECIALIZED,
-        tags={"throughput"},
-    )(cutlass_fused_moe)
-
-if trtllm_fp4_block_scale_moe is not error_fn:
-    trtllm_fp4_block_scale_moe = register_kernel(
-        "moe",
-        "fused",
-        name="flashinfer_trtllm_fp4_fused_moe",
-        features={"self_routing"},
-        solution="trtllm",
-        capability=_NVIDIA_CAPABILITY,
-        signatures=_FP4_FUSED_FORMAT_SIGNATURES,
-        traits={},
-        priority=Priority.SPECIALIZED,
-        tags={"throughput"},
-    )(trtllm_fp4_block_scale_moe)
-
-try:
-    if not platform.is_nvidia:
-        raise ImportError
+    from flashinfer import (
+        cutlass_fused_moe,
+        fp4_quantize,
+        mxfp8_quantize,
+        nvfp4_block_scale_interleave,
+        trtllm_bf16_moe,
+        trtllm_fp4_block_scale_moe,
+    )
+    from flashinfer.autotuner import autotune
+    from flashinfer.cute_dsl import (
+        scaled_fp4_grouped_quantize,
+        silu_and_mul_scaled_nvfp4_experts_quantize,
+    )
+    from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
     from flashinfer.fused_moe import CuteDslMoEWrapper
+    from flashinfer.fused_moe.core import (
+        ActivationType,
+    )
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices as maybe_get_cached_w3_w1_permute_indices,
+    )
+    from flashinfer.fused_moe.core import (
+        convert_to_block_layout,
+        get_w2_permute_indices_with_cache,
+    )
+
+    flashinfer_trtllm_bf16_fused_moe = trtllm_bf16_moe
+    flashinfer_cutlass_fused_moe = cutlass_fused_moe
+    flashinfer_trtllm_fp4_fused_moe = trtllm_fp4_block_scale_moe
 
     _cutedsl_wrapper_cache: dict[tuple, CuteDslMoEWrapper] = {}
 
@@ -253,22 +92,6 @@ try:
             _cutedsl_wrapper_cache[cache_key] = CuteDslMoEWrapper(**wrapper_kwargs)
         return _cutedsl_wrapper_cache[cache_key]
 
-    @register_kernel(
-        "moe",
-        "fused",
-        name="flashinfer_cutedsl_nvfp4_fused_moe",
-        features={"pre_routed"},
-        solution="cutedsl",
-        capability=_NVIDIA_CAPABILITY,
-        signatures=_CUTEDSL_NVFP4_FORMAT_SIGNATURES,
-        traits={
-            "tp": frozenset({False}),
-            "ep": frozenset({True, False}),
-            "cuda_graph": frozenset({True, False}),
-        },
-        priority=Priority.SPECIALIZED,
-        tags={"throughput"},
-    )
     def cutedsl_nvfp4_fused_moe(
         x_fp4,
         x_scale,
@@ -321,5 +144,18 @@ try:
             tactic=None,
         )
 
-except ImportError:
-    pass
+
+__all__ = [
+    "ActivationType",
+    "autotune",
+    "convert_to_block_layout",
+    "cutedsl_nvfp4_fused_moe",
+    "flashinfer_cutlass_fused_moe",
+    "flashinfer_trtllm_bf16_fused_moe",
+    "flashinfer_trtllm_fp4_fused_moe",
+    "get_w2_permute_indices_with_cache",
+    "grouped_gemm_nt_masked",
+    "maybe_get_cached_w3_w1_permute_indices",
+    "scaled_fp4_grouped_quantize",
+    "silu_and_mul_scaled_nvfp4_experts_quantize",
+]

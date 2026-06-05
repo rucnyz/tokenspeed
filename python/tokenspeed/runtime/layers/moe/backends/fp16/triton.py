@@ -22,9 +22,13 @@ from __future__ import annotations
 
 from functools import partial
 
-import tokenspeed_kernel
 import torch
 import triton.language as tl
+from tokenspeed_kernel.ops.moe.triton import (
+    triton_moe_align_block_size,
+    triton_moe_fused_experts,
+    triton_moe_sum_reduce,
+)
 from torch import nn
 
 from tokenspeed.runtime.layers.activation import silu_and_mul
@@ -78,10 +82,8 @@ def _build_triton_gemms(
         per_channel_quant=False,
         block_shape=None,
         filter_expert=True,
-        features={"dispatch_sorted"},
-        expected_kernel_name="triton_moe_fused_experts",
     )
-    gemm = partial(tokenspeed_kernel.moe_experts, **experts_common)
+    gemm = partial(triton_moe_fused_experts, **experts_common)
     gate_up_gemm = partial(
         gemm,
         A_scale=None,
@@ -152,14 +154,10 @@ def _triton_forward(
     gate_up_moe_use_tma = config is not None and config.pop("USE_TMA", False)
     down_moe_use_tma = down_config is not None and down_config.pop("USE_TMA", False)
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = (
-        tokenspeed_kernel.moe_dispatch(
-            topk_ids,
-            config["BLOCK_SIZE_M"],
-            num_experts,
-            dtype=torch.int32,
-            expected_kernel_name="triton_moe_align_block_size",
-        )
+    sorted_token_ids, expert_ids, num_tokens_post_padded = triton_moe_align_block_size(
+        topk_ids,
+        config["BLOCK_SIZE_M"],
+        num_experts,
     )
 
     max_num_active_experts = min(m_tokens * top_k, num_experts + 1)
@@ -224,17 +222,11 @@ def _triton_forward(
     )
 
     out_hidden_states = torch.empty_like(hidden_states)
-    expected_combine_kernel = (
-        "torch_compile_moe_sum_reduce" if m_tokens <= 32 else "triton_moe_sum_reduce"
-    )
     routed_scaling_factor = 1.0
-    tokenspeed_kernel.moe_combine(
+    triton_moe_sum_reduce(
         intermediate_cache3,
         out_hidden_states,
         routed_scaling_factor,
-        dtype=dtype,
-        traits={"num_tokens": m_tokens, "comm_strategy": None},
-        expected_kernel_name=expected_combine_kernel,
     )
     return out_hidden_states
 

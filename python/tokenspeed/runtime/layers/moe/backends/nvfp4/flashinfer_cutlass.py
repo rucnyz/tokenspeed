@@ -20,9 +20,11 @@
 
 from __future__ import annotations
 
-import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.moe.flashinfer import ActivationType
+from tokenspeed_kernel.ops.moe.flashinfer import (
+    ActivationType,
+    flashinfer_cutlass_fused_moe,
+)
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -100,7 +102,7 @@ class Nvfp4FlashinferCutlassBackend(MoEBackend):
             x.shape[0], output_col, dtype=output_dtype, device=x.device
         )
 
-        return tokenspeed_kernel.moe_fused(
+        return flashinfer_cutlass_fused_moe(
             output=symm_output,
             input=x,
             token_selected_experts=topk_output.topk_ids.to(torch.int),
@@ -123,15 +125,6 @@ class Nvfp4FlashinferCutlassBackend(MoEBackend):
             tp_rank=self.spec.tp_rank,
             tune_max_num_tokens=next_power_of_2(x.shape[0]),
             activation_type=ActivationType.Swiglu,
-            dtype=x.dtype,
-            features={"pre_routed"},
-            weight_format="nvfp4",
-            traits={
-                "tp": True,
-                "ep": True,
-                "cuda_graph": False,
-            },
-            expected_kernel_name="flashinfer_cutlass_fused_moe",
         )[0]
 
 

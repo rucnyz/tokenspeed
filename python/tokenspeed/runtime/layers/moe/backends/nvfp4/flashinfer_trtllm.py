@@ -33,11 +33,11 @@ WAR: Use --moe-backend flashinfer_cutlass instead.
 
 from __future__ import annotations
 
-import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.ops.moe.flashinfer import (
-    _maybe_get_cached_w3_w1_permute_indices,
+    flashinfer_trtllm_fp4_fused_moe,
     get_w2_permute_indices_with_cache,
+    maybe_get_cached_w3_w1_permute_indices,
 )
 from tokenspeed_kernel.ops.quantization.flashinfer import (
     fp4_quantize,
@@ -164,14 +164,14 @@ class Nvfp4FlashinferTrtllmBackend(MoEBackend):
 
         for idx in range(num_experts):
             # W1/W3 (gemm1) weight permutation
-            perm = _maybe_get_cached_w3_w1_permute_indices(
+            perm = maybe_get_cached_w3_w1_permute_indices(
                 cache, w13_fp4[idx].view(torch.uint8), epilogue_tile_m
             )
             w13_weights_shuffled.append(
                 w13_fp4[idx].view(torch.uint8)[perm.to(w13_fp4.device)].contiguous()
             )
             # W1/W3 scale permutation + interleave
-            perm_sf = _maybe_get_cached_w3_w1_permute_indices(
+            perm_sf = maybe_get_cached_w3_w1_permute_indices(
                 cache,
                 w13_scales[idx].view(torch.uint8),
                 epilogue_tile_m,
@@ -303,7 +303,7 @@ class Nvfp4FlashinferTrtllmBackend(MoEBackend):
         routing_logits = topk_output.router_logits.to(self._routing_logits_dtype)
         routing_bias = self._correction_bias
 
-        result = tokenspeed_kernel.moe_fused(
+        result = flashinfer_trtllm_fp4_fused_moe(
             routing_logits=routing_logits,
             routing_bias=routing_bias,
             hidden_states=hs_fp4,
@@ -335,10 +335,6 @@ class Nvfp4FlashinferTrtllmBackend(MoEBackend):
             routing_method_type=self._routing_method_type,
             do_finalize=do_finalize,
             tune_max_num_tokens=next_power_of_2(num_tokens),
-            dtype=x.dtype,
-            features={"self_routing"},
-            weight_format="nvfp4",
-            expected_kernel_name="flashinfer_trtllm_fp4_fused_moe",
         )
         if do_finalize:
             return result[0]

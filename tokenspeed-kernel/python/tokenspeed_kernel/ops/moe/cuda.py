@@ -18,52 +18,27 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Registration of CUDA-based MoE kernels.
-
-The actual implementations live in tokenspeed_kernel.thirdparty.cuda.
-This module imports and registers them so they are discoverable via
-select_kernel("moe", ...).
-"""
+"""CUDA-based MoE helper imports."""
 
 from __future__ import annotations
 
-import torch
-from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.ops.routing.cuda import routing_flash as cuda_routing_flash
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import error_fn
 
-try:
+platform = current_platform()
+
+silu_and_mul_fuse_block_quant = error_fn
+moe_finalize_fuse_shared = error_fn
+
+if platform.is_nvidia:
     from tokenspeed_kernel.thirdparty.cuda.activation import (
         silu_and_mul_fuse_block_quant,
     )
-except ImportError:
-    silu_and_mul_fuse_block_quant = error_fn
-
-try:
     from tokenspeed_kernel.thirdparty.cuda.moe import moe_finalize_fuse_shared
-except ImportError:
-    moe_finalize_fuse_shared = error_fn
 
-# --- CUDA routing_flash (fused softmax + bias + top-k) ---
-try:
-    from tokenspeed_kernel.ops.routing.cuda import routing_flash
-
-    if routing_flash is not error_fn:
-        routing_flash = register_kernel(
-            "moe",
-            "route",
-            name="cuda_routing_flash",
-            solution="cuda",
-            signatures=format_signatures(
-                "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
-            ),
-            traits={
-                "output_type": frozenset({"topk"}),
-                "biased": frozenset({True}),
-                "grouped": frozenset({False}),
-                "ep": frozenset({False}),
-            },
-            priority=Priority.SPECIALIZED + 3,
-            tags={"latency"},
-        )(routing_flash)
-except ImportError:
-    pass
+__all__ = [
+    "cuda_routing_flash",
+    "moe_finalize_fuse_shared",
+    "silu_and_mul_fuse_block_quant",
+]

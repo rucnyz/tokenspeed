@@ -26,8 +26,6 @@ from contextlib import contextmanager
 import torch
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
 
 # Trigger the redirect that aliases ``triton`` -> ``tokenspeed_triton`` for
 # upstream ``triton_kernels`` imports.
@@ -138,44 +136,10 @@ def _matmul(
     return out
 
 
-_matmul_common = dict(
-    solution="triton",
-    signatures=format_signatures(
-        "x", "dense", {torch.float16, torch.bfloat16, torch.uint8}
-    ),
-    priority=Priority.PERFORMANT + 2,
-    tags={"portability"},
-)
-
-register_kernel(
-    "moe",
-    "experts",
-    name="triton_kernels_dispatch_gemm",
-    features={"ragged_metadata", "dispatch_gemm"},
-    **_matmul_common,
-)(_matmul)
-
-register_kernel(
-    "moe",
-    "experts",
-    name="triton_kernels_gemm_combine",
-    features={"ragged_metadata", "gemm_combine"},
-    **_matmul_common,
-)(_matmul)
+triton_kernels_dispatch_gemm = _matmul
+triton_kernels_gemm_combine = _matmul
 
 
-@register_kernel(
-    "moe",
-    "route",
-    name="triton_kernels_routing",
-    solution="triton",
-    signatures=format_signatures(
-        "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
-    ),
-    traits={"output_type": frozenset({"ragged_metadata"})},
-    priority=Priority.PERFORMANT + 2,
-    tags={"portability"},
-)
 def triton_kernels_routing(
     logits: torch.Tensor,
     n_expts_act: int,
@@ -218,5 +182,8 @@ __all__ = [
     "layout",
     "opt_flags",
     "swiglu_fn",
+    "triton_kernels_dispatch_gemm",
+    "triton_kernels_gemm_combine",
+    "triton_kernels_routing",
     "wrap_torch_tensor",
 ]
