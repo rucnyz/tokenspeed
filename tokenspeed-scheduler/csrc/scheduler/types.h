@@ -21,6 +21,7 @@
 #pragma once
 
 #include <optional>
+#include <unordered_map>
 #include <variant>
 #include <cstdint>
 #include <string>
@@ -41,6 +42,8 @@ enum class DisaggregationMode {
     kPrefill,
     kDecode,
 };
+// `PagedCacheGroupFamily` is defined in
+// resource/allocator/paged_cache_group.h (transitively included above).
 
 template <ResourceType>
 class NodeRef;
@@ -64,6 +67,12 @@ struct SchedulerStats {
     std::int64_t active_requests = 0;
 };
 
+// Opt-in spec for the paged-cache prefix-cache adjunct. Unset means paged-cache
+// groups are transport-only (no snapshot chain, no prefix-cache reuse).
+struct PrefixCacheAdjunctSpec {
+    std::vector<std::string> required_groups{};
+};
+
 struct SchedulerConfig {
     std::int32_t page_size{};
     struct {
@@ -76,6 +85,9 @@ struct SchedulerConfig {
 
     std::vector<PagedCacheGroupConfig> paged_cache_groups{};
 
+    // Unset means paged-cache groups are transport-only.
+    std::optional<PrefixCacheAdjunctSpec> prefix_cache_adjunct{};
+
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};
     std::int32_t decode_input_tokens{1};
@@ -83,6 +95,7 @@ struct SchedulerConfig {
     bool enable_l3_storage{false};
     std::int32_t prefetch_threshold{4};  // num pages
     bool enable_kv_cache_events{false};
+    bool enable_mixed_prefill_decode{false};
 
     std::int32_t num_pages_reserved_for_retracted_or_running{};
     Role role{Role::kFused};
@@ -91,6 +104,8 @@ struct SchedulerConfig {
     bool enable_mamba{false};
     std::int32_t mamba_cache_chunk_size{64};
     std::int32_t mamba_pool_total_chunks{0};
+    bool enable_mamba_l2{false};
+    std::int32_t mamba_l2_host_slots{0};
 };
 
 }  // namespace tokenspeed

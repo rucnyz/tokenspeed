@@ -31,6 +31,7 @@ from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.layers.attention.utils import (
+    profile_available_cache_memory_bytes,
     profile_cache_budget,
     profile_max_num_pages,
 )
@@ -61,6 +62,18 @@ def _resolve_max_num_tokens(
             f"(page_size={page_size})"
         )
     return min(profiled_tokens, requested_pages * page_size)
+
+
+def _resolve_draft_cache_cell_size_for_profile(
+    draft_attn_config: BaseAttnConfig | None,
+    draft_model_config: ModelConfig | None,
+    draft_profile_cache_cell_size: int | None,
+) -> int:
+    if draft_profile_cache_cell_size is not None:
+        return draft_profile_cache_cell_size
+    if draft_attn_config is None or draft_model_config is None:
+        return 0
+    return draft_attn_config.cache_cell_size() * draft_model_config.num_attention_layers
 
 
 # ---------- backend registry ----------
@@ -217,10 +230,13 @@ def _create_hybrid_linear_attn(
         config,
     )
 
-    # Create mamba/linear attention backend
-    config.speculative_num_draft_tokens = getattr(
-        server_args, "speculative_num_draft_tokens", 0
-    )
+    # Create mamba/linear attention backend. Only propagate the configured
+    # verify width when spec-dec is actually enabled — matches MLAConfig /
+    # MHAConfig.generate. Otherwise the BaseAttnConfig sentinel (1) wins so
+    # non-spec hybrid decode doesn't get misclassified as target verify /
+    # draft extend by `self.spec_num_tokens > 1`.
+    if server_args.speculative_algorithm is not None:
+        config.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
 
     # Create KV cache pool (only for full attention layers)
     num_full_attn_layers = len(full_attn_layers)
@@ -284,6 +300,12 @@ def _create_hybrid_linear_attn(
             if server_args.speculative_algorithm is not None
             else 0
         ),
+        max_req_pool_size=(
+            server_args.max_num_seqs
+            // max(
+                server_args.data_parallel_size or server_args.mapping.attn.dp_size, 1
+            )
+        ),
     )
     linear_attn_backend.set_pool(mamba_pool)
 
@@ -322,10 +344,15 @@ def create_attn_components(
     architectures = getattr(model_config.hf_config, "architectures", None) or []
     is_hybrid_gdn = any(a in _HYBRID_GDN_ARCHITECTURES for a in architectures)
     is_deepseek_v4_model = is_deepseek_v4(model_config.hf_config)
+    is_deepseek_v4_draft_model = draft_model_config is not None and is_deepseek_v4(
+        draft_model_config.hf_config
+    )
     original_attn_backend = server_args.attention_backend
     if is_deepseek_v4_model:
         server_args.attention_backend = "deepseek_v4"
-    elif is_hybrid_gdn:
+    if is_deepseek_v4_draft_model:
+        server_args.drafter_attention_backend = "deepseek_v4"
+    if is_hybrid_gdn:
         # Qwen3.5 GDN hybrid models always need hybrid_linear_attn.
         # Save the user's original choice for the full-attention sub-backend.
         server_args.attention_backend = "hybrid_linear_attn"
@@ -346,7 +373,9 @@ def create_attn_components(
         )
     num_layers = model_config.num_attention_layers
     deepseek_v4_layout = None
+    draft_deepseek_v4_layout = None
     profile_cache_cell_size = None
+    draft_profile_cache_cell_size = None
     if is_deepseek_v4_model:
         from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
             deepseek_v4_cache_layout_from_config,
@@ -358,8 +387,30 @@ def create_attn_components(
             use_fp4_indexer_cache=_attention_use_fp4_indexer_cache(
                 server_args, model_config.hf_config
             ),
+            layer_indices=range(num_layers),
         )
         profile_cache_cell_size = deepseek_v4_layout.cache_cell_size(num_layers)
+    if is_deepseek_v4_draft_model:
+        from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+            deepseek_v4_cache_layout_from_config,
+        )
+
+        draft_layer_start = draft_model_config.num_hidden_layers
+        draft_num_layers = draft_model_config.num_attention_layers
+        draft_deepseek_v4_layout = deepseek_v4_cache_layout_from_config(
+            draft_model_config.hf_config,
+            page_size=server_args.block_size,
+            use_fp4_indexer_cache=_attention_use_fp4_indexer_cache(
+                server_args, draft_model_config.hf_config
+            ),
+            layer_indices=range(
+                draft_layer_start,
+                draft_layer_start + draft_num_layers,
+            ),
+        )
+        draft_profile_cache_cell_size = draft_deepseek_v4_layout.cache_cell_size(
+            draft_model_config.num_attention_layers
+        )
 
     hf_config = getattr(model_config, "hf_config", None)
     text_config = getattr(hf_config, "text_config", hf_config) if hf_config else None
@@ -387,12 +438,59 @@ def create_attn_components(
         ),
     )
 
-    if has_mamba and server_args.max_mamba_cache_size is not None:
+    if is_deepseek_v4_model:
+        from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+            profile_deepseek_v4_max_num_pages,
+        )
+
+        draft_cache_cell_size = _resolve_draft_cache_cell_size_for_profile(
+            draft_attn_config,
+            draft_model_config,
+            draft_profile_cache_cell_size,
+        )
+        max_total_num_pages = profile_deepseek_v4_max_num_pages(
+            layout=deepseek_v4_layout,
+            hf_config=model_config.hf_config,
+            layer_num=num_layers,
+            max_live_requests=config.max_bs,
+            max_scheduled_tokens=server_args.chunked_prefill_size,
+            max_context_len=config.context_len,
+            available_cache_memory_bytes=profile_available_cache_memory_bytes(
+                attn_config=config,
+                gpu_id=gpu_id,
+                tp_size=server_args.mapping.world_size,
+                gpu_memory_utilization=server_args.gpu_memory_utilization,
+                total_gpu_memory=gpu_memory,
+                world_group=server_args.mapping.world_group,
+            ),
+            draft_cache_cell_size=draft_cache_cell_size,
+        )
+        logger.info(
+            "DeepSeek V4 grouped KV profile: max_live_requests=%s "
+            "(attn config max_bs=%s, attn_dp_size=%s), max_total_num_pages=%s",
+            config.max_bs,
+            config.max_bs,
+            server_args.mapping.attn.dp_size,
+            max_total_num_pages,
+        )
+        max_num_tokens = _resolve_max_num_tokens(
+            max_total_num_pages,
+            server_args.block_size,
+            server_args.max_total_tokens,
+        )
+    elif has_mamba and server_args.max_mamba_cache_size is not None:
         mamba_pool_total_chunks = server_args.max_mamba_cache_size
+        full_attn_layer_ids = getattr(text_config, "full_attention_layer_ids", None)
+        num_kv_layers = (
+            len(full_attn_layer_ids)
+            if full_attn_layer_ids is not None
+            else num_layers - len(mamba_cache_params[4])
+        )
         max_total_num_pages = profile_max_num_pages(
-            **_profile_kwargs,
+            **{**_profile_kwargs, "num_attention_layers": num_kv_layers},
             gpu_memory_utilization=server_args.gpu_memory_utilization,
             cache_cell_size=profile_cache_cell_size,
+            draft_cache_cell_size=draft_profile_cache_cell_size,
         )
         max_num_tokens = _resolve_max_num_tokens(
             max_total_num_pages,
@@ -419,8 +517,14 @@ def create_attn_components(
             conv_size * conv_dtype.itemsize + temporal_size * ssm_dtype.itemsize
         ) * (1 + speculative_num_draft_tokens)
         memory_per_mamba_chunk = num_mamba_layers * per_layer_mamba_chunk_memory
+        full_attn_layer_ids = getattr(text_config, "full_attention_layer_ids", None)
+        num_kv_layers = (
+            len(full_attn_layer_ids)
+            if full_attn_layer_ids is not None
+            else num_layers - num_mamba_layers
+        )
         kv_max_num_pages, mamba_pool_total_chunks = profile_cache_budget(
-            **_profile_kwargs,
+            **{**_profile_kwargs, "num_attention_layers": num_kv_layers},
             mem_fraction_static=server_args.gpu_memory_utilization,
             mamba_memory_per_chunk=memory_per_mamba_chunk,
             mamba_ratio=server_args.mamba_full_memory_ratio,
@@ -435,6 +539,7 @@ def create_attn_components(
             **_profile_kwargs,
             gpu_memory_utilization=server_args.gpu_memory_utilization,
             cache_cell_size=profile_cache_cell_size,
+            draft_cache_cell_size=draft_profile_cache_cell_size,
         )
         max_num_tokens = _resolve_max_num_tokens(
             max_total_num_pages,
@@ -498,7 +603,29 @@ def create_attn_components(
     if draft_attn_config:
         # Check if draft model is also a hybrid GDN model.
         draft_archs = getattr(draft_model_config.hf_config, "architectures", None) or []
-        if any(a in _HYBRID_GDN_ARCHITECTURES for a in draft_archs):
+        if is_deepseek_v4_draft_model:
+            from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+                DeepseekV4TokenToKVPool,
+            )
+
+            draft_attn_backend = _create_attn_backend(
+                draft_model_config.attention_arch, draft_attn_config
+            )
+            draft_pool = DeepseekV4TokenToKVPool(
+                size=max_num_tokens,
+                model_dtype=draft_model_config.dtype,
+                layout=draft_deepseek_v4_layout,
+                layer_num=draft_model_config.num_attention_layers,
+                device=draft_attn_config.device,
+                enable_memory_saver=enable_memory_saver,
+                max_batch_size=draft_attn_config.max_bs,
+                max_context_len=draft_attn_config.context_len,
+                page_size=server_args.block_size,
+                rank=rank,
+                hf_config=draft_model_config.hf_config,
+                max_scheduled_tokens=server_args.chunked_prefill_size,
+            )
+        elif any(a in _HYBRID_GDN_ARCHITECTURES for a in draft_archs):
             resolved_draft_backend = _BACKEND_ALIASES.get(
                 original_attn_backend, original_attn_backend
             )

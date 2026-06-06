@@ -1,3 +1,9 @@
+# Adapted from meituan-longcat/SGLang-FluentLLM.
+# This file has been modified for this repository.
+# This file may incorporate material from ModelTC/lightllm,
+# vllm-project/vllm, and sgl-project/sglang, as identified in
+# python/THIRDPARTYNOTICES.
+
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -19,6 +25,8 @@
 # SOFTWARE.
 
 
+import logging
+
 import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
@@ -28,6 +36,17 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
 )
 from tokenspeed_kernel.platform import Platform
 from torch.nn.parameter import Parameter
+
+logger = logging.getLogger(__name__)
+
+try:
+    from tokenspeed_kernel.thirdparty.deep_gemm import ceil_to_ue8m0 as _ceil_to_ue8m0
+    from tokenspeed_kernel.thirdparty.deep_gemm import (
+        transform_sf_into_required_layout as _transform_sf,
+    )
+except ImportError:
+    _ceil_to_ue8m0 = None
+    _transform_sf = None
 
 from tokenspeed.runtime.layers.dense.utils import normalize_e4m3fn_to_e4m3fnuz
 from tokenspeed.runtime.layers.parameter import (
@@ -187,6 +206,57 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
             layer.weight.data = weight.data
             layer.weight_scale_inv.data = weight_scale.data
+            layer._use_deep_gemm_fp8 = False
+            is_bmm = getattr(layer, "is_bmm", False)
+            is_ue8m0 = getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
+            if _transform_sf is not None and _ceil_to_ue8m0 is not None and is_ue8m0:
+                N, K = layer.weight.shape
+                block_n, block_k = self.quant_config.weight_block_size
+                if is_bmm:
+                    # Grouped (batched) projection (V4 attention wo_a, weight
+                    # [groups * n, K], consumed per group as [n, K]). Transform
+                    # the block scale into the deep_gemm MN-major layout with the
+                    # group axis so deep_gemm.fp8_einsum("bhr,hdr->bhd") runs the
+                    # output projection as one native FP8 GEMM (no FP32 dequant).
+                    # recipe is (1, block_n, block_k) at load; the runtime einsum
+                    # uses (1, 1, block_n) on SM100.
+                    g = layer.bmm_batch_size
+                    n = N // g
+                    if n % block_n == 0 and K % block_k == 0:
+                        sf = _ceil_to_ue8m0(layer.weight_scale_inv.data).view(
+                            g, n // block_n, K // block_k
+                        )
+                        layer.weight_scale_inv.data = _transform_sf(
+                            sf=sf,
+                            mn=n,
+                            k=K,
+                            recipe=(1, block_n, block_k),
+                            num_groups=g,
+                            is_sfa=False,
+                        )
+                        layer._deep_gemm_block_size = [block_n, block_k]
+                        layer._use_deep_gemm_fp8 = True
+                elif N % 64 == 0 and K % 128 == 0:
+                    sf = _ceil_to_ue8m0(layer.weight_scale_inv.data)
+                    layer.weight_scale_inv.data = _transform_sf(
+                        sf=sf,
+                        mn=N,
+                        k=K,
+                        recipe=(1, block_n, block_k),
+                        is_sfa=False,
+                    )
+                    layer._use_deep_gemm_fp8 = True
+            if is_bmm and not layer._use_deep_gemm_fp8:
+                # The is_bmm runtime path (DeepSeek-V4 o_proj) has no FP32
+                # fallback, so fail fast at load with a clear message instead of
+                # a cryptic AttributeError on the first forward.
+                raise RuntimeError(
+                    "is_bmm weight requires the deep_gemm FP8 block-scale path "
+                    "but it could not be prepared (deep_gemm_available="
+                    f"{_transform_sf is not None}, ue8m0={is_ue8m0}, "
+                    f"weight={tuple(layer.weight.shape)}); ensure FP8 block-quant "
+                    "ue8m0 weights with block-aligned dims and deep_gemm installed."
+                )
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -253,6 +323,11 @@ class Fp8LinearMethod(LinearMethodBase):
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
             output_dtype = output_dtype or x.dtype
 
+            override = (
+                "deep_gemm_mm_fp8_blockscale"
+                if getattr(layer, "_use_deep_gemm_fp8", False)
+                else None
+            )
             output = tokenspeed_kernel.mm(
                 input_2d,
                 layer.weight,
@@ -262,6 +337,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 out_dtype=output_dtype,
                 quant="mxfp8",
                 block_size=self.quant_config.weight_block_size,
+                override=override,
             )
             return output.to(dtype=output_dtype).view(*output_shape)
         else:

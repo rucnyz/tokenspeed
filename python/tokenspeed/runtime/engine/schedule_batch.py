@@ -225,7 +225,9 @@ class ScheduleBatch(DisaggregationDecodeScheduler):
                 logger.debug("[evict] out_cache_loc=%r after evict", out_cache_loc)
 
             if out_cache_loc is None:
-                phase_str = "Prefill" if self.forward_mode.is_extend() else "Decode"
+                phase_str = (
+                    "Prefill" if self.forward_mode.is_extend_or_mixed() else "Decode"
+                )
                 logger.error(
                     "%s out of memory. Try to lower your batch size.\nTry to allocate %s tokens.\nAvailable tokens: %s\n",
                     phase_str,
@@ -269,10 +271,12 @@ class ScheduleBatch(DisaggregationDecodeScheduler):
             return
         out_cache_loc = torch.concat(out_cache_loc_list)
         out_cache_loc = out_cache_loc.to(self.device, non_blocking=True)
-        req_indices = torch.tensor(req_indices, dtype=torch.int32).to(
+        req_indices = torch.tensor(req_indices, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
-        start_offsets = self.req_to_token_pool.alloced_lens[req_indices]
+        start_offsets = torch.index_select(
+            self.req_to_token_pool.alloced_lens, 0, req_indices
+        )
         end_offsets = start_offsets + num_tokens_pre_alloc
         assign_req_to_token_pool[(bs,)](
             req_indices,

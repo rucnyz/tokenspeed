@@ -72,9 +72,17 @@ class RequestState:
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
         token_ids_logprob: list[int] | None = None,
+        multimodal_inputs=None,
+        prompt_input_ids_unpadded: list[int] | None = None,
     ) -> None:
         # --- Extracted from recv_req (immutable) ---
         self.prompt_input_ids: list[int] = prompt_input_ids
+        self.prompt_input_ids_unpadded: list[int] = (
+            prompt_input_ids_unpadded
+            if prompt_input_ids_unpadded is not None
+            else prompt_input_ids
+        )
+        self.multimodal_inputs = multimodal_inputs
         self.sampling_params = sampling_params
         self.stream = stream
         self.eos_token_ids = eos_token_ids
@@ -145,6 +153,8 @@ class RequestState:
             return_logprob=getattr(recv_req, "return_logprob", False),
             top_logprobs_num=getattr(recv_req, "top_logprobs_num", 0),
             token_ids_logprob=getattr(recv_req, "token_ids_logprob", None),
+            multimodal_inputs=getattr(recv_req, "multimodal_inputs", None),
+            prompt_input_ids_unpadded=getattr(recv_req, "input_ids_unpadded", None),
         )
 
     @property
@@ -166,14 +176,32 @@ class RequestState:
     def add_computed_length(self, incr: int):
         self.computed_length += incr
 
+    def maybe_extend_multimodal_mrope_positions(self) -> None:
+        mm = self.multimodal_inputs
+        if mm is None or mm.mrope_positions is None:
+            return
+
+        target_len = self.input_length + self.output_length
+        current_len = mm.mrope_positions.shape[-1]
+        if current_len >= target_len:
+            return
+
+        from tokenspeed.runtime.multimodal.mrope import (
+            extend_mrope_positions_for_retracted_request,
+        )
+
+        mm.mrope_positions = extend_mrope_positions_for_retracted_request(
+            mm.mrope_positions, target_len - current_len
+        )
+
     def init_incremental_detokenize(self):
         """Return (all_ids_from_surr_offset, read_offset_relative_to_surr)."""
         if self._surr_offset is None or self._read_offset is None:
-            self._read_offset = self.input_length
+            self._read_offset = len(self.prompt_input_ids_unpadded)
             self._surr_offset = max(
                 self._read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
-        all_ids = self.prompt_input_ids + self.output_ids
+        all_ids = self.prompt_input_ids_unpadded + self.output_ids
         return (
             all_ids[self._surr_offset :],
             self._read_offset - self._surr_offset,
@@ -483,7 +511,7 @@ class OutputProcesser:
             forward_op.input_lengths,
             forward_op.extend_prefix_lens,
         )
-        is_decode_op = forward_op.num_extends() <= 0
+        num_extends = forward_op.num_extends()
 
         request_changes = []
         stream_out_rids = []
@@ -504,7 +532,8 @@ class OutputProcesser:
                 if output_logprobs_list is not None
                 else None
             )
-            if self.spec_num_tokens is not None and is_decode_op:
+            is_decode_slot = i >= num_extends
+            if self.spec_num_tokens is not None and is_decode_slot:
                 pt += self.spec_num_tokens
             else:
                 pt += output_length
@@ -522,9 +551,22 @@ class OutputProcesser:
             # Notify caller of first output token (used by prefill node to hand off
             # bootstrap token to the KV transfer layer before streaming output).
             if on_first_token is not None and model_output_ids:
-                on_first_token(forward_op.request_pool_indices[i], model_output_ids[0])
+                spec_candidate_ids = None
+                if model_execution_results.next_input_ids is not None and i < len(
+                    model_execution_results.next_input_ids
+                ):
+                    spec_candidate_ids = [
+                        int(x)
+                        for x in model_execution_results.next_input_ids[i].tolist()
+                    ]
+                on_first_token(
+                    rid,
+                    forward_op.request_pool_indices[i],
+                    model_output_ids[0],
+                    spec_candidate_ids,
+                )
 
-            if is_decode_op and self.spec_algorithm is not None:
+            if is_decode_slot and self.spec_algorithm is not None:
                 request_state.spec_verify_ct += 1
 
             # With the capturable grammar pipeline the matcher is
@@ -597,7 +639,7 @@ class OutputProcesser:
             else:
                 stream_out_rids.append(rid)
                 stream_out_states.append(request_state)
-                if is_decode_op:
+                if is_decode_slot:
                     request_changes.append(
                         make_update_reserve_tokens_event(rid, output_length)
                     )

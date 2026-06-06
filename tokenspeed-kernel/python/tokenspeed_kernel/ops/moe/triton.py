@@ -20,9 +20,7 @@
 
 from __future__ import annotations
 
-import functools
 import os
-from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -35,6 +33,7 @@ from tokenspeed_kernel.ops.moe.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.thirdparty.trtllm import (
     moe_align_block_size as _moe_align_block_size,
 )
@@ -44,9 +43,178 @@ __all__ = [
     "moe_align_block_size",
     "moe_sum_reduce_torch_compile",
     "moe_sum_reduce_triton",
+    "stage_deepseek_v4_mega_moe_inputs",
 ]
 
 padding_size = 128 if bool(int(os.getenv("TOKENSPEED_MOE_PADDING", "0"))) else 0
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek V4 MegaMoE staging
+# ---------------------------------------------------------------------------
+
+
+_DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE = 128
+
+
+@triton.jit
+def _deepseek_v4_stage_mega_moe_inputs_kernel(
+    hidden_states,
+    x_fp8,
+    x_sf,
+    topk_ids,
+    topk_weights,
+    topk_idx_out,
+    topk_weights_out,
+    hidden_stride_m: tl.constexpr,
+    hidden_stride_k: tl.constexpr,
+    x_stride_m: tl.constexpr,
+    x_stride_k: tl.constexpr,
+    x_sf_stride_m: tl.constexpr,
+    x_sf_stride_k: tl.constexpr,
+    topk_ids_stride_m: tl.constexpr,
+    topk_ids_stride_k: tl.constexpr,
+    topk_weights_stride_m: tl.constexpr,
+    topk_weights_stride_k: tl.constexpr,
+    topk_idx_stride_m: tl.constexpr,
+    topk_idx_stride_k: tl.constexpr,
+    topk_weights_out_stride_m: tl.constexpr,
+    topk_weights_out_stride_k: tl.constexpr,
+    hidden_size: tl.constexpr,
+    top_k: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_K: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+) -> None:
+    token_id = tl.program_id(0)
+    k_block_id = tl.program_id(1)
+
+    k_offsets = k_block_id * BLOCK_K + tl.arange(0, BLOCK_K)
+    k_mask = k_offsets < hidden_size
+    hidden = tl.load(
+        hidden_states + token_id * hidden_stride_m + k_offsets * hidden_stride_k,
+        mask=k_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    num_groups: tl.constexpr = BLOCK_K // GROUP_K
+    hidden_groups = tl.reshape(tl.abs(hidden), [num_groups, GROUP_K])
+    amax = tl.max(hidden_groups, axis=1)
+    amax = tl.maximum(amax, 1.0e-4)
+
+    scale = amax / 448.0
+    scale_bits = scale.to(tl.uint32, bitcast=True)
+    scale_exp = ((scale_bits >> 23) & 0xFF) + ((scale_bits & 0x7FFFFF) != 0).to(
+        tl.uint32
+    )
+    scale_exp = tl.minimum(tl.maximum(scale_exp, 1), 254)
+    rounded_scale = (scale_exp << 23).to(tl.float32, bitcast=True)
+
+    hidden_groups = tl.reshape(hidden, [num_groups, GROUP_K])
+    scaled = hidden_groups * (1.0 / rounded_scale)[:, None]
+    scaled = tl.reshape(scaled, [BLOCK_K])
+    fp8 = scaled.to(tl.float8e4nv)
+    tl.store(
+        x_fp8 + token_id * x_stride_m + k_offsets * x_stride_k,
+        fp8,
+        mask=k_mask,
+    )
+
+    scale_offsets = tl.arange(0, num_groups)
+    packed_scale = tl.sum(scale_exp << (scale_offsets * 8), axis=0).to(tl.int32)
+    tl.store(
+        x_sf + token_id * x_sf_stride_m + k_block_id * x_sf_stride_k,
+        packed_scale,
+    )
+
+    if k_block_id == 0:
+        topk_offsets = tl.arange(0, BLOCK_TOPK)
+        topk_mask = topk_offsets < top_k
+
+        ids = tl.load(
+            topk_ids + token_id * topk_ids_stride_m + topk_offsets * topk_ids_stride_k,
+            mask=topk_mask,
+            other=0,
+        ).to(tl.int64)
+        tl.store(
+            topk_idx_out
+            + token_id * topk_idx_stride_m
+            + topk_offsets * topk_idx_stride_k,
+            ids,
+            mask=topk_mask,
+        )
+
+        weights = tl.load(
+            topk_weights
+            + token_id * topk_weights_stride_m
+            + topk_offsets * topk_weights_stride_k,
+            mask=topk_mask,
+            other=0.0,
+        )
+        tl.store(
+            topk_weights_out
+            + token_id * topk_weights_out_stride_m
+            + topk_offsets * topk_weights_out_stride_k,
+            weights,
+            mask=topk_mask,
+        )
+
+
+def stage_deepseek_v4_mega_moe_inputs(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    x_fp8: torch.Tensor,
+    x_sf: torch.Tensor,
+    topk_idx_out: torch.Tensor,
+    topk_weights_out: torch.Tensor,
+) -> None:
+    num_tokens, hidden_size = hidden_states.shape
+    if num_tokens == 0:
+        return
+    if hidden_size % _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE != 0:
+        raise ValueError(
+            "DeepSeek V4 MegaMoE input staging requires hidden_size to be "
+            f"a multiple of {_DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE}."
+        )
+    if topk_weights.shape != topk_ids.shape:
+        raise ValueError(
+            "DeepSeek V4 MegaMoE input staging requires topk_weights and "
+            "topk_ids to have the same shape."
+        )
+
+    block_k = _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE
+    grid = (num_tokens, triton.cdiv(hidden_size, block_k))
+    block_topk = triton.next_power_of_2(topk_ids.shape[1])
+    _deepseek_v4_stage_mega_moe_inputs_kernel[grid](
+        hidden_states,
+        x_fp8,
+        x_sf,
+        topk_ids,
+        topk_weights,
+        topk_idx_out,
+        topk_weights_out,
+        hidden_states.stride(0),
+        hidden_states.stride(1),
+        x_fp8.stride(0),
+        x_fp8.stride(1),
+        x_sf.stride(0),
+        x_sf.stride(1),
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        topk_weights.stride(0),
+        topk_weights.stride(1),
+        topk_idx_out.stride(0),
+        topk_idx_out.stride(1),
+        topk_weights_out.stride(0),
+        topk_weights_out.stride(1),
+        hidden_size,
+        topk_ids.shape[1],
+        BLOCK_K=block_k,
+        GROUP_K=32,
+        BLOCK_TOPK=block_topk,
+        num_warps=4,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +306,7 @@ def _biased_grouped_topk_reference(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
-    from tokenspeed_kernel.ops.moe.reference import biased_grouped_topk_gpu
+    from tokenspeed_kernel.numerics.reference.moe import biased_grouped_topk_gpu
 
     return biased_grouped_topk_gpu(
         hidden_states,
@@ -161,7 +329,7 @@ def _biased_grouped_topk_reference(
     "route",
     name="triton_minimax_biased_grouped_topk",
     solution="triton",
-    dtypes={torch.float32},
+    signatures=format_signatures("logits", "dense", {torch.float32}),
     traits={
         "output_type": frozenset({"topk"}),
         "biased": frozenset({True}),
@@ -570,13 +738,48 @@ def fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+def _normalize_fp8_group_scale_layout(
+    A: torch.Tensor,
+    A_scale: torch.Tensor,
+    expected_scale_k: int,
+) -> torch.Tensor:
+    """Return FP8 activation scales as [M, num_k_groups].
+
+    The NVIDIA fast path in ``per_token_group_quant_fp8`` can return TRT-LLM
+    scales as a flattened buffer with M padded to a multiple of 4. The MoE
+    Triton kernel consumes row-major scales with no padded rows.
+    """
+    if A_scale.shape[-1] == expected_scale_k:
+        return A_scale
+
+    if A_scale.ndim == 1:
+        m = A.shape[-2]
+        aligned_m = triton.cdiv(m, 4) * 4
+        valid_numel = expected_scale_k * aligned_m
+        if A_scale.numel() < valid_numel:
+            return A_scale
+        return (
+            A_scale[:valid_numel]
+            .view(expected_scale_k, aligned_m)[:, :m]
+            .T.contiguous()
+        )
+
+    # Some helpers return [num_k_groups, M]; convert to [M, num_k_groups].
+    if A_scale.shape[0] == expected_scale_k:
+        return A_scale.transpose(0, 1).contiguous()
+
+    return A_scale
+
+
 @register_kernel(
     "moe",
     "experts",
     name="triton_moe_fused_experts",
     features={"dispatch_sorted"},
     solution="triton",
-    dtypes={torch.float16, torch.bfloat16, torch.float8_e4m3fn},
+    signatures=format_signatures(
+        "x", "dense", {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
+    ),
     priority=Priority.PERFORMANT + 2,
     tags={"portability"},
 )
@@ -624,15 +827,8 @@ def invoke_fused_moe_kernel(
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
             A, A_scale = per_token_group_quant_fp8(A, block_k)
-            # TRT-LLM's per-token group quantization helper returns scales in
-            # column-major layout [num_groups, num_tokens], while this MoE
-            # kernel consumes [num_tokens, num_groups].
             expected_scale_k = triton.cdiv(A.shape[-1], block_k)
-            if (
-                A_scale.shape[-1] != expected_scale_k
-                and A_scale.shape[0] == expected_scale_k
-            ):
-                A_scale = A_scale.transpose(0, 1).contiguous()
+            A_scale = _normalize_fp8_group_scale_layout(A, A_scale, expected_scale_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
@@ -643,10 +839,11 @@ def invoke_fused_moe_kernel(
         assert A_scale is None
         assert B_scale is None
 
-    grid = lambda META: (
-        triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
-        * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
-    )
+    def grid(META):
+        return (
+            triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+            * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
+        )
 
     K = B.shape[2] - padded_size
     even_Ks = K % config["BLOCK_SIZE_K"] == 0
@@ -784,7 +981,7 @@ def _moe_sum_reduce_kernel(
     "combine",
     name="triton_moe_sum_reduce",
     solution="triton",
-    dtypes={torch.float16, torch.bfloat16},
+    signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
     traits={"comm_strategy": frozenset({None})},
     priority=Priority.PERFORMANT + 2,
     tags={"portability"},
@@ -829,7 +1026,7 @@ def moe_sum_reduce_triton(
     "combine",
     name="torch_compile_moe_sum_reduce",
     solution="reference",
-    dtypes={torch.float16, torch.bfloat16},
+    signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
     traits={"comm_strategy": frozenset({None})},
     priority=Priority.PORTABLE + 1,
     tags={"portability"},
@@ -850,7 +1047,7 @@ def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
     "dispatch",
     name="triton_moe_align_block_size",
     solution="triton",
-    dtypes={torch.int32},
+    signatures=format_signatures("indices", "dense", {torch.int32}),
     traits={
         "comm_strategy": frozenset({"local"}),
     },

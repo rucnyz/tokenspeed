@@ -1,3 +1,9 @@
+# Adapted from meituan-longcat/SGLang-FluentLLM.
+# This file has been modified for this repository.
+# This file may incorporate material from ModelTC/lightllm,
+# vllm-project/vllm, and sgl-project/sglang, as identified in
+# python/THIRDPARTYNOTICES.
+
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -494,7 +500,13 @@ class VocabParallelEmbedding(torch.nn.Module):
                 self.shard_indices.added_vocab_end_index,
             )
         else:
-            masked_input = input_
+            # Single-rank (DP / replicated) path has no shard mask, so an
+            # out-of-range id (e.g. CUDA-graph capture warmup where the drafter
+            # feeds argmax over uninitialized logits) hits F.embedding OOB.
+            # Clamp here for parity with the tp_size>1 mask path; under normal
+            # inference upstream guarantees id < num_embeddings_padded so this
+            # is a no-op.
+            masked_input = input_.clamp(min=0, max=self.num_embeddings_padded - 1)
 
         # Get the embeddings.
         output_parallel = self.linear_method.embedding(self, masked_input)
@@ -504,7 +516,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
 
             if reduce_results:
-                output = all_reduce(output_parallel, self.tp_rank, self.tp_group)
+                output = all_reduce(output_parallel, self.tp_group)
             else:
                 output = output_parallel
 

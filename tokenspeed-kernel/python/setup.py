@@ -286,8 +286,7 @@ def _ensure_cuda_compiler() -> None:
 # Format: (name, [source_files], extra_ldflags) or
 #         (name, [source_files], extra_ldflags, extra_cflags)
 # The 4-tuple form lets a kernel append nvcc flags on top of the global set —
-# e.g. merge_state needs ``-O3 -use_fast_math`` to match flashinfer's bundled
-# build. extra_cflags defaults to [] when omitted.
+# e.g., fused_topk_topp needs ``--expt-extended-lambda`` for CUB lambdas.
 KERNEL_GROUPS = [
     (
         "rope",
@@ -348,6 +347,16 @@ KERNEL_GROUPS = [
         [],
     ),
     (
+        "fused_topk_topp",
+        [
+            CUDA_CSRC_DIR / "fused_topk_topp" / "fused_topk_topp.cu",
+            CUDA_CSRC_DIR / "fused_topk_topp" / "fused_topk_topp_binding.cu",
+        ],
+        [],
+        # --expt-extended-lambda is required by air_topk_stable.cuh's CUB usage.
+        ["--expt-extended-lambda"],
+    ),
+    (
         "rmsnorm_fused_parallel",
         [
             CUDA_CSRC_DIR / "rmsnorm_fused_parallel.cu",
@@ -361,9 +370,13 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "merge_state.cu",
         ],
         [],
-        # flashinfer compiles cascade.cuh with -O3 -use_fast_math; -O2 alone
-        # leaves ~14% on the table at large T (kernel_only), so match upstream.
-        ["-O3", "-DNDEBUG", "-use_fast_math"],
+    ),
+    (
+        "flashinfer_softmax",
+        [
+            CUDA_CSRC_DIR / "flashinfer_softmax.cu",
+        ],
+        [],
     ),
     (
         "silu_fuse_block_quant",
@@ -396,13 +409,20 @@ KERNEL_GROUPS = [
         [],
     ),
     (
+        "lm_head_gemm",
+        [
+            CUDA_CSRC_DIR / "lm_head_gemm.cu",
+            CUDA_CSRC_DIR / "lm_head_gemm_binding.cu",
+        ],
+        [],
+    ),
+    (
         "trtllm_comm",
         [
             CUDA_CSRC_DIR / "trtllm_allreduce.cu",
             CUDA_CSRC_DIR / "trtllm_allreduce_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_reducescatter_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_allgather_fusion.cu",
-            CUDA_CSRC_DIR / "all_gather.cu",
             CUDA_CSRC_DIR / "minimax_reduce_rms.cu",
         ],
         [],
@@ -500,13 +520,6 @@ class CudaKernelBuilder:
                     _add_dir(candidate)
                 if (candidate / "cccl").exists():
                     _add_dir(candidate / "cccl")
-            for rel in (
-                "tokenspeed_triton/backends/nvidia/include",
-                "triton/backends/nvidia/include",
-            ):
-                candidate = base_path / rel
-                if (candidate / "cuda_runtime.h").exists():
-                    _add_dir(candidate)
 
         try:
             tvm_ffi = importlib.import_module("tvm_ffi")
@@ -641,7 +654,9 @@ class CudaKernelBuilder:
         ]
         nvcc_flags = [
             "-std=c++17",
-            "-O2",
+            "-O3",
+            "-DNDEBUG",
+            "-use_fast_math",
             "--expt-relaxed-constexpr",
             "--compiler-options=-fPIC",
             "-DFLASHINFER_ENABLE_BF16",

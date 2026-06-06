@@ -33,6 +33,16 @@
 namespace tokenspeed {
 
 template <ResourceType RType>
+inline bool HasResource(const TreeNode* node) {
+    if (node == nullptr) return false;
+    if constexpr (RType == ResourceType::Device) {
+        return node->OnDevice();
+    } else {
+        return node->OnHost();
+    }
+}
+
+template <ResourceType RType>
 inline bool HasChildWithPages(const TreeNode* node) {
     for (const auto& [_, child] : node->Children()) {
         if (child == nullptr) continue;
@@ -62,20 +72,34 @@ inline bool IsLeaf(const TreeNode* node) {
 }
 
 template <ResourceType RType>
+void ResourceManager<RType>::removeLeaf(TreeNode* node) {
+    if (node == nullptr || node->IsRoot()) return;
+
+    auto it = node_time_.find(node);
+    if (it != node_time_.end()) {
+        lru_leaves_.erase({it->second, node->SeqId(), node});
+        node_time_.erase(it);
+        if (HasResource<RType>(node)) {
+            GetResource<RType>(node).ClearEvictableNotifier();
+        }
+    }
+}
+
+template <ResourceType RType>
+void ResourceManager<RType>::RemoveLeaf(TreeNode* node) {
+    removeLeaf(node);
+}
+
+template <ResourceType RType>
 void ResourceManager<RType>::updateLeaf(TreeNode* node) {
     if (node == nullptr || node->IsRoot()) return;
 
     // Remove stale entry (if any) using the stored sort key for O(1) erase.
-    auto it = node_time_.find(node);
-    if (it != node_time_.end()) {
-        lru_leaves_.erase({it->second, node});
-        node_time_.erase(it);
-        GetResource<RType>(node).ClearEvictableNotifier();
-    }
+    removeLeaf(node);
 
     if (IsLeaf<RType>(node)) {
         auto ts = node->Time();
-        lru_leaves_.insert({ts, node});
+        lru_leaves_.insert({ts, node->SeqId(), node});
         node_time_[node] = ts;
         // When the last lock on this node is released, OnNodeEvictable refreshes
         // the LRU sort key so Touch() calls made while locked are reflected.
@@ -105,8 +129,8 @@ std::vector<TreeNode*> ResourceManager<RType>::Evict(std::int32_t num_pages) {
     std::int32_t evicted = 0;
     while (evicted < num_pages && !lru_leaves_.empty()) {
         auto it = lru_leaves_.begin();  // oldest (LRU) first
-        TreeNode* leaf = it->second;
-        timestamp_t ts = it->first;
+        timestamp_t ts = std::get<0>(*it);
+        TreeNode* leaf = std::get<2>(*it);
         lru_leaves_.erase(it);
         node_time_.erase(leaf);
 
@@ -141,7 +165,7 @@ std::vector<TreeNode*> ResourceManager<RType>::Evict(std::int32_t num_pages) {
     // the node was locked is reflected in LRU order immediately.
     for (auto& [ts, node] : deferred_locked) {
         auto current_ts = node->Time();
-        lru_leaves_.insert({current_ts, node});
+        lru_leaves_.insert({current_ts, node->SeqId(), node});
         node_time_[node] = current_ts;
         GetResource<RType>(node).BindEvictableNotifier(this, node);
     }

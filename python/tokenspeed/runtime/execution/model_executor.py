@@ -45,10 +45,12 @@ from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
+from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
 from tokenspeed.runtime.utils.common import maybe_inference_mode
+from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -86,6 +88,7 @@ class ModelExecutorConfig:
     cudagraph_capture_sizes: list[int] | None
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
+    model_is_mrope: bool
 
     # ====== DP =========
     data_parallel_size: int = 1
@@ -97,6 +100,7 @@ class ModelExecutorConfig:
     spec_num_steps: int | None = None
     # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
     spec_num_tokens: int | None = None
+    use_target_verify_forward_mode: bool = False
 
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
@@ -121,6 +125,11 @@ class ModelExecutorConfig:
             if server_args.speculative_algorithm
             else 1
         )
+        rope_scaling = getattr(
+            model_config.hf_text_config, "rope_parameters", None
+        ) or getattr(model_config.hf_text_config, "rope_scaling", {})
+        model_is_mrope = bool(rope_scaling and "mrope_section" in rope_scaling)
+
         return ModelExecutorConfig(
             max_req_pool_size=max_req_pool_size,
             output_length=output_length,
@@ -138,12 +147,14 @@ class ModelExecutorConfig:
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
+            model_is_mrope=model_is_mrope,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
+            use_target_verify_forward_mode=model_config.use_target_verify_forward_mode,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
@@ -175,6 +186,7 @@ class ModelExecutor:
         self.token_to_kv_pool = token_to_kv_pool
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        self._layerwise_mamba_cow_done = None
 
         if config.spec_algo is not None:
             max_num_pages_per_req = (
@@ -225,6 +237,12 @@ class ModelExecutor:
             )
             embed, head = self.model_runner.model.get_embed_and_head()
             draft_model_runner.model.set_embed_and_head(embed, head)
+            target_hf = self.model_runner.model_config.hf_config
+            mm_pad_substitute_id = getattr(
+                target_hf, "image_token_id", None
+            ) or getattr(target_hf, "media_placeholder_token_id", None)
+            if mm_pad_substitute_id is not None:
+                self.drafter.set_mm_pad_substitute_id(mm_pad_substitute_id)
             if config.spec_algo in ("EAGLE3",) and hasattr(
                 self.model_runner.model, "set_eagle3_layers_to_capture"
             ):
@@ -273,6 +291,9 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
             )
 
+        self._active_multimodal_context = None
+        self._active_positions_override = None
+
         self.forward_step = CudaGraphWrapper(
             forward_func=self._forward_step,
             attn_backend=attn_backend,
@@ -288,9 +309,32 @@ class ModelExecutor:
             runtime_states=self.runtime_states,
         )
 
+        # CUDA graph warmup runs the drafter with dummy data whose
+        # uninitialized KV cache produces NaN → argmax sentinel -1.
+        # Clear the residue so pool slots reused by real requests start clean.
+        self.runtime_states.future_input_map.zero_()
+
+        # Encoder CUDA graph: install the model-built wrapper by overriding
+        # ``image_encoder``. Vision-encoder analogue of ``forward_step``'s
+        # ``CudaGraphWrapper``.
+        self.encoder_graph_wrapper = None
+        _mm_model = self.model_runner.model
+        if (
+            hasattr(_mm_model, "make_encoder_cudagraph_wrapper")
+            and getattr(_mm_model, "is_multimodal_active", True)
+            and envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH.get()
+            and self.model_runner.server_args.mm_attention_backend != "flashinfer_cudnn"
+        ):
+            self.encoder_graph_wrapper = _mm_model.make_encoder_cudagraph_wrapper(
+                _mm_model.mapping
+            )
+            _mm_model.image_encoder = self.encoder_graph_wrapper
+
         self.execution_stream = torch.cuda.Stream()
         self.log_step = 0
         self._seen_prefill_ids: set[str] = set()
+        self._prev_decode_bs: int = 0
+        self._sentinel_neg1 = torch.tensor(-1, device=self.device, dtype=torch.int64)
         # Decode stats — accumulated from synced results (no GPU sync needed)
         self.num_generated_tokens = 0
         self.num_decode_steps = 0
@@ -333,35 +377,90 @@ class ModelExecutor:
 
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
+        positions = self._active_positions_override
+        if positions is None:
+            if self.config.model_is_mrope:
+                positions = self.input_buffers.mrope_positions_buf[
+                    :, : ctx.input_num_tokens
+                ]
+            else:
+                positions = self.input_buffers.positions_buf[: ctx.input_num_tokens]
         return self.model_runner.forward(
             ctx,
             self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
-            self.input_buffers.positions_buf[: ctx.input_num_tokens],
+            positions,
             self.input_buffers.out_cache_loc_buf[: ctx.input_num_tokens],
-            self.input_buffers.input_lengths_buf[:bs],
             req_pool_indices=req_pool_indices,
             seq_lens=self.input_buffers.seq_lens_buf[:bs],
             extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
                 : ctx.num_extends
             ],
+            multimodal_context=self._active_multimodal_context,
         )
+
+    def _apply_force_single_token_verify(
+        self,
+        accept_lengths: torch.Tensor,
+        row_offset: int,
+        row_count: int,
+        decode_input_ids: list[int] | None,
+    ) -> torch.Tensor:
+        if decode_input_ids is None or row_count <= 0:
+            return accept_lengths
+        force_mask = self.input_buffers.force_single_token_verify_buf[
+            row_offset : row_offset + row_count
+        ]
+        return torch.where(force_mask, torch.ones_like(accept_lengths), accept_lengths)
 
     @nvtx_range("sampling", color="yellow")
     def _run_sampling(
         self,
-        logits_output,
+        logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         ctx: ForwardContext,
-        candidates,
+        candidates: torch.Tensor | None = None,
     ):
-        if self.drafter is not None and (
-            ctx.forward_mode == ForwardMode.DECODE
-            or ctx.forward_mode == ForwardMode.TARGET_VERIFY
-        ):
-            return self.sampling_backend.verify(
+        if self.drafter is None:
+            return self.sampling_backend.sample(logits_output, sampling_info)
+
+        num_extends = ctx.num_extends
+        num_decodes = ctx.bs - num_extends
+
+        if num_decodes == 0:
+            return self.sampling_backend.sample(logits_output, sampling_info)
+
+        if num_extends == 0:
+            output_tokens, accept_lengths = self.sampling_backend.verify(
                 logits_output, sampling_info, candidates
             )
-        return self.sampling_backend.sample(logits_output, sampling_info)
+            accept_lengths = self._apply_force_single_token_verify(
+                accept_lengths, 0, num_decodes, ctx.decode_input_ids
+            )
+            return output_tokens, accept_lengths
+
+        logits = logits_output.next_token_logits
+        prefill_out = LogitsProcessorOutput(next_token_logits=logits[:num_extends])
+        prefill_tokens, prefill_accept = self.sampling_backend.sample(
+            prefill_out, sampling_info[:num_extends]
+        )
+        decode_out = LogitsProcessorOutput(next_token_logits=logits[num_extends:])
+        decode_tokens, decode_accept = self.sampling_backend.verify(
+            decode_out, sampling_info[num_extends:], candidates
+        )
+        decode_accept = self._apply_force_single_token_verify(
+            decode_accept, num_extends, num_decodes, ctx.decode_input_ids
+        )
+        if (
+            prefill_out.next_token_logprobs is not None
+            and decode_out.next_token_logprobs is not None
+        ):
+            logits_output.next_token_logprobs = torch.cat(
+                [prefill_out.next_token_logprobs, decode_out.next_token_logprobs]
+            )
+        return (
+            torch.cat([prefill_tokens, decode_tokens]),
+            torch.cat([prefill_accept, decode_accept]),
+        )
 
     @maybe_inference_mode()
     def _forward_step(
@@ -377,7 +476,7 @@ class ModelExecutor:
         if self.capturable_grammar is not None:
             n = self.capturable_grammar.max_tokens_per_req
             is_spec_verify = n > 1 and (
-                ctx.forward_mode.is_target_verify() or ctx.forward_mode.is_decode()
+                ctx.forward_mode.is_decode() or ctx.forward_mode.is_target_verify()
             )
             slice_ = (
                 self.input_buffers.input_ids_buf[: bs * n] if is_spec_verify else None
@@ -397,6 +496,18 @@ class ModelExecutor:
         output_tokens, accept_lengths = self._run_sampling(
             logits_output, sampling_info, ctx, candidates
         )
+
+        # Single choke point for every (sample/verify) x (greedy/flashinfer)
+        # path: NaN logits (e.g. DP dummy/warmup batches over uninitialized KV)
+        # make cute_argmax emit the -1 sentinel. Left unclamped, that -1 poisons
+        # both consumers below -- it flows into output_ids -> detokenizer (the
+        # HF Rust tokenizer raises OverflowError on a negative id and kills the
+        # engine) and, via the drafter, back into future_input_map as the next
+        # round's input_ids (negative embedding index -> garbage / CUDA illegal
+        # access). Clamp in place (this runs inside the CUDA graph) so grammar,
+        # drafter, and the return value all observe clean ids. Mirror of the
+        # draft-side draft_ids.clamp_(min=0) guard.
+        output_tokens.clamp_(min=0)
 
         # Fork sampler-output D2H onto the grammar side stream so the
         # next step's build hostfunc can advance the matcher.
@@ -426,7 +537,7 @@ class ModelExecutor:
         output_tokens: torch.Tensor,
         accept_lengths: torch.Tensor,
         input_lengths: torch.Tensor,
-        is_extend: bool,
+        num_extends: int,
     ):
         """Write output tokens to future_input_map and update cache lengths.
 
@@ -438,21 +549,24 @@ class ModelExecutor:
             # Without drafter, store output tokens for next round.
             # With drafter, _forward_step already wrote the drafter's
             # next-round input (verified + draft tokens) to future_input_map.
-            tokens_per_req = self.config.output_length if not is_extend else 1
+            tokens_per_req = self.config.output_length if num_extends == 0 else 1
             next_round_input_ids = output_tokens.to(torch.int32).reshape(
                 -1, tokens_per_req
             )
             self.runtime_states.future_input_map[req_pool_indices, :tokens_per_req] = (
                 next_round_input_ids
             )
-        if is_extend:
-            self.runtime_states.update_valid_cache_length(
-                req_pool_indices, input_lengths
-            )
+
+        bs = req_pool_indices.shape[0]
+        if num_extends == 0:
+            deltas = accept_lengths
+        elif num_extends == bs:
+            deltas = input_lengths
         else:
-            self.runtime_states.update_valid_cache_length(
-                req_pool_indices, accept_lengths
+            deltas = torch.cat(
+                [input_lengths[:num_extends], accept_lengths[num_extends:]]
             )
+        self.runtime_states.update_valid_cache_length(req_pool_indices, deltas)
 
     def _build_sampling_info(
         self,
@@ -472,48 +586,170 @@ class ModelExecutor:
         self.num_generated_tokens += int(results.output_lengths.sum().item())
         self.num_decode_steps += bs
 
-    def snapshot_mamba_checkpoints_for_op(self, forward_op) -> None:
-        """Snapshot completed decode working states into checkpoint slots."""
-        if self.runtime_states.mamba_pool is None or forward_op.num_extends() > 0:
-            return
-        if not getattr(forward_op, "mamba_pool_indices", None):
-            return
+    @staticmethod
+    @torch.compile(dynamic=True)
+    def _compute_mtp_snapshot_indices(
+        valid_cache_lengths: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        accept_lengths: torch.Tensor,
+        output_indices: torch.Tensor,
+        track_indices: torch.Tensor,
+        sentinel: torch.Tensor,
+        page_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused elementwise pipeline computing snapshot src/dst for MTP.
 
-        # CPU-side pre-filter
-        src_list = []
-        dst_list = []
-        req_list = []
-        for i in range(len(forward_op.request_ids)):
-            pool_idx = forward_op.mamba_pool_indices[i]
-            ckpt_idx = forward_op.mamba_track_pool_indices[i]
-            if pool_idx != -1 and ckpt_idx != -1:
-                src_list.append(pool_idx)
-                dst_list.append(ckpt_idx)
-                req_list.append(forward_op.request_pool_indices[i])
+        All operations are batched and fused by torch.compile into a single
+        Triton kernel (plus the two gathers), eliminating the ~14 individual
+        elementwise kernel launches of the eager implementation.
+        """
+        new_cl = valid_cache_lengths[req_pool_indices]
+        old_cl = new_cl - accept_lengths.to(new_cl.dtype)
+        first_boundary = ((old_cl // page_size) + 1) * page_size
 
-        num_valid = len(src_list)
-        if num_valid == 0:
-            return
+        step_raw = first_boundary - old_cl - 1
+        max_col = output_indices.shape[1] - 1
+        step = step_raw.clamp(min=0, max=max_col).to(torch.int64)
 
-        t_src = torch.tensor(src_list, dtype=torch.int64, device="cpu", pin_memory=True)
-        t_dst = torch.tensor(dst_list, dtype=torch.int64, device="cpu", pin_memory=True)
-        t_req = torch.tensor(req_list, dtype=torch.int64, device="cpu", pin_memory=True)
+        bs = req_pool_indices.shape[0]
+        req_range = torch.arange(bs, device=req_pool_indices.device)
+        src_raw = output_indices[req_range, step].to(torch.int64)
+        dst_raw = track_indices.to(torch.int64)
 
-        src_buf = torch.empty(num_valid, dtype=torch.int64, device=self.device)
-        dst_buf = torch.empty(num_valid, dtype=torch.int64, device=self.device)
-        req_buf = torch.empty(num_valid, dtype=torch.int64, device=self.device)
-        src_buf.copy_(t_src, non_blocking=True)
-        dst_buf.copy_(t_dst, non_blocking=True)
-        req_buf.copy_(t_req, non_blocking=True)
-
-        cache_lengths = self.runtime_states.valid_cache_lengths[req_buf]
-        self.runtime_states.snapshot_mamba_checkpoints(
-            src_buf,
-            dst_buf,
-            cache_lengths,
-            self.config.block_size,
-            num_valid,
+        invalid = (
+            (first_boundary > new_cl)
+            | (dst_raw < 0)
+            | (src_raw < 0)
+            | (src_raw == dst_raw)
+            | (step_raw < 0)
         )
+        src = torch.where(invalid, sentinel, src_raw)
+        dst = torch.where(invalid, sentinel, dst_raw)
+        return src, dst
+
+    def _snapshot_mamba_checkpoints(
+        self,
+        accept_lengths: torch.Tensor,
+        bs: int,
+        num_extends: int,
+    ) -> None:
+        """Snapshot mamba states to checkpoint slots at page boundaries.
+
+        Called after ``_update_runtime_state`` on the execution stream so
+        ``valid_cache_lengths`` already reflects the accepted tokens.
+
+        Non-MTP (accept_length == 1):
+            The working slot holds the up-to-date state for the new
+            cache_length.  Pass the kernel page_size so it copies only
+            when the new length is page-aligned.
+
+        MTP (accept_length > 1):
+            cache_length may jump over a page boundary.  The intermediate
+            state lives in ``mamba_output_indices[req, step]``.  Boundary
+            detection and source-slot selection are done entirely on GPU
+            with -1 sentinels so the snapshot kernel skips invalid entries
+            via its bounds check — no GPU-to-CPU sync, preserving
+            overlap-schedule pipelining.
+        """
+        if self.runtime_states.mamba_pool is None or num_extends > 0:
+            return
+        if not self.input_buffers.has_mamba:
+            return
+
+        req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
+        track_indices = self.input_buffers.mamba_track_pool_indices_buf[:bs]
+        page_size = self.config.block_size
+        dev = req_pool_indices.device
+        sentinel = self._sentinel_neg1
+
+        if self.drafter is not None:
+            # -- MTP path: find the output slot at the crossed boundary --
+            backend = getattr(
+                self.attn_backend, "linear_attn_backend", self.attn_backend
+            )
+            fm = getattr(backend, "forward_metadata", None)
+            if fm is None:
+                return
+            output_indices = fm.mamba_output_indices
+            if output_indices is None:
+                return
+
+            src, dst = self._compute_mtp_snapshot_indices(
+                self.runtime_states.valid_cache_lengths,
+                req_pool_indices,
+                accept_lengths[:bs].to(device=dev),
+                output_indices,
+                track_indices,
+                sentinel,
+                page_size,
+            )
+
+            self.runtime_states.snapshot_mamba_checkpoints(
+                src,
+                dst,
+                cache_lengths=None,
+                page_size=0,
+                num_valid=bs,
+            )
+        else:
+            # -- Non-MTP path: working slot IS the up-to-date state --
+            src_raw = self.input_buffers.mamba_pool_indices_buf[:bs].to(
+                device=dev, dtype=torch.int64
+            )
+            dst_raw = track_indices.to(device=dev, dtype=torch.int64)
+
+            invalid = (src_raw < 0) | (dst_raw < 0) | (src_raw == dst_raw)
+            src = torch.where(invalid, sentinel, src_raw)
+            dst = torch.where(invalid, sentinel, dst_raw)
+
+            cache_lengths = self.runtime_states.valid_cache_lengths[req_pool_indices]
+            self.runtime_states.snapshot_mamba_checkpoints(
+                src,
+                dst,
+                cache_lengths=cache_lengths,
+                page_size=page_size,
+                num_valid=bs,
+            )
+
+    def flush_mamba_draft_to_working_on_retract(self) -> None:
+        """Copy accepted draft mamba state -> working slot for all previous-batch requests.
+
+        Called from event_loop when retract WriteBackOps are detected.
+        Uses the previous decode iteration's input_buffers (still valid since
+        no new forward has overwritten them).
+        Runs on execution_stream to respect ordering with previous forward writes.
+        """
+        bs = self._prev_decode_bs
+        if bs <= 0:
+            return
+
+        backend = getattr(self.attn_backend, "linear_attn_backend", self.attn_backend)
+        pool = getattr(backend, "pool", None)
+        if pool is None:
+            return
+
+        sentinel = self._sentinel_neg1
+
+        with torch.cuda.stream(self.execution_stream):
+            req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
+            working = self.input_buffers.mamba_pool_indices_buf[:bs]
+
+            src_raw = pool.current_input_indices[req_pool_indices.clamp(0).long()].to(
+                dtype=torch.int64
+            )
+            dst_raw = working.to(dtype=torch.int64)
+
+            invalid = (src_raw < 0) | (dst_raw < 0) | (src_raw == dst_raw)
+            src = torch.where(invalid, sentinel, src_raw)
+            dst = torch.where(invalid, sentinel, dst_raw)
+
+            self.runtime_states.snapshot_mamba_checkpoints(
+                src,
+                dst,
+                cache_lengths=None,
+                page_size=0,
+                num_valid=bs,
+            )
 
     def execute_forward_op_with_log(
         self,
@@ -526,6 +762,8 @@ class ModelExecutor:
         dp_global_bs=None,
         dp_all_decode_or_idle: bool = False,
         grammar_inputs=None,
+        multimodal_context=None,
+        capture_next_input_ids: bool = False,
     ) -> ModelExecutionResult:
         self.log_step += 1
 
@@ -563,6 +801,8 @@ class ModelExecutor:
             dp_global_bs,
             dp_all_decode_or_idle,
             grammar_inputs=grammar_inputs,
+            multimodal_context=multimodal_context,
+            capture_next_input_ids=capture_next_input_ids,
         )
 
         if is_decode and (
@@ -616,6 +856,7 @@ class ModelExecutor:
                     gen_throughput,
                     num_queue_reqs,
                 )
+            self.token_to_kv_pool.maybe_log_paged_cache_group_pages()
             self.num_generated_tokens = 0
             self.num_decode_steps = 0
             self.last_decode_stats_tic = now
@@ -634,10 +875,9 @@ class ModelExecutor:
         ranks do. The MoE all-to-all is a collective that requires ALL
         ranks to participate.
         """
-        graph_forward_mode = (
-            ForwardMode.TARGET_VERIFY
-            if self.drafter is not None
-            else ForwardMode.DECODE
+        graph_forward_mode = ForwardMode.decode_or_target_verify(
+            has_drafter=self.drafter is not None,
+            use_target_verify=self.config.use_target_verify_forward_mode,
         )
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
@@ -691,32 +931,34 @@ class ModelExecutor:
             input_ids=empty,
             positions=empty,
             out_cache_loc=empty,
-            input_lengths=empty,
         )
 
         # If a drafter is active, its model also has MoE layers that issue
         # NCCL collectives. Idle ranks must match those collectives:
         # 1 first-step forward + (spec_num_steps - 1) multi-step decode forwards.
         if self.drafter is not None:
-            draft_ctx = ForwardContext(
-                attn_backend=self.drafter.attn_backend,
-                token_to_kv_pool=self.drafter.token_to_kv_pool,
-                req_to_page=self.drafter.req_to_page,
-                bs=0,
-                num_extends=0,
-                input_num_tokens=0,
-                forward_mode=ForwardMode.IDLE,
-                global_num_tokens=global_num_tokens,
-                global_bs=global_bs,
-                all_decode_or_idle=all_decode_or_idle,
-            )
-            for _ in range(self.drafter.spec_num_steps):
+            for step_idx in range(self.drafter.spec_num_steps):
+                # Mirror active rank's catch-up step: when all non-idle ranks
+                # are decoding, step 0 sizes collectives from bs/global_bs.
+                draft_ctx = ForwardContext(
+                    attn_backend=self.drafter.attn_backend,
+                    token_to_kv_pool=self.drafter.token_to_kv_pool,
+                    req_to_page=self.drafter.req_to_page,
+                    bs=0,
+                    num_extends=0,
+                    input_num_tokens=0,
+                    forward_mode=ForwardMode.IDLE,
+                    global_num_tokens=global_num_tokens,
+                    global_bs=global_bs,
+                    all_decode_or_idle=all_decode_or_idle,
+                    draft_first_step_reduce=(step_idx == 0 and all_decode_or_idle),
+                )
                 self.drafter.draft_model_runner.forward(
                     draft_ctx,
                     input_ids=empty,
                     positions=empty,
                     out_cache_loc=empty,
-                    input_lengths=empty,
+                    spec_step_idx=step_idx,
                 )
 
     def update_block_table(self, forward_op) -> ModelExecutionResult:
@@ -728,6 +970,45 @@ class ModelExecutor:
                 device=self.device,
                 req_to_page=self.req_to_page,
             )
+
+    def reset_remote_prefill_mamba_inputs(self, forward_op) -> None:
+        if self.runtime_states.mamba_pool is None:
+            return
+        if not hasattr(self.attn_backend, "reset_current_inputs"):
+            return
+
+        num_extends = forward_op.num_extends()
+        if num_extends <= 0:
+            return
+
+        mamba_indices = list(getattr(forward_op, "mamba_pool_indices", []))
+        if not mamba_indices:
+            return
+
+        req_pool_indices = list(forward_op.request_pool_indices[:num_extends])
+        pairs = [
+            (int(req_pool_idx), int(mamba_idx))
+            for req_pool_idx, mamba_idx in zip(
+                req_pool_indices, mamba_indices[:num_extends]
+            )
+            if int(mamba_idx) >= 0
+        ]
+        if not pairs:
+            return
+
+        req_pool_tensor = torch.tensor(
+            [req_pool_idx for req_pool_idx, _ in pairs],
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=True,
+        ).to(self.device, non_blocking=True)
+        mamba_tensor = torch.tensor(
+            [mamba_idx for _, mamba_idx in pairs],
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=True,
+        ).to(self.device, non_blocking=True)
+        self.attn_backend.reset_current_inputs(req_pool_tensor, mamba_tensor)
 
     @nvtx_range("reset_valid_cache_length", color="orange")
     def reset_valid_cache_length(self, forward_op) -> None:
@@ -799,6 +1080,67 @@ class ModelExecutor:
                     mask_1d, hist_dev, vcl
                 )
 
+    def set_layerwise_mamba_cow_done(
+        self, cow_by_src: dict[int, list[int]] | None
+    ) -> None:
+        self._layerwise_mamba_cow_done = (
+            {
+                int(src): {int(dst) for dst in dsts}
+                for src, dsts in cow_by_src.items()
+                if dsts
+            }
+            if cow_by_src
+            else None
+        )
+
+    def _skip_completed_layerwise_mamba_cow(
+        self, forward_op, bs: int
+    ) -> torch.Tensor | None:
+        cow_done = self._layerwise_mamba_cow_done
+        self._layerwise_mamba_cow_done = None
+        if not cow_done or not getattr(self.input_buffers, "has_mamba", False):
+            return None
+        cow_src_indices = getattr(forward_op, "mamba_cow_src_indices", None)
+        working_indices = getattr(forward_op, "mamba_pool_indices", None)
+        if cow_src_indices is None or working_indices is None:
+            return None
+
+        cow_src_indices = list(cow_src_indices)[:bs]
+        working_indices = list(working_indices)[:bs]
+        skipped_mask = [False] * bs
+        changed = False
+        for i, (cow_src, working) in enumerate(zip(cow_src_indices, working_indices)):
+            cow_src = int(cow_src)
+            working = int(working)
+            if working in cow_done.get(cow_src, set()):
+                cow_src_indices[i] = -1
+                skipped_mask[i] = True
+                changed = True
+        if not changed:
+            return None
+
+        self.input_buffers._mamba_cow_src_indices_cpu[:bs].copy_(
+            torch.as_tensor(cow_src_indices, dtype=torch.int32)
+        )
+        cow_src_buf = self.input_buffers.mamba_cow_src_indices_buf
+        cow_src_buf[:bs].copy_(
+            self.input_buffers._mamba_cow_src_indices_cpu[:bs], non_blocking=True
+        )
+        return torch.tensor(skipped_mask, dtype=torch.bool, device=cow_src_buf.device)
+
+    @staticmethod
+    def _mamba_retract_reset_mask(
+        mamba_cow_src: torch.Tensor,
+        bs: int,
+        skipped_layerwise_cow_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        reset_mask = mamba_cow_src[:bs] >= 0
+        if skipped_layerwise_cow_mask is not None:
+            reset_mask = reset_mask | skipped_layerwise_cow_mask[:bs].to(
+                device=reset_mask.device, dtype=torch.bool
+            )
+        return reset_mask
+
     def execute_forward_op(
         self,
         forward_op,
@@ -807,11 +1149,15 @@ class ModelExecutor:
         dp_global_bs=None,
         dp_all_decode_or_idle: bool = False,
         grammar_inputs=None,
+        multimodal_context=None,
+        capture_next_input_ids: bool = False,
     ) -> ModelExecutionResult:
+        num_extends = forward_op.num_extends()
+        total_tokens = sum(forward_op.input_lengths)
+        self._active_multimodal_context = multimodal_context
+        self._active_positions_override = None
 
         with nvtx_range("pre_fill_setup", color="orange"):
-            num_extends = forward_op.num_extends()
-            total_tokens = sum(forward_op.input_lengths)
             has_retract = num_extends <= 0 and any(
                 x != -1 for x in getattr(forward_op, "hist_token_lens", [])
             )
@@ -822,21 +1168,31 @@ class ModelExecutor:
             torch.cuda.current_stream().wait_stream(self.execution_stream)
             self.execution_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.execution_stream):
-            self.input_buffers.fill_input_buffers(
+            bs = len(forward_op.request_ids)
+            decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
                 req_to_page=self.req_to_page,
                 total_tokens=total_tokens,
             )
+            skipped_layerwise_cow_mask = self._skip_completed_layerwise_mamba_cow(
+                forward_op, bs
+            )
+            self._active_positions_override = self._build_mrope_positions_override(
+                forward_op=forward_op,
+                multimodal_context=multimodal_context,
+                total_tokens=total_tokens,
+            )
 
-            if num_extends > 0:
-                forward_mode = ForwardMode.EXTEND
-            elif self.drafter is not None:
-                forward_mode = ForwardMode.TARGET_VERIFY
-            else:
-                forward_mode = ForwardMode.DECODE
+            forward_mode = ForwardMode.from_num_extends(
+                num_extends,
+                bs,
+                has_drafter=self.drafter is not None,
+                use_target_verify=self.config.use_target_verify_forward_mode,
+            )
 
-            bs = len(forward_op.request_ids)
+            if num_extends <= 0:
+                self._prev_decode_bs = bs
 
             if self.runtime_states.mamba_pool is not None and (
                 num_extends > 0 or has_retract
@@ -850,9 +1206,25 @@ class ModelExecutor:
                     self.runtime_states.zero_mamba_states(
                         mamba_pool_indices,
                         mamba_cow_src,
-                        self.input_buffers.extend_prefix_lens_buf[:bs],
-                        bs,
+                        self.input_buffers.extend_prefix_lens_buf[:num_extends],
+                        num_extends,
                     )
+                    if hasattr(self.attn_backend, "reset_current_inputs"):
+                        self.attn_backend.reset_current_inputs(
+                            self.input_buffers.req_pool_indices_buf[:num_extends],
+                            mamba_pool_indices[:num_extends],
+                        )
+                elif has_retract:
+                    if hasattr(self.attn_backend, "reset_current_inputs"):
+                        retract_mask = self._mamba_retract_reset_mask(
+                            mamba_cow_src,
+                            bs,
+                            skipped_layerwise_cow_mask,
+                        )
+                        self.attn_backend.reset_current_inputs(
+                            self.input_buffers.req_pool_indices_buf[:bs][retract_mask],
+                            mamba_pool_indices[:bs][retract_mask],
+                        )
 
             grammar_completion = None
 
@@ -862,6 +1234,42 @@ class ModelExecutor:
                 output_lengths = torch.zeros(bs, dtype=torch.int32, device=self.device)
                 output_logprobs = None
             else:
+                gather_ids = None
+                if num_extends > 0:
+                    num_decodes = bs - num_extends
+                    if self.drafter is not None and num_decodes > 0:
+                        # MIXED + spec: prefill rows pruned to last token,
+                        # decode block kept full at verify width.
+                        num_decode_tokens = num_decodes * self.config.spec_num_tokens
+                        num_prefill_tokens = total_tokens - num_decode_tokens
+                        gather_ids = torch.empty(
+                            num_extends + num_decode_tokens,
+                            dtype=torch.int64,
+                            device=self.device,
+                        )
+                        gather_ids[:num_extends] = (
+                            torch.cumsum(
+                                self.input_buffers.input_lengths_buf[:num_extends],
+                                dim=0,
+                            )
+                            - 1
+                        )
+                        gather_ids[num_extends:] = torch.arange(
+                            num_prefill_tokens,
+                            total_tokens,
+                            device=self.device,
+                            dtype=torch.int64,
+                        )
+                    else:
+                        # EXTEND, MIXED non-spec, or EXTEND + spec: last token
+                        # per request via cumsum.
+                        gather_ids = (
+                            torch.cumsum(
+                                self.input_buffers.input_lengths_buf[:bs], dim=0
+                            )
+                            - 1
+                        )
+
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
                     token_to_kv_pool=self.token_to_kv_pool,
@@ -875,9 +1283,8 @@ class ModelExecutor:
                         if self.drafter is not None
                         else CaptureHiddenMode.NULL
                     ),
-                    padded_static_len=-1,
-                    keep_full_logits=forward_mode.is_decode_or_idle()
-                    or forward_mode.is_target_verify(),
+                    gather_ids=gather_ids,
+                    decode_input_ids=decode_input_ids,
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:
@@ -894,7 +1301,7 @@ class ModelExecutor:
                     grammar_completion = setup_grammar_step(
                         sampling_info=sampling_info,
                         bs=bs,
-                        is_spec_decode=self.drafter is not None and num_extends <= 0,
+                        is_spec_decode=self.drafter is not None and num_extends < bs,
                         spec_num_tokens=self.config.spec_num_tokens or 1,
                         grammar_inputs=grammar_inputs,
                         grammar_runtime=self.grammar_runtime,
@@ -982,12 +1389,51 @@ class ModelExecutor:
                     output_tokens=output_tokens,
                     accept_lengths=output_lengths,
                     input_lengths=self.input_buffers.input_lengths_buf[:bs],
-                    is_extend=num_extends > 0,
+                    num_extends=num_extends,
+                )
+                self._snapshot_mamba_checkpoints(
+                    output_lengths,
+                    bs,
+                    num_extends,
                 )
 
             with nvtx_range("output_d2h", color="green"):
-                output_tokens = output_tokens.to("cpu", non_blocking=True)
-                output_lengths = output_lengths.to("cpu", non_blocking=True)
+                next_input_ids = None
+                if (
+                    capture_next_input_ids
+                    and self.drafter is not None
+                    and num_extends > 0
+                ):
+                    next_input_ids = self.runtime_states.future_input_map.index_select(
+                        0, self.input_buffers.req_pool_indices_buf[:num_extends]
+                    ).to("cpu", non_blocking=True)
+
+                # Defensive clamp into the valid vocab range (kept from the
+                # pre-pack path). An out-of-range token id -- e.g. a stale/corrupt
+                # value surfaced by the intermittent spec-decode decode-state race
+                # -- would otherwise reach the detokenizer, whose HF
+                # tokenizer.decode raises a fatal OverflowError on ids outside
+                # [0, vocab) and tears down the whole server process tree.
+                # It must run on-GPU *before* the non_blocking D2H: clamping the
+                # CPU result afterwards would race the in-flight copy. In-place
+                # (clamp_) so output_tokens keeps aliasing _output_pack_buf and
+                # the get_packed_output_d2h data_ptr fast-path still fires -- and
+                # in-place on the forward's inference tensors is only legal inside
+                # inference mode, so re-enter it (maybe_inference_mode mirrors the
+                # forward and reduces to no_grad when inference mode is disabled,
+                # where output_tokens isn't an inference tensor anyway).
+                vocab_size = self.runtime_states.vocab_size
+                with maybe_inference_mode():
+                    output_tokens.clamp_(0, vocab_size - 1)
+
+                packed = self.sampling_backend.get_packed_output_d2h(
+                    output_tokens, output_lengths
+                )
+                if packed is not None:
+                    output_tokens, output_lengths = packed
+                else:
+                    output_tokens = output_tokens.to("cpu", non_blocking=True)
+                    output_lengths = output_lengths.to("cpu", non_blocking=True)
 
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)
@@ -1001,4 +1447,80 @@ class ModelExecutor:
             output_logprobs=output_logprobs,
             copy_event=copy_event,
             grammar_completion=grammar_completion,
+            next_input_ids=next_input_ids,
         )
+
+    def write_remote_spec_candidate_ids(
+        self, req_pool_idx: int, candidate_ids: list[int]
+    ) -> None:
+        # Remote spec candidates are CPU materialized; enqueue the H2D copy and
+        # future_input_map update on execution_stream. The next forward's input
+        # prep already waits on execution_stream before reading runtime state.
+        with torch.cuda.stream(self.execution_stream):
+            self.runtime_states.write_remote_spec_candidate_ids(
+                req_pool_idx, candidate_ids
+            )
+
+    def _expand_mrope_from_input(self, mm_input, seq_len: int) -> torch.Tensor:
+        # Cache delta expansion for retracted/chunked requests.
+        if mm_input.mrope_position_delta_repeated_cache is None:
+            mm_input.mrope_position_delta_repeated_cache = (
+                (mm_input.mrope_position_delta - 1).flatten().unsqueeze(0).repeat(3, 1)
+            )
+        return mm_input.mrope_position_delta_repeated_cache + seq_len
+
+    def _build_mrope_positions_override(
+        self,
+        forward_op,
+        multimodal_context,
+        total_tokens: int,
+    ) -> torch.Tensor | None:
+        if not self.config.model_is_mrope or total_tokens == 0:
+            return None
+
+        is_prefill = forward_op.num_extends() > 0
+        base_positions = self.input_buffers.positions_buf[:total_tokens]
+        pos_chunks = torch.split(base_positions, list(forward_op.input_lengths), dim=0)
+        mrope_chunks = []
+        mm_inputs = (
+            multimodal_context.mm_inputs
+            if multimodal_context is not None and multimodal_context.has_inputs()
+            else []
+        )
+
+        for batch_idx, base_chunk in enumerate(pos_chunks):
+            mm_input = mm_inputs[batch_idx] if batch_idx < len(mm_inputs) else None
+            if mm_input is None or mm_input.mrope_positions is None:
+                mrope_chunks.append(base_chunk.unsqueeze(0).expand(3, -1))
+                continue
+
+            if is_prefill and batch_idx < len(forward_op.extend_prefix_lens):
+                start = int(forward_op.extend_prefix_lens[batch_idx])
+                end = start + int(forward_op.input_lengths[batch_idx])
+                positions = mm_input.mrope_positions[:, start:end]
+                if positions.numel() != 0:
+                    mrope_chunks.append(
+                        positions.to(device=self.device, dtype=torch.int64)
+                    )
+                    continue
+                if base_chunk.numel() == 1:
+                    seq_len = int(base_chunk[-1].item()) + 1
+                    mrope_chunks.append(
+                        self._expand_mrope_from_input(mm_input, seq_len).to(
+                            device=self.device, dtype=torch.int64
+                        )
+                    )
+                    continue
+
+            delta = mm_input.mrope_position_delta
+            if delta is None:
+                delta = torch.zeros(1, dtype=torch.int64)
+            delta = delta.flatten()[0].to(device=self.device, dtype=torch.int64)
+            # Decode positions need (mrope_delta - 1) + seq_len. positions_buf
+            # already stores the per-token zero-based position (seq_len - 1 for
+            # decode), so this is the same value without a GPU-to-CPU sync.
+            mrope_chunks.append((base_chunk + delta).unsqueeze(0).expand(3, -1))
+
+        mrope_positions = torch.cat(mrope_chunks, dim=1).contiguous()
+        self.input_buffers.mrope_positions_buf[:, :total_tokens].copy_(mrope_positions)
+        return self.input_buffers.mrope_positions_buf[:, :total_tokens]

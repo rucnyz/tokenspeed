@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
@@ -36,15 +37,32 @@ if TYPE_CHECKING:
 class AttentionBackend(ABC):
     """The base class of attention backends"""
 
+    uses_paged_cache_groups: bool = False
+    uses_padded_decode_token_mask: bool = False
+
     def __init__(self, config: BaseAttnConfig) -> None:
         self.device = config.device
         self.num_qo_heads = config.num_attention_heads // config.attn_tp_size
         self.num_kv_heads = max(config.num_kv_heads // config.attn_tp_size, 1)
         self.dtype = config.dtype
         self.head_dim = config.head_dim
+        self.is_draft = config.is_draft
+        self.spec_num_tokens = config.speculative_num_draft_tokens
 
-    @property
-    def support_kv_cache_prewrite(self) -> bool:
+    @contextmanager
+    def override_num_extends(self, num_extends: int):
+        """Temporarily override the decode-metadata slice discriminator for the
+        wrapped block. Used by MLA backends to flip between drafter step 0
+        (slice = [num_extends:]) and step 1+ (slice = [0:]).
+
+        Default no-op for backends that fill separate prefill/decode metadata
+        at init time.
+        """
+        yield
+
+    def support_kv_cache_prewrite(
+        self, forward_mode: ForwardMode | None = None
+    ) -> bool:
         return False
 
     @property
@@ -69,7 +87,6 @@ class AttentionBackend(ABC):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -119,6 +136,7 @@ class AttentionBackend(ABC):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool: BaseTokenToKVPool,
         forward_mode: ForwardMode,
+        bs: int,
         save_kv_cache: bool = True,
         **kwargs,
     ):
@@ -131,6 +149,7 @@ class AttentionBackend(ABC):
                 layer,
                 out_cache_loc,
                 token_to_kv_pool,
+                bs,
                 save_kv_cache=save_kv_cache,
                 **kwargs,
             )
@@ -149,6 +168,7 @@ class AttentionBackend(ABC):
                 layer,
                 out_cache_loc,
                 token_to_kv_pool,
+                bs,
                 save_kv_cache=save_kv_cache,
                 forward_mode=forward_mode,
                 **kwargs,
@@ -170,6 +190,7 @@ class AttentionBackend(ABC):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool: BaseTokenToKVPool,
+        bs: int,
         save_kv_cache: bool = True,
         **kwargs,
     ):
@@ -184,6 +205,7 @@ class AttentionBackend(ABC):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool: BaseTokenToKVPool,
+        bs: int,
         save_kv_cache: bool = True,
         **kwargs,
     ):

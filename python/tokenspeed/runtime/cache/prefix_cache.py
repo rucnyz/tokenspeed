@@ -186,6 +186,9 @@ class PrefixCache(BasePrefixCache):
         self.protected_size_ = 0
         self.evictable_leaves: set[TreeNode] = set()
 
+        if self.enable_kv_cache_events and KV_EVENTS_AVAILABLE:
+            self.kv_event_queue.append(AllBlocksCleared())
+
     def match_prefix(self, key: list, **kwargs) -> MatchResult:
         """Find the matching prefix from the prefix tree.
         Args:
@@ -198,9 +201,6 @@ class PrefixCache(BasePrefixCache):
             than the last node's value.
         """
 
-        # Emit AllBlocksCleared event when cache is reset
-        if self.enable_kv_cache_events and KV_EVENTS_AVAILABLE:
-            self.kv_event_queue.append(AllBlocksCleared())
         if self.disable or len(key) == 0:
             return self._empty_match_result()
 
@@ -644,17 +644,3 @@ class PrefixCache(BasePrefixCache):
                 continue
             block_hash = hash(tuple(page_tokens))
             self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
-
-
-if __name__ == "__main__":
-    params = CacheInitParams(
-        req_to_token_pool=None, token_to_kv_pool_allocator=None, disable=False
-    )
-    tree = PrefixCache(params=params)
-    tree.insert([(1, 2), (3, 4)], [torch.tensor([1, 2]), torch.tensor([3, 4])])
-    tree.insert(
-        [(1, 2), (3, 4), (5, 6)],
-        [torch.tensor([1, 2]), torch.tensor([6, 5]), torch.tensor([7, 8])],
-    )
-    tree.pretty_print()
-    print(tree.match_prefix([(1, 2), (3, 4)]))

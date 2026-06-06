@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <span>
 #include <string>
 #include <vector>
@@ -69,6 +70,21 @@ struct MatchResult {
     // Mamba extension (default: no mamba cache, -1 = inactive)
     std::int32_t mamba_branching_seqlen{-1};
     std::int32_t mamba_cow_src_index{-1};
+    std::int32_t mamba_host_src_index{-1};
+
+    // Paged-cache adjunct hit. Null last_node or zero prefix means no imported prefix.
+    // history_hit_tokens records the deepest complete history chain observed; it may
+    // be deeper than prefix_len_tokens when state restoration is unavailable.
+    // When hit, device/host last_node also sit at or before prefix_len_tokens.
+    // base_logical_page is 0 for full-history groups; > 0 for sliding windows.
+    // TODO(match-result-pagedcache-zero-copy): return snapshot+depth and walk on demand.
+    struct PagedCache {
+        TreeNode* last_node{nullptr};
+        std::int32_t prefix_len_tokens{0};
+        std::int32_t history_hit_tokens{0};
+        std::map<std::string, std::vector<std::int32_t>> per_group_page_ids;
+        std::map<std::string, std::int32_t> per_group_base_logical_page;
+    } paged_cache;
 };
 
 struct InsertResult {

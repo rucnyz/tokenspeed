@@ -23,9 +23,10 @@
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.qwen3_5_text_base_config import Qwen3_5BaseTextConfig
+from tokenspeed.runtime.configs.qwen3_vision_config import Qwen3VLVisionConfig
 
 
-class Qwen3_5VisionConfig:
+class Qwen3_5VisionConfig(Qwen3VLVisionConfig):
     model_type = "qwen3_5"
     base_config_key = "vision_config"
 
@@ -71,6 +72,7 @@ class Qwen3_5Config(PretrainedConfig):
         tie_word_embeddings=False,
         **kwargs,
     ):
+        self.vision_config = self._ensure_vision_config(vision_config)
         self.text_config = self._ensure_text_config(text_config)
 
         self.image_token_id = image_token_id
@@ -84,24 +86,50 @@ class Qwen3_5Config(PretrainedConfig):
         text_cls = self.sub_configs["text_config"]
         if isinstance(text_config, dict):
             return text_cls(**text_config)
+        if isinstance(text_config, Qwen3_5Config):
+            nested_text_config = text_config.__dict__.get("text_config")
+            if nested_text_config is not None and nested_text_config is not text_config:
+                return self._ensure_text_config(nested_text_config)
         if text_config is None:
             return text_cls()
         return text_config
+
+    def _ensure_vision_config(self, vision_config):
+        """Convert vision_config to the proper config class if it's a dict."""
+        vision_cls = self.sub_configs["vision_config"]
+        if isinstance(vision_config, dict):
+            return vision_cls(**vision_config)
+        if vision_config is None:
+            return vision_cls()
+        return vision_config
 
     def __setattr__(self, name, value):
         # from_pretrained re-assigns text_config as a raw dict after __init__;
         # intercept and convert it back to the proper config class.
         if name == "text_config" and isinstance(value, dict):
             value = self._ensure_text_config(value)
+        elif name == "vision_config" and isinstance(value, dict):
+            value = self._ensure_vision_config(value)
         super().__setattr__(name, value)
 
     def __getattr__(self, name):
         """Forward attribute access to text_config for inference-only usage."""
-        try:
-            text_config = super().__getattribute__("text_config")
-            return getattr(text_config, name)
-        except AttributeError:
+        if name.startswith("_") or name in {"text_config", "vision_config"}:
             raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
+
+        text_config = self.__dict__.get("text_config")
+        if isinstance(text_config, dict):
+            text_config = self._ensure_text_config(text_config)
+            self.__dict__["text_config"] = text_config
+        if text_config is None or text_config is self:
+            raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
+
+        try:
+            return getattr(text_config, name)
+        except AttributeError as exc:
+            raise AttributeError(
+                f"'{type(self).__name__}' has no attribute '{name}'"
+            ) from exc
 
 
 class Qwen3_5MoeVisionConfig(Qwen3_5VisionConfig):
@@ -123,3 +151,8 @@ class Qwen3_5MoeConfig(Qwen3_5Config):
         "vision_config": Qwen3_5MoeVisionConfig,
         "text_config": Qwen3_5MoeTextConfig,
     }
+
+    def __init__(self, **kwargs):
+        # Explicit __init__ prevents transformers from auto-generating one
+        # that skips Qwen3_5Config.__init__ (text/vision config setup).
+        super().__init__(**kwargs)

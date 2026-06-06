@@ -1,3 +1,9 @@
+# Adapted from meituan-longcat/SGLang-FluentLLM.
+# This file has been modified for this repository.
+# This file may incorporate material from ModelTC/lightllm,
+# vllm-project/vllm, and sgl-project/sglang, as identified in
+# python/THIRDPARTYNOTICES.
+
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -686,11 +692,25 @@ def check_close_model_outputs(
     rouge_l_tolerance: float,
     debug_text: str = "",
     check_logprobs: bool = True,
+    extra_references: Optional[List[List[str]]] = None,
 ):
     # Compare output strings
     print(f"{hf_outputs.output_strs=}")
     print(f"{rt_outputs.output_strs=}")
-    rouge_l_scores = calculate_rouge_l(hf_outputs.output_strs, rt_outputs.output_strs)
+    base_scores = calculate_rouge_l(hf_outputs.output_strs, rt_outputs.output_strs)
+    if extra_references:
+        rouge_l_scores = [
+            max(
+                base,
+                *(
+                    calculate_rouge_l([ref[i]], [rt_outputs.output_strs[i]])[0]
+                    for ref in extra_references
+                ),
+            )
+            for i, base in enumerate(base_scores)
+        ]
+    else:
+        rouge_l_scores = base_scores
     print(f"{rouge_l_scores=}")
     assert all(
         score >= rouge_l_tolerance for score in rouge_l_scores

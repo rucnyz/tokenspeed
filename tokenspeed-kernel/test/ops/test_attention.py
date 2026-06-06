@@ -20,14 +20,13 @@
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 from tokenspeed_kernel import (
     mha_decode_with_kvcache,
+    mha_extend_with_kvcache,
+    mha_merge_state,
     mha_prefill,
-    mha_prefill_with_kvcache,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -53,9 +52,11 @@ def test_mha_prefill(
 ) -> None:
     seqlens_list = [17, 9, 12]
     max_seqlen = max(seqlens_list)
+    cu_seqlens_cpu = [0]
+    for seqlen in seqlens_list:
+        cu_seqlens_cpu.append(cu_seqlens_cpu[-1] + seqlen)
     seqlens = torch.tensor(seqlens_list, device=device, dtype=torch.int32)
-    cu_seqlens = torch.cumsum(seqlens, dim=0, dtype=torch.int32)
-    cu_seqlens = torch.nn.functional.pad(cu_seqlens, (1, 0))
+    cu_seqlens = torch.tensor(cu_seqlens_cpu, device=device, dtype=torch.int32)
     total_tokens = int(seqlens.sum().item())
 
     q = torch.randn(total_tokens, num_q_heads, head_dim, device=device, dtype=dtype)
@@ -66,11 +67,9 @@ def test_mha_prefill(
         q=q,
         k=k,
         v=v,
-        cu_seqlens_q=cu_seqlens,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_k=max_seqlen,
-        softmax_scale=1.0 / math.sqrt(head_dim),
-        is_causal=True,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        max_seqlen=max_seqlen,
     )
 
     assert out.shape == q.shape
@@ -80,7 +79,7 @@ def test_mha_prefill(
     "dtype,head_dim,num_q_heads,num_kv_heads",
     [(torch.bfloat16, 128, 8, 2)],
 )
-def test_mha_prefill_with_kvcache(
+def test_mha_extend_with_kvcache(
     device: str,
     dtype: torch.dtype,
     head_dim: int,
@@ -163,10 +162,8 @@ def test_mha_prefill_with_kvcache(
                     dtype=dtype,
                 )
 
-    out = mha_prefill_with_kvcache(
+    out = mha_extend_with_kvcache(
         q=q,
-        k=None,
-        v=None,
         cu_seqlens_q=cu_seqlens_q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -174,11 +171,25 @@ def test_mha_prefill_with_kvcache(
         cache_seqlens=cache_seqlens,
         max_seqlen_q=max_query_seqlen,
         max_seqlen_k=max_cache_seqlen_used,
-        softmax_scale=1.0 / math.sqrt(head_dim),
-        is_causal=True,
     )
 
     assert out.shape == q.shape
+
+    triton_out, triton_lse = mha_extend_with_kvcache(
+        q=q,
+        cu_seqlens_q=cu_seqlens_q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=prefix_seqlens,
+        max_seqlen_q=max_query_seqlen,
+        max_seqlen_k=int(prefix_seqlens.max().item()),
+        return_lse=True,
+        solution="triton",
+    )
+
+    assert triton_out.shape == q.shape
+    assert triton_lse.shape == (q.shape[0], q.shape[1])
 
 
 @pytest.mark.parametrize(
@@ -264,8 +275,54 @@ def test_mha_decode_with_kvcache(
         page_table=page_table,
         cache_seqlens=cache_seqlens,
         max_seqlen_k=max_cache_seqlen,
-        softmax_scale=1.0 / math.sqrt(head_dim),
-        is_causal=True,
     )
 
     assert out.shape == q.shape
+
+
+@pytest.mark.parametrize(
+    "dtype,head_dim,num_heads",
+    [(torch.bfloat16, 64, 8)],
+)
+@pytest.mark.parametrize(
+    "solution",
+    [None, "triton", "cuda"],
+    ids=["auto", "triton", "cuda"],
+)
+def test_mha_merge_state(
+    device: str,
+    solution: str | None,
+    dtype: torch.dtype,
+    head_dim: int,
+    num_heads: int,
+) -> None:
+    if solution == "cuda" and not (platform.is_nvidia and platform.is_hopper_plus):
+        pytest.skip("CUDA merge-state kernel is NVIDIA Hopper+-only")
+
+    total_q = 31
+    out_a = torch.randn(total_q, num_heads, head_dim, device=device, dtype=dtype)
+    out_b = torch.randn(total_q, num_heads, head_dim, device=device, dtype=dtype)
+    lse_a = torch.randn(total_q, num_heads, device=device, dtype=torch.float32)
+    lse_b = torch.randn(total_q, num_heads, device=device, dtype=torch.float32)
+
+    out, lse = mha_merge_state(
+        out_a,
+        lse_a,
+        out_b,
+        lse_b,
+        solution=solution,
+    )
+
+    lse_ref = torch.maximum(lse_a, lse_b)
+    weight_a = torch.exp(lse_a - lse_ref)
+    weight_b = torch.exp(lse_b - lse_ref)
+    denom = weight_a + weight_b
+    out_ref = (
+        out_a.float() * weight_a[..., None] + out_b.float() * weight_b[..., None]
+    ) / denom[..., None]
+    lse_ref = lse_ref + torch.log(denom)
+
+    assert out.shape == out_a.shape
+    assert lse.shape == lse_a.shape
+    torch.testing.assert_close(out.float(), out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-5, atol=1e-5)

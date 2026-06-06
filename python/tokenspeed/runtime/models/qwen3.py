@@ -26,6 +26,7 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
+from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
@@ -187,13 +188,13 @@ class Qwen3Attention(nn.Module):
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        q_by_head = q.reshape(-1, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
-        k_by_head = k.reshape(-1, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.view(k.shape)
-        return q, k
+        return qk_rmsnorm(
+            q,
+            k,
+            self.q_norm.weight.data,
+            self.k_norm.weight.data,
+            self.q_norm.variance_epsilon,
+        )
 
     def _rotate_half(self, x):
         x1 = x[..., : x.shape[-1] // 2]
@@ -287,9 +288,7 @@ class Qwen3DecoderLayer(nn.Module):
         elif (
             ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]
         ):
-            hidden_states = all_reduce(
-                hidden_states, self.mapping.dense.tp_rank, self.mapping.dense.tp_group
-            )
+            hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         else:
             hidden_states, residual, *_ = (
@@ -311,9 +310,7 @@ class Qwen3DecoderLayer(nn.Module):
 
         # Fully Connected
         if ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]:
-            hidden_states = all_reduce(
-                hidden_states, self.mapping.attn.tp_rank, self.mapping.attn.tp_group
-            )
+            hidden_states = all_reduce(hidden_states, self.mapping.attn.tp_group)
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
@@ -394,9 +391,7 @@ class Qwen3Model(nn.Module):
                 cos_sin=None,
             )
         if ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]:
-            hidden_states = all_reduce(
-                hidden_states, self.mapping.dense.tp_rank, self.mapping.dense.tp_group
-            )
+            hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
             hidden_states, _ = self.norm(hidden_states, residual)
         else:
             hidden_states, *_ = self.norm.forward_with_allreduce_fusion(

@@ -146,10 +146,16 @@ def _initialize_model(
     model_class, _ = get_model_architecture(model_config)
     quant_config = _get_quantization_config(model_config, load_config)
     mapping = model_config.mapping
+    # Only VLM wrappers accept these kwargs.
+    extra_kwargs: dict = {}
+    if model_config.is_multimodal:
+        extra_kwargs["is_multimodal_active"] = model_config.is_multimodal_active
+        extra_kwargs["mm_attention_backend"] = model_config.mm_attention_backend
     return model_class(
         config=model_config.hf_config,
         mapping=mapping,
         quant_config=quant_config,
+        **extra_kwargs,
     )
 
 
@@ -214,7 +220,6 @@ class DefaultModelLoader(BaseModelLoader):
         if envs.TOKENSPEED_USE_MODELSCOPE.is_set():
             # download model from ModelScope hub,
             # lazy import so that modelscope is not required for normal use.
-            # pylint: disable=C.
             from modelscope.hub.snapshot_download import snapshot_download
 
             if not os.path.exists(model):

@@ -23,6 +23,8 @@
 Only supports all_reduce. Other ops delegate to a fallback backend.
 """
 
+from contextlib import nullcontext
+
 import torch
 
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
@@ -76,6 +78,13 @@ class CustomAllReduceBackend(CommBackend):
         ca_comm = res["ca_comm"]
         return ca_comm is not None and not ca_comm.disabled
 
+    def capture(self, group: Group):
+        res = self._get_or_create_resources(group)
+        ca_comm = res["ca_comm"]
+        if ca_comm is None or ca_comm.disabled:
+            return nullcontext()
+        return ca_comm.capture()
+
     # ---- Public CommBackend interface ----
 
     def all_reduce(self, tensor: torch.Tensor, group: Group, op=None) -> torch.Tensor:
@@ -111,7 +120,6 @@ class CustomAllReduceBackend(CommBackend):
     def token_all_gather(
         self,
         tensor: torch.Tensor,
-        rank: int,
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
@@ -120,7 +128,6 @@ class CustomAllReduceBackend(CommBackend):
     def token_reduce_scatter(
         self,
         tensor: torch.Tensor,
-        rank: int,
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:

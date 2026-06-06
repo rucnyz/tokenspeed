@@ -40,6 +40,22 @@ def has_indexer_topk_prefill() -> bool:
     return hasattr(module, "deepseek_v4_indexer_topk_prefill")
 
 
+def has_indexer_mxfp4_paged_gather() -> bool:
+    try:
+        module = _load_deepseek_v4_attention_module()
+    except Exception:
+        return False
+    return hasattr(module, "deepseek_v4_gather_paged_indexer_mxfp4_cache")
+
+
+def has_persistent_topk() -> bool:
+    try:
+        module = _load_deepseek_v4_attention_module()
+    except Exception:
+        return False
+    return hasattr(module, "deepseek_v4_persistent_topk")
+
+
 def fused_qnorm_rope_kv_insert(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -49,6 +65,7 @@ def fused_qnorm_rope_kv_insert(
     cos_sin_cache: torch.Tensor,
     rms_norm_eps: float,
     block_size: int,
+    enable_pdl: bool = False,
 ) -> None:
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError(f"q must be float16 or bfloat16, got {q.dtype}")
@@ -72,6 +89,7 @@ def fused_qnorm_rope_kv_insert(
         cos_sin_cache.contiguous(),
         float(rms_norm_eps),
         int(block_size),
+        bool(enable_pdl),
     )
 
 
@@ -96,4 +114,67 @@ def indexer_topk_prefill(
         row_ends.contiguous(),
         output,
         int(k),
+    )
+
+
+def indexer_mxfp4_paged_gather(
+    kv_cache: torch.Tensor,
+    values_out: torch.Tensor,
+    scales_out: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    cache_block_size: int,
+) -> None:
+    if kv_cache.dtype != torch.uint8:
+        raise TypeError(f"kv_cache must be uint8, got {kv_cache.dtype}")
+    if values_out.dtype != torch.uint8:
+        raise TypeError(f"values_out must be uint8, got {values_out.dtype}")
+    if scales_out.dtype != torch.uint8:
+        raise TypeError(f"scales_out must be uint8, got {scales_out.dtype}")
+    if block_table.dtype != torch.int32:
+        block_table = block_table.to(torch.int32)
+    if cu_seq_lens.dtype != torch.int32:
+        cu_seq_lens = cu_seq_lens.to(torch.int32)
+    if values_out.shape[0] != scales_out.shape[0]:
+        raise ValueError(
+            "DeepSeek V4 paged gather output value/scale rows must match, "
+            f"got values={values_out.shape[0]}, scales={scales_out.shape[0]}"
+        )
+    _load_deepseek_v4_attention_module().deepseek_v4_gather_paged_indexer_mxfp4_cache(
+        kv_cache,
+        values_out,
+        scales_out,
+        block_table.contiguous(),
+        cu_seq_lens.contiguous(),
+        int(cache_block_size),
+    )
+
+
+def persistent_topk(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    output: torch.Tensor,
+    workspace: torch.Tensor,
+    k: int,
+    max_seq_len: int,
+) -> None:
+    if logits.dtype != torch.float32:
+        raise TypeError(f"logits must be float32, got {logits.dtype}")
+    if lengths.dtype != torch.int32:
+        lengths = lengths.to(torch.int32)
+    if output.dtype != torch.int32:
+        raise TypeError(f"output must be int32, got {output.dtype}")
+    if workspace.dtype != torch.uint8:
+        raise TypeError(f"workspace must be uint8, got {workspace.dtype}")
+    if not logits.is_contiguous():
+        logits = logits.contiguous()
+    if not lengths.is_contiguous():
+        lengths = lengths.contiguous()
+    _load_deepseek_v4_attention_module().deepseek_v4_persistent_topk(
+        logits,
+        lengths,
+        output,
+        workspace,
+        int(k),
+        int(max_seq_len),
     )

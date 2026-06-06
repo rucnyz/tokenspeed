@@ -106,22 +106,57 @@ pip_install_with_retry pip3 install tokenspeed-scheduler/
 # Step 5: Install TokenSpeed
 # ============================================================
 echo "=== Step 5: Install TokenSpeed ==="
-# Pin smg / smg-grpc-servicer / smg-grpc-proto: the `tokenspeed` submodule
-# that `ts serve` imports (smg_grpc_servicer.tokenspeed.server) only exists
-# on these post-release pins. The three post-date versions must stay in sync:
-# the gRPC proto / runtime contract is pinned as a set.
-pip_install_with_retry pip3 install \
-    "smg==1.4.1.post20260512" \
-    "smg-grpc-servicer==0.5.2.post20260512" \
-    "smg-grpc-proto==0.4.7.post20260512" \
-    --extra-index-url https://lightseek.org/whl/cu130
-pip_install_with_retry pip3 install -e "./python[cuda_${SM}]" \
+# tokenspeed-smg / -grpc-servicer / -grpc-proto are pinned in
+# python/pyproject.toml; pip resolves them from PyPI as part of the
+# editable install below.
+pip_install_with_retry pip3 install -e "./python" \
     --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX}
 
 # ============================================================
-# Step 6: Fix Triton ptxas (CUDA 13+ only)
+# Step 6: Optionally override tokenspeed-mla with in-tree source
 # ============================================================
-echo "=== Step 6: Fix Triton ptxas ==="
+# Set by `.github/workflows/pr-test.yml` when the diff touches
+# `tokenspeed-mla/`. Without this override CI exercises whichever
+# `tokenspeed-mla` version is pinned in
+# `tokenspeed-kernel/python/requirements/cuda-thirdparty.txt` and the
+# in-tree change is silently ignored.
+if [ "${INSTALL_TOKENSPEED_MLA_FROM_SOURCE:-0}" = "1" ]; then
+    echo "=== Step 6: Reinstall tokenspeed-mla from in-tree source ==="
+    pip_install_with_retry pip3 install --break-system-packages \
+        --force-reinstall --no-deps "${WORKSPACE}/tokenspeed-mla"
+fi
+
+# ============================================================
+# Step 7: Pin critical kernel deps to exact versions
+# ============================================================
+echo "=== Step 7: Pin critical kernel deps ==="
+CUDA_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda.txt"
+pin_version() {
+    # Extract "<pkg>==<version>" for an exact-pinned package in cuda.txt.
+    local pkg="$1"
+    grep -E "^${pkg}==" "${CUDA_REQ}" | head -n1 | tr -d '[:space:]'
+}
+CUDA_MAJOR="${CUDA_VERSION%%.*}"
+PINNED_KERNEL_DEPS=()
+for pkg in nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-cu${CUDA_MAJOR} \
+           flashinfer-python flashinfer-cubin; do
+    spec="$(pin_version "${pkg}")"
+    if [ -n "${spec}" ]; then
+        PINNED_KERNEL_DEPS+=("${spec}")
+    fi
+done
+if [ "${#PINNED_KERNEL_DEPS[@]}" -gt 0 ]; then
+    echo "Force-reinstalling pinned kernel deps: ${PINNED_KERNEL_DEPS[*]}"
+    pip_install_with_retry pip3 install --break-system-packages \
+        --force-reinstall --no-deps "${PINNED_KERNEL_DEPS[@]}"
+else
+    echo "No pinned kernel deps found in ${CUDA_REQ}; skipping."
+fi
+
+# ============================================================
+# Step 8: Fix Triton ptxas (CUDA 13+ only)
+# ============================================================
+echo "=== Step 8: Fix Triton ptxas ==="
 if [ "${CUDA_VERSION%%.*}" = "13" ]; then
     TRITON_BIN="/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin"
     if [ -d "${TRITON_BIN}" ]; then

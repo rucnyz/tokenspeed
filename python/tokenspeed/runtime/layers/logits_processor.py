@@ -25,17 +25,23 @@ import dataclasses
 import torch
 import triton
 import triton.language as tl
+from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = get_colorful_logger(__name__)
 
@@ -74,11 +80,11 @@ class LogitsProcessorOutput:
 class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+    gather_ids: torch.Tensor | None = None
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
     extend_token_ids_logprob: bool = False
-    extend_seq_lens: torch.Tensor | None = None
     extend_seq_lens_cpu: list[int] | None = None
     extend_logprob_start_lens_cpu: list[int] | None = None
     extend_logprob_pruned_lens_cpu: list[int] | None = None
@@ -105,24 +111,65 @@ class LogitsMetadata:
     global_num_tokens_for_logprob_cpu: torch.Tensor | None = None
     global_num_tokens_for_logprob_gpu: torch.Tensor | None = None
 
-    # for padding
-    padded_static_len: int = -1
-
     @classmethod
-    def from_forward_context(
-        cls,
-        ctx: ForwardContext,
-        input_lengths: torch.Tensor,
-    ):
+    def from_forward_context(cls, ctx: ForwardContext):
         return cls(
             forward_mode=ctx.forward_mode,
             capture_hidden_mode=ctx.capture_hidden_mode,
-            extend_seq_lens=input_lengths,
-            padded_static_len=ctx.padded_static_len,
+            gather_ids=ctx.gather_ids,
         )
 
 
+_FUSED_LM_HEAD_GEMM = None
+
+
+def _get_fused_lm_head_gemm():
+    """Lazily import the fused lm_head GEMM kernel.
+
+    The kernel is only present when tokenspeed-kernel was built with a
+    compatible nvcc. Cache a sentinel when unavailable so we fall back
+    to ``torch.matmul`` silently on subsequent calls.
+    """
+    global _FUSED_LM_HEAD_GEMM
+    if _FUSED_LM_HEAD_GEMM is not None:
+        return _FUSED_LM_HEAD_GEMM
+    try:
+        from tokenspeed_kernel.thirdparty.cuda.lm_head_gemm import (
+            lm_head_gemm,
+            should_use_fused,
+        )
+
+        _FUSED_LM_HEAD_GEMM = (should_use_fused, lm_head_gemm)
+    except Exception:
+        _FUSED_LM_HEAD_GEMM = (None, None)
+    return _FUSED_LM_HEAD_GEMM
+
+
+def _lm_head_matmul(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Compute ``hidden_states @ weight.T``.
+
+    Routes to the fused ``lm_head_gemm`` when the shape matches a compiled
+    template and the bench-driven perf gate accepts (``should_use_fused``).
+    Otherwise falls back to ``torch.matmul``.
+
+    Only enabled for Kimi (``model_type == "kimi_k2"``) at the call site —
+    on DSv3 the fused kernel's PDL launch surface caused a downstream EAGLE3
+    spec decode AR regression that we have not characterised end-to-end; on
+    Kimi the perf win is the largest and the regression has not been
+    reproduced, so we gate the fused path to Kimi only.
+    """
+    cast_hidden = hidden_states.to(weight.dtype)
+    should_use_fused, lm_head_gemm = _get_fused_lm_head_gemm()
+    if should_use_fused is not None and should_use_fused(cast_hidden, weight):
+        return lm_head_gemm(cast_hidden, weight, enable_pdl=True)
+    return torch.matmul(cast_hidden, weight.T)
+
+
 class LogitsProcessor(nn.Module):
+
+    _LOGITS_AG_MAX_TOKENS = 128
+    _LOGITS_AG_STATE_UNINITIALIZED = object()
+
     def __init__(
         self,
         config,
@@ -145,6 +192,8 @@ class LogitsProcessor(nn.Module):
         assert tp_size == 1 or tp_group is not None
         self.tp_rank, self.tp_size, self.tp_group = tp_rank, tp_size, tp_group
 
+        self._all_gather_state = self._LOGITS_AG_STATE_UNINITIALIZED
+
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -153,6 +202,27 @@ class LogitsProcessor(nn.Module):
             and self.final_logit_softcapping < 0
         ):
             self.final_logit_softcapping = None
+
+        # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
+        self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
+
+    def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
+        if not current_platform().is_nvidia:
+            return None
+
+        if self.tp_size == 1 or self.skip_all_gather:
+            return None
+
+        vocab_padded = lm_head.weight.size(0) * self.tp_size
+        if vocab_padded % (self.tp_size * 8) != 0:
+            return None
+
+        return create_state(
+            group=pg_manager.get_process_group("nccl", self.tp_group),
+            rank_in_group=self.tp_rank,
+            max_tokens=self._LOGITS_AG_MAX_TOKENS,
+            hidden_size=vocab_padded,
+        )
 
     def forward(
         self,
@@ -163,38 +233,27 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: torch.Tensor | None = None,
     ) -> LogitsProcessorOutput:
         # Get the last hidden states and last logits for the next token prediction
-        if (
-            logits_metadata.forward_mode.is_decode_or_idle()
-            or logits_metadata.forward_mode.is_target_verify()
-        ):
-            pruned_states = hidden_states
-            if aux_hidden_states is not None:
-                aux_pruned_states = [hidden for hidden in aux_hidden_states]
-            sample_indices = None
-            input_logprob_indices = None
-        elif (
-            logits_metadata.forward_mode.is_extend()
-            and not logits_metadata.extend_return_logprob
-        ):
-            # Prefill without input logprobs.
-            if logits_metadata.padded_static_len < 0:
-                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+        if not logits_metadata.extend_return_logprob:
+            gather_ids = logits_metadata.gather_ids
+            if gather_ids is not None:
+                # Shapes align iff midlayer already pruned to one row per request
+                # (draft first-step reduce). Other paths emit [N, H] with N > bs.
+                if gather_ids.shape[0] == hidden_states.shape[0]:
+                    pruned_states = hidden_states
+                    if aux_hidden_states is not None:
+                        aux_pruned_states = list(aux_hidden_states)
+                else:
+                    pruned_states = hidden_states[gather_ids]
+                    if aux_hidden_states is not None:
+                        aux_pruned_states = [h[gather_ids] for h in aux_hidden_states]
             else:
-                # If padding_static length is 5 and extended_seq_lens is [2, 3],
-                # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
-                # and this retrieves t01 and t12, which are the valid last tokens
-                idx = torch.arange(
-                    len(logits_metadata.extend_seq_lens),
-                    device=logits_metadata.extend_seq_lens.device,
-                )
-                last_index = (
-                    idx * logits_metadata.padded_static_len
-                    + logits_metadata.extend_seq_lens
-                    - 1
-                )
-            pruned_states = hidden_states[last_index]
-            if aux_hidden_states is not None:
-                aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
+                assert (
+                    not logits_metadata.forward_mode.is_extend_or_mixed()
+                ), "EXTEND/MIXED forward must set gather_ids on ForwardContext"
+                pruned_states = hidden_states
+                if aux_hidden_states is not None:
+                    aux_pruned_states = list(aux_hidden_states)
+
             sample_indices = None
             input_logprob_indices = None
         else:
@@ -359,9 +418,12 @@ class LogitsProcessor(nn.Module):
         guarantee the given hidden_states follow this constraint.
         """
         if hasattr(lm_head, "weight"):
-            logits = torch.matmul(
-                hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-            )
+            if self._use_fused_lm_head:
+                logits = _lm_head_matmul(hidden_states, lm_head.weight)
+            else:
+                logits = torch.matmul(
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                )
         else:
             # GGUF models
             logits = lm_head.linear_method.apply(lm_head, hidden_states, embedding_bias)
@@ -370,21 +432,37 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         if self.tp_size > 1 and not self.skip_all_gather:
-            gathered_logits = torch.empty(
-                self.tp_size * logits.size(0),
-                logits.size(1),
-                dtype=logits.dtype,
-                device=logits.device,
-            )
-            all_gather_into_tensor(gathered_logits, logits, self.tp_rank, self.tp_group)
-            logits = (
-                gathered_logits.view(self.tp_size, logits.size(0), logits.size(1))
-                .transpose(0, 1)
-                .contiguous()
-                .view(logits.size(0), -1)
-            )
+            if self._all_gather_state is self._LOGITS_AG_STATE_UNINITIALIZED:
+                self._all_gather_state = self._init_all_gather_state(lm_head)
 
-        logits = logits[:, : self.config.vocab_size].float()
+            if (
+                self._all_gather_state is not None
+                and logits.size(0) <= self._LOGITS_AG_MAX_TOKENS
+            ):
+                # skip_entry_sync=True assumes other sync points existing between two all_gather_inner calls.
+                logits = all_gather_inner(
+                    self._all_gather_state,
+                    logits,
+                    tp_hidden_dim=logits.size(-1) * self.tp_size,
+                    skip_entry_sync=True,
+                    safe=False,
+                )
+            else:
+                gathered_logits = torch.empty(
+                    self.tp_size * logits.size(0),
+                    logits.size(1),
+                    dtype=logits.dtype,
+                    device=logits.device,
+                )
+                all_gather_into_tensor(gathered_logits, logits, self.tp_group)
+                logits = (
+                    gathered_logits.view(self.tp_size, logits.size(0), logits.size(1))
+                    .transpose(0, 1)
+                    .contiguous()
+                    .view(logits.size(0), -1)
+                )
+
+        logits = logits[:, : self.config.vocab_size].contiguous()
 
         if self.final_logit_softcapping:
             fused_softcap_generic(logits, self.final_logit_softcapping)
@@ -453,6 +531,7 @@ class LogitsProcessor(nn.Module):
         Returns:
             torch.Tensor: logprobs from logits
         """
+        last_logits = last_logits.float()
         # Scale logits if temperature scaling is enabled
         if logits_metadata.temp_scaled_logprobs:
             last_logits = last_logits / logits_metadata.temperature
@@ -486,14 +565,13 @@ def fused_softcap_kernel(
     mask = offsets < n_elements
 
     # Load values
-    x = tl.load(full_logits_ptr + offsets, mask=mask)
+    x = tl.load(full_logits_ptr + offsets, mask=mask).to(tl.float32)
 
     # Perform operations in-place
     x = x / softcapping_value
 
-    # Manual tanh implementation using exp
-    exp2x = tl.exp(2 * x)
-    x = (exp2x - 1) / (exp2x + 1)
+    # Stable tanh form; the exp ratio overflows to inf/inf for large logits.
+    x = 2 * tl.sigmoid(2 * x) - 1
 
     x = x * softcapping_value
 

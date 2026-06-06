@@ -25,11 +25,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
+import os
 import signal
 import sys
+from pathlib import Path
 
 from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
+from tokenspeed.cli._logo import print_logo
 from tokenspeed.cli._logprefix import ENGINE_TAG, GATEWAY_TAG, tag_stream
 from tokenspeed.cli._proc import (
     spawn_engine,
@@ -45,7 +49,18 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_GATEWAY_HOST = "0.0.0.0"
 DEFAULT_GATEWAY_PORT = 8000
-DEFAULT_REASONING_PARSER = "none"
+DEFAULT_REASONING_PARSER = "passthrough"
+DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
+DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
+DEFAULT_SMG_LOG_LEVEL = "warn"
+DEFAULT_SMG_PROMETHEUS_PORT = 8413
+# smg reliability knobs we always want disabled when launched under
+# ts serve. These are tokenspeed-internal defaults: not surfaced via
+# the ts CLI, not routed through split_argv.
+_DEFAULT_SMG_DISABLE_FLAGS = (
+    "--disable-circuit-breaker",
+    "--disable-retries",
+)
 
 
 def _check_serve_extra_installed() -> None:
@@ -53,20 +68,19 @@ def _check_serve_extra_installed() -> None:
 
     missing: list[str] = []
     if importlib.util.find_spec("smg") is None:
-        missing.append("smg")
+        missing.append("tokenspeed-smg")
     if importlib.util.find_spec("smg_grpc_servicer.tokenspeed.server") is None:
-        missing.append("smg-grpc-servicer")
+        missing.append("tokenspeed-smg-grpc-servicer")
     if missing:
         sys.stderr.write(
-            "ts serve requires SMG packages:\n\n"
+            "ts serve requires the bundled gateway packages, normally installed\n"
+            "as part of `tokenspeed`. Reinstall tokenspeed to restore them:\n\n"
+            "    pip install --force-reinstall --no-deps tokenspeed\n\n"
+            "or install them explicitly:\n\n"
             "    pip install \\\n"
-            "        'smg==1.4.1.post20260512' \\\n"
-            "        'smg-grpc-servicer==0.5.2.post20260512' \\\n"
-            "        'smg-grpc-proto==0.4.7.post20260512' \\\n"
-            "        --extra-index-url https://lightseek.org/whl/cu130/\n\n"
-            "Swap the index for other variants:\n"
-            "    https://lightseek.org/whl/cu129/      (CUDA 12.9)\n"
-            "    https://lightseek.org/whl/rocm7.2/    (ROCm 7.2)\n\n"
+            "        tokenspeed-smg \\\n"
+            "        tokenspeed-smg-grpc-servicer \\\n"
+            "        tokenspeed-smg-grpc-proto\n\n"
             f"Missing: {', '.join(missing)}\n"
         )
         sys.exit(1)
@@ -102,9 +116,211 @@ def _gateway_args_with_default_reasoning_parser(gateway_args: list[str]) -> list
     return [*gateway_args, "--reasoning-parser", DEFAULT_REASONING_PARSER]
 
 
+def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str]:
+    """Append the smg reliability-disable switches if they are not already there."""
+    result = list(gateway_args)
+    for flag in _DEFAULT_SMG_DISABLE_FLAGS:
+        if flag not in result:
+            result.append(flag)
+    return result
+
+
+_TOKENIZER_CACHE_FLAGS = (
+    "--tokenizer-cache-enable-l0",
+    "--tokenizer-cache-enable-l1",
+)
+
+
+def _gateway_args_with_default_tokenizer_cache(gateway_args: list[str]) -> list[str]:
+    """Default smg tokenizer caches (L0 + L1) ON for gateway-fronted launches.
+
+    For agentic / chat-completions traffic with a shared system prompt + history,
+    L1 prefix-caching at special-token boundaries cuts TTFT by ~30% (verified
+    end-to-end on mm25). smg's own clap defaults leave both layers OFF.
+
+    Opt-out: operators can pass ``--no-tokenizer-cache-enable-l0`` and/or
+    ``--no-tokenizer-cache-enable-l1`` to ``ts serve``. The ``--no-`` form is
+    intercepted here (smg's clap doesn't accept it natively) and prevents the
+    positive injection for that layer.
+    """
+    result = list(gateway_args)
+    for flag in _TOKENIZER_CACHE_FLAGS:
+        no_flag = "--no-" + flag[2:]
+        if no_flag in result:
+            # Operator opted out: strip the --no- marker (smg rejects it)
+            # and skip the positive injection for this layer.
+            while no_flag in result:
+                result.remove(no_flag)
+            continue
+        if flag not in result:
+            result.append(flag)
+    return result
+
+
+def _gateway_args_with_default_log_level(gateway_args: list[str]) -> list[str]:
+    if "--log-level" in gateway_args:
+        return gateway_args
+    return [*gateway_args, "--log-level", DEFAULT_SMG_LOG_LEVEL]
+
+
+def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[str]:
+    """Pin the smg Prometheus exporter to ``DEFAULT_SMG_PROMETHEUS_PORT``.
+
+    smg's own default (``29000``) collides easily when multiple ``ts serve``
+    instances share a host or when a previous run hasn't released the
+    port yet — the gateway then exits early and the tokenizer
+    registration job never runs, surfacing later as
+    ``tokenizer_not_found`` on the first request. Pinning a tokenspeed-
+    specific default keeps the port stable for our deployments while
+    still allowing an explicit override.
+    """
+    if "--prometheus-port" in gateway_args:
+        return gateway_args
+    return [*gateway_args, "--prometheus-port", str(DEFAULT_SMG_PROMETHEUS_PORT)]
+
+
+def _user_model_id(gateway_args: list[str]) -> str | None:
+    """Return the value of ``--model`` from a split gateway argv, or ``None``."""
+    try:
+        idx = gateway_args.index("--model")
+    except ValueError:
+        return None
+    if idx + 1 >= len(gateway_args):
+        return None
+    return gateway_args[idx + 1]
+
+
+def _is_deepseek_v4_model(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+
+    normalized = model_id.lower().replace("_", "-")
+    compact = normalized.replace("-", "")
+    if "deepseek-v4" in normalized or "deepseekv4" in compact:
+        return True
+
+    config_path = Path(model_id) / "config.json"
+    if not config_path.is_file():
+        return False
+    try:
+        with config_path.open() as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(config, dict):
+        return False
+    architectures = config.get("architectures") or []
+    return (
+        config.get("model_type") == "deepseek_v4"
+        or "DeepseekV4ForCausalLM" in architectures
+    )
+
+
+def _args_with_default_model_parsers(
+    engine_args: list[str], gateway_args: list[str]
+) -> tuple[list[str], list[str]]:
+    """Apply model-family parser defaults before smg gateway defaults.
+
+    Reasoning parser defaults must be visible to both processes: smg extracts
+    reasoning_content after generation, while the engine uses the same parser
+    name to defer json_schema grammars past the reasoning channel.
+    """
+    model_id = _user_model_id(gateway_args) or _user_model_id(engine_args)
+    if not _is_deepseek_v4_model(model_id):
+        return engine_args, gateway_args
+
+    engine_result = list(engine_args)
+    gateway_result = list(gateway_args)
+    if (
+        "--reasoning-parser" not in engine_result
+        and "--reasoning-parser" not in gateway_result
+    ):
+        engine_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
+        gateway_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
+    if "--tool-call-parser" not in gateway_result:
+        gateway_result.extend(["--tool-call-parser", DEEPSEEK_V4_TOOL_CALL_PARSER])
+    return engine_result, gateway_result
+
+
+def _prewarm_hf_tokenizer(model_id: str) -> None:
+    """Download tokenizer artifacts to the HF cache before the gateway boots.
+
+    smg fires its ``AddTokenizer`` job asynchronously after the engine
+    reports SERVING. On fast runners (e.g. b300) the first eval request
+    can race that fetch and fail with ``tokenizer_not_found``. Pulling
+    tokenizer files into the HF cache up front keeps the registration
+    fast regardless of engine startup speed.
+    """
+    if not model_id or os.path.isdir(model_id):
+        return
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        return
+    try:
+        snapshot_download(
+            repo_id=model_id,
+            allow_patterns=[
+                "tokenizer*",
+                "special_tokens_map*",
+                "vocab*",
+                "merges*",
+                "*.json",
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("HF tokenizer prewarm failed for %s: %s", model_id, exc)
+
+
 def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     gateway_args = _gateway_args_with_default_port(gateway_args)
-    return _gateway_args_with_default_reasoning_parser(gateway_args)
+    gateway_args = _gateway_args_with_default_reasoning_parser(gateway_args)
+    gateway_args = _gateway_args_with_smg_disable_defaults(gateway_args)
+    gateway_args = _gateway_args_with_default_tokenizer_cache(gateway_args)
+    gateway_args = _gateway_args_with_default_log_level(gateway_args)
+    return _gateway_args_with_default_prometheus_port(gateway_args)
+
+
+async def _start_control_server(
+    *,
+    gateway_url: str,
+    engine_grpc_addr: str,
+    host: str,
+    port: int,
+    timeout: float = 30.0,
+) -> bool:
+    """Start the control HTTP server in a daemon thread and wait for it to bind.
+
+    Runs uvicorn alongside smg without blocking the orchestrator event loop.
+    Returns True once the server is accepting connections, or False if it
+    failed to bind (e.g. the port is already in use) or did not come up within
+    ``timeout`` seconds. Non-fatal: the smg gateway runs independently.
+    """
+    import threading
+
+    from tokenspeed.runtime.entrypoints.http_server import build_server
+
+    server = build_server(
+        gateway_url=gateway_url,
+        engine_grpc_addr=engine_grpc_addr,
+        host=host,
+        port=port,
+    )
+    thread = threading.Thread(target=server.run, daemon=True, name="ts-http-server")
+    thread.start()
+
+    # uvicorn sets `started = True` only after the socket is bound and serving.
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    deadline = start + timeout
+    while not server.started:
+        if not thread.is_alive():
+            return False  # uvicorn raised during startup (e.g. AddrInUse)
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(0.05)
+    logger.info("control server bound in %.2fs", loop.time() - start)
+    return True
 
 
 async def _stream_to(proc, tag: str) -> None:
@@ -219,6 +435,27 @@ async def run_smg(
         sys.stdout.write(f"ts serve ready on http://{user_host}:{user_port}\n")
         sys.stdout.flush()
 
+        control_port = (
+            opts.control_port if opts.control_port is not None else user_port + 1
+        )
+        control_ok = await _start_control_server(
+            gateway_url=f"http://{user_host}:{user_port}",
+            engine_grpc_addr=f"127.0.0.1:{engine_port}",
+            host=user_host,
+            port=control_port,
+        )
+        if control_ok:
+            sys.stdout.write(
+                f"ts control server ready on http://{user_host}:{control_port}\n"
+            )
+        else:
+            sys.stderr.write(
+                f"WARNING: ts control server failed to bind on "
+                f"http://{user_host}:{control_port} (port in use?); "
+                f"serving continues without it\n"
+            )
+        sys.stdout.flush()
+
         engine_wait = asyncio.create_task(engine.wait())
         gateway_wait = asyncio.create_task(gateway.wait())
         stop_wait = asyncio.create_task(stop.wait())
@@ -284,13 +521,22 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     except ImportError:
         pass
 
+    print_logo()
+
     _check_serve_extra_installed()
     split = split_argv(raw_argv)
-    gateway_args = _gateway_args_with_defaults(split.gateway)
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        split.engine, split.gateway
+    )
+    gateway_args = _gateway_args_with_defaults(gateway_args)
     user_host, user_port = _user_host_port_from_gateway_args(gateway_args)
+
+    model_id = _user_model_id(gateway_args)
+    if model_id is not None:
+        _prewarm_hf_tokenizer(model_id)
     rc = asyncio.run(
         run_smg(
-            engine_args=split.engine,
+            engine_args=engine_args,
             gateway_args=gateway_args,
             opts=split.opts,
             user_host=user_host,

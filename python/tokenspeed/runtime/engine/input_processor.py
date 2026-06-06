@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import TYPE_CHECKING
 
@@ -33,6 +34,11 @@ from tokenspeed.runtime.engine.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from tokenspeed.runtime.grammar.reasoning_structural_tag import (
+    structural_tag_for_reasoning_json_schema,
+)
+from tokenspeed.runtime.multimodal.embedder import pad_input_tokens
+from tokenspeed.runtime.multimodal.mrope import compute_mrope_positions
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 if TYPE_CHECKING:
@@ -49,6 +55,32 @@ class InputProcessor:
 
     def __init__(self, engine: AsyncLLM):
         self.engine = engine
+
+    def _maybe_wrap_json_schema_for_reasoning(self, sampling: dict) -> None:
+        # Without this, xgrammar locks onto ``{`` at token 0 and the
+        # model can't emit ``<think>…</think>`` before the JSON.
+        if "json_schema" not in sampling:
+            return
+        reasoning_parser = getattr(self.engine.server_args, "reasoning_parser", None)
+        if not reasoning_parser:
+            return
+        try:
+            schema = sampling["json_schema"]
+            if isinstance(schema, str):
+                schema = json.loads(schema)
+            wrapped = structural_tag_for_reasoning_json_schema(reasoning_parser, schema)
+        except Exception as e:
+            self.engine.logger.warning(
+                "reasoning-parser=%s: failed to wrap json_schema (%s); "
+                "falling back.",
+                reasoning_parser,
+                e,
+            )
+            return
+        if wrapped is None:
+            return
+        sampling.pop("json_schema", None)
+        sampling["structural_tag"] = wrapped
 
     def validate_request(self, obj: GenerateReqInput | EmbeddingReqInput) -> None:
         """Reject cross-type requests before any other processing.
@@ -78,6 +110,8 @@ class InputProcessor:
     ) -> TokenizedGenerateReqInput | TokenizedEmbeddingReqInput:
         """Tokenize one request without changing current behavior."""
         input_embeds = None
+        multimodal_inputs = None
+        input_ids_unpadded = None
         input_text = obj.text
         input_ids = obj.input_ids
 
@@ -97,6 +131,46 @@ class InputProcessor:
                     "the engine with skip_tokenizer_init=False."
                 )
             input_ids = self.engine.tokenizer.encode(input_text)
+
+        precomputed_mm = (
+            isinstance(obj, GenerateReqInput)
+            and obj.precomputed_multimodal_inputs is not None
+        )
+        if precomputed_mm:
+            # Gateway-side preprocess path (e.g. SMG): mm tensors are already
+            # built by an upstream preprocessor and the input_ids carry the
+            # expanded placeholder tokens (im_token_id) at the right offsets.
+            # We still need to run pad_input_tokens so the engine's
+            # VisionEmbedder can plan vision-token scatter ranges from each
+            # item's offsets — the bare placeholder token alone would not
+            # encode per-item uniqueness needed by the radix prefix layer.
+            if not self.engine.model_config.is_multimodal_active:
+                raise ValueError(
+                    "precomputed_multimodal_inputs is provided for a text-only model."
+                )
+            multimodal_inputs = obj.precomputed_multimodal_inputs
+            # MRoPE-aware models (Qwen2/3-VL, …) require 3-axis position_ids
+            # derived from image_grid_thw + the image_token_id placeholders in
+            # input_ids. SMG ships precomputed mm inputs with mrope_* unset; if
+            # left None, model_executor falls back to a 1-D linear position
+            # override — silently degrading OCR accuracy. Compute them here, on
+            # the un-padded input_ids (so get_rope_index can still locate the
+            # image regions) BEFORE pad_input_tokens substitutes per-image
+            # pad_value over the placeholders, then pad for the embed splice.
+            if (
+                input_ids is not None
+                and getattr(multimodal_inputs, "mrope_positions", None) is None
+            ):
+                mrope_positions, mrope_position_delta = compute_mrope_positions(
+                    self.engine.model_config.hf_config,
+                    list(input_ids),
+                    multimodal_inputs.mm_items,
+                )
+                multimodal_inputs.mrope_positions = mrope_positions
+                multimodal_inputs.mrope_position_delta = mrope_position_delta
+            if input_ids is not None:
+                input_ids_unpadded = list(input_ids)
+                input_ids = pad_input_tokens(list(input_ids), multimodal_inputs)
 
         if self.engine.is_generation:
             return_logprob = obj.return_logprob
@@ -131,6 +205,8 @@ class InputProcessor:
             )
             obj.sampling_params.update({"max_new_tokens": adjusted_max_new_tokens})
 
+        self._maybe_wrap_json_schema_for_reasoning(obj.sampling_params)
+
         sampling_params = SamplingParams(**obj.sampling_params)
         sampling_params.resolve_seed(obj.rid)
         sampling_params.normalize(self.engine.tokenizer)
@@ -157,6 +233,8 @@ class InputProcessor:
                 created_time=time.time(),
                 input_multi_ids=obj.input_multi_ids,
                 input_extra_infos=obj.input_extra_infos,
+                input_ids_unpadded=input_ids_unpadded,
+                multimodal_inputs=multimodal_inputs,
             )
 
         return TokenizedEmbeddingReqInput(
