@@ -25,6 +25,7 @@ class KVCachePool:
         # draft KV pool and a (future) draft Mamba pool need no special kinds.
         self.kind = CacheKind.KV
         self.is_draft = is_draft
+        self.pool_id = "kv.draft" if is_draft else "kv"
         self.device_pool = device_pool
         self.host_pool = host_pool
         self.io_backend = io_backend

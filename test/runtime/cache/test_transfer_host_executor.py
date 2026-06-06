@@ -77,6 +77,8 @@ class FakeCounter:
 class FakePool:
     def __init__(self, kind: CacheKind, page_size: int, num_layers: int):
         self.kind = kind
+        self.is_draft = False
+        self.pool_id = kind.value
         self._page_size = page_size
         self._num_layers = num_layers
         self.device = torch.device("cpu")

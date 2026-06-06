@@ -105,13 +105,6 @@ class _Ack(NamedTuple):
     op_ids: list[int]
 
 
-def _pool_key(pool) -> str:
-    """Executor key for a pool: cache kind plus a ``.draft`` suffix for draft
-    pools. Decouples the (KV/Mamba) cache type from the target/draft role."""
-    base = CacheKind(pool.kind).value
-    return f"{base}.draft" if getattr(pool, "is_draft", False) else base
-
-
 class HostExecutor:
     def __init__(
         self,
@@ -164,11 +157,11 @@ class HostExecutor:
                     expanded_pools.append(draft_pool)
         pools = expanded_pools
 
-        # Pools are keyed by an id that combines the cache *kind* (type) with the
-        # target-vs-draft *role*, e.g. "kv", "kv.draft", "mamba", "mamba.draft".
-        # Page routing keys off the kind; counters / ordering / consumer wiring
-        # key off the full id, so a draft of any kind needs no special CacheKind.
-        self.pools = {_pool_key(pool): pool for pool in pools}
+        # Pools are keyed by their pool_id ("kv", "kv.draft", "mamba", ...): the
+        # cache *kind* (type) plus the target-vs-draft *role*. Page routing keys
+        # off the kind; counters / ordering / consumer wiring key off the full
+        # id, so a draft of any kind needs no special CacheKind.
+        self.pools = {pool.pool_id: pool for pool in pools}
         self.device = next(iter(self.pools.values())).device
 
         write_priority, load_priority = _cache_stream_priorities()
@@ -208,7 +201,7 @@ class HostExecutor:
         return [
             k
             for k, p in self.pools.items()
-            if CacheKind(p.kind) == kind and not getattr(p, "is_draft", False)
+            if CacheKind(p.kind) == kind and not p.is_draft
         ]
 
     def enqueue_writeback(
