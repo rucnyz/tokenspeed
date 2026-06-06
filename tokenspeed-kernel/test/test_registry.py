@@ -187,25 +187,20 @@ class TestRegistrySingleton:
         r2 = KernelRegistry.get()
         assert r1 is not r2
 
-    def test_reset_clears_builtin_load_state(self, monkeypatch):
-        from tokenspeed_kernel import backends
+    def test_load_builtin_kernels_accepts_family_filter(self, monkeypatch):
+        from tokenspeed_kernel import registry as registry_mod
 
         imported: list[str] = []
         monkeypatch.setitem(
-            backends._BUILTIN_MODULES_BY_FAMILY,
+            registry_mod._BUILTIN_IMPORTS_BY_FAMILY,
             "test",
             ("test_builtin",),
         )
-        monkeypatch.setattr(backends.importlib, "import_module", imported.append)
-        backends.reset_builtin_kernel_load_state()
+        monkeypatch.setattr(registry_mod.importlib, "import_module", imported.append)
 
-        backends.load_builtin_kernels("test")
-        backends.load_builtin_kernels("test")
+        registry_mod.load_builtin_kernels("test")
+
         assert imported == ["test_builtin"]
-
-        KernelRegistry.reset()
-        backends.load_builtin_kernels("test")
-        assert imported == ["test_builtin", "test_builtin"]
 
 
 class TestRegistryRegister:

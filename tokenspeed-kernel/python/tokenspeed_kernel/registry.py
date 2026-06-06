@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -248,11 +249,6 @@ class KernelRegistry:
     def reset(cls) -> None:
         """Reset singleton (for testing)."""
         cls._instance = None
-        try:
-            from tokenspeed_kernel.backends import reset_builtin_kernel_load_state
-        except ImportError:
-            return
-        reset_builtin_kernel_load_state()
 
     # ---- Registration ----
 
@@ -446,10 +442,55 @@ def describe_kernel(name: str) -> str:
     return "\n".join(lines)
 
 
-def load_builtin_kernels(families=None) -> None:
-    from tokenspeed_kernel.backends import load_builtin_kernels as _load_builtins
+_BUILTIN_IMPORTS_BY_FAMILY: dict[str, tuple[str, ...]] = {
+    "attention": ("tokenspeed_kernel.ops.attention",),
+    "embedding": ("tokenspeed_kernel.ops.embedding",),
+    "gemm": ("tokenspeed_kernel.ops.gemm",),
+    "moe": ("tokenspeed_kernel.ops.moe",),
+    "quantization": ("tokenspeed_kernel.ops.quantization",),
+}
 
-    _load_builtins(families)
+
+def _normalize_builtin_families(families) -> tuple[str, ...]:
+    if families is None:
+        return tuple(_BUILTIN_IMPORTS_BY_FAMILY)
+    if isinstance(families, str):
+        return (families,)
+    return tuple(families)
+
+
+def _clear_cached_builtin_modules() -> None:
+    import sys
+
+    for name in list(sys.modules):
+        if name.startswith("tokenspeed_kernel.ops.") or name.startswith(
+            "tokenspeed_kernel.numerics.reference."
+        ):
+            del sys.modules[name]
+
+
+def load_builtin_kernels(families=None) -> None:
+    """Import core built-in registration modules.
+
+    Vendor kernels are registered by plugin entry points. This helper stays for
+    CLIs/tests that need core kernels without importing the public package first.
+    """
+
+    if not KernelRegistry.get().list_kernels():
+        # Registry was reset; clear cached modules so decorators run again.
+        _clear_cached_builtin_modules()
+
+    for family in _normalize_builtin_families(families):
+        try:
+            module_names = _BUILTIN_IMPORTS_BY_FAMILY[family]
+        except KeyError as exc:
+            valid = ", ".join(sorted(_BUILTIN_IMPORTS_BY_FAMILY))
+            raise ValueError(
+                f"unknown built-in kernel family {family!r}: {valid}"
+            ) from exc
+
+        for module_name in module_names:
+            importlib.import_module(module_name)
 
 
 def error_fn(*args, **kwargs):
