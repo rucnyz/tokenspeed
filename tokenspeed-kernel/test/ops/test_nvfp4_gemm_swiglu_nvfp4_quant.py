@@ -158,7 +158,7 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
         nvfp4_gemm_swiglu_nvfp4_quant,
     )
     from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
-    from tokenspeed_kernel.registry import load_builtin_kernels
+    from tokenspeed_kernel.plugins import discover_plugins
     from tokenspeed_kernel.thirdparty.cuda import silu_and_mul_fuse_nvfp4_quant
 
     from tokenspeed.runtime.layers.dense.nvfp4 import (
@@ -166,7 +166,7 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
         swizzle_blockscale_2d,
     )
 
-    load_builtin_kernels()
+    discover_plugins()
 
     torch.manual_seed(1000 + m + i)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)

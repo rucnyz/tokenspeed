@@ -29,8 +29,8 @@ from tokenspeed_kernel.benchmark.report import format_report
 from tokenspeed_kernel.benchmark.result import export_results
 from tokenspeed_kernel.benchmark.runner import BenchmarkRunner
 from tokenspeed_kernel.platform import Platform
+from tokenspeed_kernel.plugins import discover_plugins
 from tokenspeed_kernel.profiling import ProfilingConfig
-from tokenspeed_kernel.registry import load_builtin_kernels
 
 _DTYPE_SELECTIONS: dict[str, torch.dtype] = {
     "fp32": torch.float32,
@@ -166,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--export", help="Export benchmark results as JSON")
     args = parser.parse_args(argv)
 
-    load_builtin_kernels()
+    discover_plugins()
     dtype = _DTYPE_SELECTIONS[args.dtype]
     op_filter = _parse_op(args.op)
     shapes = _parse_shapes(args.shapes)

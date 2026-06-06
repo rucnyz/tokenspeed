@@ -63,7 +63,7 @@ jobs:
 
           version=$(
             cd tokenspeed-kernel/python
-            TOKENSPEED_KERNEL_BACKEND=cuda \
+            TOKENSPEED_KERNEL_PACKAGE=core \
             TOKENSPEED_KERNEL_VERSION_DATE="$version_date" \
             TOKENSPEED_KERNEL_GIT_SHA="$GITHUB_SHA" \
             TOKENSPEED_KERNEL_GIT_BRANCH="$GITHUB_REF_NAME" \
@@ -80,6 +80,46 @@ jobs:
           echo "tag_name=${tag_name}" >> "$GITHUB_OUTPUT"
           echo "Release version: ${version}"
           echo "Release tag: ${tag_name}"
+
+  build-pure-wheels:
+    name: Build core and AMD pure wheels
+    needs: metadata
+    runs-on: ubuntu-24.04-32core-x64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build pure wheels
+        run: |
+          python -m pip install --upgrade \
+            build twine "setuptools<82" wheel packaging "apache-tvm-ffi>=0.1.5"
+          cd tokenspeed-kernel/python
+
+          build_kernel_wheel() {
+            local package="$1"
+            rm -rf build *.egg-info
+            TOKENSPEED_KERNEL_PACKAGE="$package" \
+            TOKENSPEED_KERNEL_SKIP_NATIVE_BUILD=1 \
+            TOKENSPEED_KERNEL_VERSION_DATE=${{ needs.metadata.outputs.version_date }} \
+            TOKENSPEED_KERNEL_GIT_SHA=$GITHUB_SHA \
+            TOKENSPEED_KERNEL_GIT_BRANCH=$GITHUB_REF_NAME \
+              python -m build --wheel --no-isolation --outdir ../../dist
+          }
+
+          build_kernel_wheel core
+          build_kernel_wheel amd
+          python -m twine check ../../dist/*.whl
+
+      - name: Upload pure wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenspeed-kernel-pure-wheels
+          path: dist/*.whl
 
   build-wheel:
     name: Build ${{ matrix.cuda.variant }} ${{ matrix.arch.name }} wheel for Python ${{ matrix.python.version }}
@@ -163,7 +203,7 @@ jobs:
             -f Dockerfile.tokenspeed-kernel-release \
             -t tokenspeed-kernel-release:${{ matrix.cuda.variant }}-${{ matrix.arch.name }} .
 
-      - name: Build wheel
+      - name: Build NVIDIA wheel
         if: inputs.cuda_variant == 'all' || inputs.cuda_variant == matrix.cuda.variant
         run: |
           mkdir -p dist
@@ -171,6 +211,7 @@ jobs:
             -e PYTHON_TAG=${{ matrix.python.tag }} \
             -e TORCH_INDEX_URL=${{ matrix.cuda.torch_index_url }} \
             -e TOKENSPEED_KERNEL_BACKEND=cuda \
+            -e TOKENSPEED_KERNEL_PACKAGE=nvidia \
             -e TOKENSPEED_KERNEL_VERSION_DATE=${{ needs.metadata.outputs.version_date }} \
             -e TOKENSPEED_KERNEL_GIT_SHA=$GITHUB_SHA \
             -e TOKENSPEED_KERNEL_GIT_BRANCH=$GITHUB_REF_NAME \
@@ -182,6 +223,7 @@ jobs:
               set -euo pipefail
 
               PYBIN="/opt/python/${PYTHON_TAG}/bin"
+              wheel_dir="$(mktemp -d)"
               cd /workspace/tokenspeed-kernel/python
 
               "${PYBIN}/python" -m pip install --upgrade \
@@ -190,7 +232,7 @@ jobs:
 
               rm -rf build *.egg-info
               PIP_EXTRA_INDEX_URL="${TORCH_INDEX_URL}" \
-                "${PYBIN}/python" -m build --wheel --no-isolation --outdir /output
+                "${PYBIN}/python" -m build --wheel --no-isolation --outdir "${wheel_dir}"
 
               python_tag="${PYTHON_TAG%%-*}"
               abi_tag="${PYTHON_TAG#*-}"
@@ -199,9 +241,10 @@ jobs:
                 --python-tag "${python_tag}" \
                 --abi-tag "${abi_tag}" \
                 --platform-tag "${platform_tag}" \
-                --remove /output/*.whl
+                --remove "${wheel_dir}"/*.whl
 
-              "${PYBIN}/python" -m twine check /output/*.whl
+              "${PYBIN}/python" -m twine check "${wheel_dir}"/*.whl
+              cp "${wheel_dir}"/*.whl /output/
             '
 
       - name: Upload wheel
@@ -224,16 +267,26 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Build source distribution
+      - name: Build source distributions
         run: |
           python -m pip install --upgrade \
             build twine "setuptools<82" wheel packaging "apache-tvm-ffi>=0.1.5"
           cd tokenspeed-kernel/python
-          TOKENSPEED_KERNEL_BACKEND=cuda \
-          TOKENSPEED_KERNEL_VERSION_DATE=${{ needs.metadata.outputs.version_date }} \
-          TOKENSPEED_KERNEL_GIT_SHA=$GITHUB_SHA \
-          TOKENSPEED_KERNEL_GIT_BRANCH=$GITHUB_REF_NAME \
-            python -m build --sdist --no-isolation --outdir ../../dist
+
+          build_kernel_sdist() {
+            local package="$1"
+            rm -rf build *.egg-info
+            TOKENSPEED_KERNEL_PACKAGE="$package" \
+            TOKENSPEED_KERNEL_SKIP_NATIVE_BUILD=1 \
+            TOKENSPEED_KERNEL_VERSION_DATE=${{ needs.metadata.outputs.version_date }} \
+            TOKENSPEED_KERNEL_GIT_SHA=$GITHUB_SHA \
+            TOKENSPEED_KERNEL_GIT_BRANCH=$GITHUB_REF_NAME \
+              python -m build --sdist --no-isolation --outdir ../../dist
+          }
+
+          build_kernel_sdist core
+          build_kernel_sdist nvidia
+          build_kernel_sdist amd
           python -m twine check ../../dist/*.tar.gz
 
       - name: Upload source distribution
@@ -244,7 +297,7 @@ jobs:
 
   release:
     name: Create GitHub release
-    needs: [metadata, build-wheel, build-sdist]
+    needs: [metadata, build-pure-wheels, build-wheel, build-sdist]
     runs-on: ubuntu-24.04-32core-x64
     steps:
       - name: Checkout repository
@@ -276,14 +329,22 @@ jobs:
             local release_title="tokenspeed-kernel ${VERSION} ${cuda_variant}"
 
             shopt -s nullglob
-            local assets=(
-              dist/tokenspeed-kernel-wheel-"${cuda_variant}"-*/*.whl
+            local shared_assets=(
+              dist/tokenspeed-kernel-pure-wheels/*.whl
               dist/tokenspeed-kernel-sdist/*.tar.gz
             )
+            local nvidia_assets=(
+              dist/tokenspeed-kernel-wheel-"${cuda_variant}"-*/*.whl
+            )
+            local assets=("${shared_assets[@]}" "${nvidia_assets[@]}")
             shopt -u nullglob
 
-            if [ "${#assets[@]}" -eq 0 ]; then
-              echo "No distributions found for ${cuda_variant}" >&2
+            if [ "${#nvidia_assets[@]}" -eq 0 ]; then
+              echo "No NVIDIA distributions found for ${cuda_variant}" >&2
+              exit 1
+            fi
+            if [ "${#shared_assets[@]}" -eq 0 ]; then
+              echo "No shared distributions found" >&2
               exit 1
             fi
 

@@ -30,7 +30,8 @@ from tokenspeed_kernel.numerics.verify import (
     verify_kernel,
 )
 from tokenspeed_kernel.platform import Platform
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
+from tokenspeed_kernel.plugins import discover_plugins
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 from tokenspeed_kernel.signature import ScaleFormat, format_signatures
 
 _fp8_dtype = Platform.get().fp8e4m3fn.dtype
@@ -164,7 +165,7 @@ class TestNumericsVerification:
     def _get_verifiable_specs(
         dtype: torch.dtype, dtype_role: str, family: str | None = None
     ) -> list[KernelSpec]:
-        load_builtin_kernels()
+        discover_plugins()
         registry = KernelRegistry.get()
         platform = Platform.get()
         specs: list[KernelSpec] = []

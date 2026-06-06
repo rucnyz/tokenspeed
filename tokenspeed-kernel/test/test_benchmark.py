@@ -456,7 +456,7 @@ def test_benchmark_cli_proton_flag_sets_profile_mode(monkeypatch):
             return []
 
     monkeypatch.setattr(benchmark_cli, "BenchmarkRunner", _FakeRunner)
-    monkeypatch.setattr(benchmark_cli, "load_builtin_kernels", lambda: None)
+    monkeypatch.setattr(benchmark_cli, "discover_plugins", lambda: None)
     monkeypatch.setattr(benchmark_cli, "format_report", lambda _results: "ok")
 
     rc = benchmark_cli.main(["--op", "gemm.mm", "--dtype-role", "a", "--proton"])
@@ -490,7 +490,7 @@ def test_benchmark_cli_builds_proton_config_from_flags(monkeypatch):
             return []
 
     monkeypatch.setattr(benchmark_cli, "BenchmarkRunner", _FakeRunner)
-    monkeypatch.setattr(benchmark_cli, "load_builtin_kernels", lambda: None)
+    monkeypatch.setattr(benchmark_cli, "discover_plugins", lambda: None)
     monkeypatch.setattr(benchmark_cli, "format_report", lambda _results: "ok")
 
     rc = benchmark_cli.main(

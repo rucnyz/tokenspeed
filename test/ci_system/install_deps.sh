@@ -87,13 +87,53 @@ echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
 python3 -m pip install --upgrade pip setuptools wheel
 
 # ============================================================
-# Step 3: Install tokenspeed-kernel
+# Step 3: Build and install tokenspeed-kernel split wheels
 # ============================================================
-echo "=== Step 3: Install tokenspeed-kernel ==="
-cd ${WORKSPACE}
+echo "=== Step 3: Build and install tokenspeed-kernel split wheels ==="
+cd "${WORKSPACE}"
 export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu${CUINDEX}"
-TOKENSPEED_KERNEL_BACKEND=cuda FLASHINFER_CUDA_ARCH_LIST="${FI_ARCH}" \
-pip_install_with_retry pip3 install tokenspeed-kernel/python/ --no-build-isolation -v
+pip_install_with_retry pip3 install build
+
+KERNEL_WHEEL_DIR="${WORKSPACE}/.ci-tokenspeed-kernel-wheels"
+rm -rf "${KERNEL_WHEEL_DIR}"
+mkdir -p "${KERNEL_WHEEL_DIR}"
+
+build_tokenspeed_kernel_wheel() {
+    local package="$1"
+    shift
+
+    echo "Building tokenspeed-kernel package: ${package}"
+    rm -rf "${WORKSPACE}/tokenspeed-kernel/python/build" "${WORKSPACE}"/tokenspeed-kernel/python/*.egg-info
+    env TOKENSPEED_KERNEL_PACKAGE="${package}" "$@" \
+        python3 -m build --wheel --no-isolation \
+        --outdir "${KERNEL_WHEEL_DIR}" \
+        "${WORKSPACE}/tokenspeed-kernel/python"
+}
+
+install_tokenspeed_kernel_wheel() {
+    local distribution="$1"
+    local wheel_prefix="${distribution//-/_}"
+    local wheels=()
+    mapfile -t wheels < <(find "${KERNEL_WHEEL_DIR}" -maxdepth 1 -type f -name "${wheel_prefix}-*.whl" | sort)
+    if [ "${#wheels[@]}" -ne 1 ]; then
+        echo "Expected exactly one ${distribution} wheel in ${KERNEL_WHEEL_DIR}, found ${#wheels[@]}" >&2
+        printf "%s\n" "${wheels[@]}" >&2
+        return 1
+    fi
+
+    echo "Installing ${distribution} wheel: ${wheels[0]}"
+    pip_install_with_retry pip3 install --force-reinstall "${wheels[0]}" -v
+}
+
+pip3 uninstall -y tokenspeed-kernel tokenspeed-kernel-nvidia tokenspeed-kernel-amd
+
+build_tokenspeed_kernel_wheel core TOKENSPEED_KERNEL_SKIP_NATIVE_BUILD=1
+install_tokenspeed_kernel_wheel tokenspeed-kernel
+
+build_tokenspeed_kernel_wheel nvidia \
+    TOKENSPEED_KERNEL_BACKEND=cuda \
+    FLASHINFER_CUDA_ARCH_LIST="${FI_ARCH}"
+install_tokenspeed_kernel_wheel tokenspeed-kernel-nvidia
 
 # ============================================================
 # Step 4: Install TokenSpeed Scheduler (C++)

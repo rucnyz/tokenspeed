@@ -28,7 +28,8 @@ import torch
 from tokenspeed_kernel.numerics.comparison import format_comparison
 from tokenspeed_kernel.numerics.verify import verify_kernel
 from tokenspeed_kernel.platform import Platform
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
+from tokenspeed_kernel.plugins import discover_plugins
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 
 _DTYPE_SELECTIONS: dict[str, torch.dtype] = {
     "fp32": torch.float32,
@@ -126,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
     op_filter = _parse_op(args.op)
     shapes = _parse_shapes(args.shapes)
 
-    load_builtin_kernels()
+    discover_plugins()
     registry = KernelRegistry.get()
     specs = _iter_candidate_specs(
         registry,
