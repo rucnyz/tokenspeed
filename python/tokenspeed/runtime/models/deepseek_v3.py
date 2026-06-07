@@ -45,7 +45,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.utils import get_rope_theta
-from tokenspeed.runtime.layers.moe.checkpoint import (
+from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )

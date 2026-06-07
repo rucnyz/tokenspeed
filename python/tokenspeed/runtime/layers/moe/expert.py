@@ -19,11 +19,19 @@
 # SOFTWARE.
 
 
+import tokenspeed_kernel
 import torch
 
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 from tokenspeed.runtime.layers.activation import SwigluArg
-from tokenspeed.runtime.layers.moe.core import MoELayerSpec, select_backend
+from tokenspeed.runtime.layers.moe.topk import TopKOutput, TopKOutputFormat
+from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
+from tokenspeed.runtime.layers.moe.weights import create_layer_weights
+from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
@@ -34,7 +42,7 @@ class MoELayer(torch.nn.Module):
         num_experts: int,
         hidden_size: int,
         intermediate_size: int,
-        quant_config,
+        quant_config: QuantizationConfig,
         layer_index: int,
         prefix: str = "",
         tp_rank: int | None = None,
@@ -94,7 +102,7 @@ class MoELayer(torch.nn.Module):
             raise ValueError("Mixed TP and EP is not supported yet.")
 
         num_local_experts = num_experts // self.ep_size
-        a2a_backend = get_all2all_backend()
+
         self.num_local_experts = num_local_experts
         self._spec = MoELayerSpec(
             top_k=top_k,
@@ -108,29 +116,72 @@ class MoELayer(torch.nn.Module):
             ep_rank=self.ep_rank,
             ep_size=self.ep_size,
             prefix=prefix,
-            a2a_backend=a2a_backend.value,
+            a2a_backend=get_all2all_backend().value,
         )
-        self.backend = select_backend(
+        self.routing_config = routing_config
+
+        self._quant_kind = "unquant"
+        if quant_config is not None and not should_ignore_quant_layer(
+            prefix=self.prefix,
+            ignored_layers=quant_config.ignored_layers,
+        ):
+            self._quant_kind = quant_config.get_name()
+
+        create_layer_weights(
             self._spec,
-            quant_config,
-            routing_config=routing_config,
+            self,
+            self._quant_kind,
+            self.quant_config,
+            with_bias=with_bias,
         )
-        self.backend.create_layer_weights(self, with_bias=with_bias)
-        self._weights_processed_after_loading = False
+
+        fp8_scale_block_shape = None
+        internal_activation_dtype = None
+        if self._quant_kind == "fp8":
+            fp8_scale_block_shape = tuple(self.quant_config.weight_block_size)
+        if self._quant_kind == "mxfp4" and self.quant_config.is_w4a8_fp8:
+            internal_activation_dtype = "fp8"
+
+        deepep_group = None
+        if self._spec.use_deepep:
+            mapping = global_server_args_dict["mapping"]
+            deepep_group = pg_manager.get_process_group(
+                "nccl",
+                mapping.moe.tp_ep_group,
+            )
+        self.plan = tokenspeed_kernel.moe_plan(
+            self._quant_kind,
+            activation=self.activation,
+            a2a_backend=self._spec.a2a_backend,
+            ep_size=self.ep_size,
+            ispp=self.intermediate_size // self.tp_size,
+            fp8_scale_block_shape=fp8_scale_block_shape,
+            internal_activation_dtype=internal_activation_dtype,
+            with_bias=with_bias,
+            deepep_group=deepep_group,
+        )
+        self._weights_processed = False
 
     def process_weights_after_loading(self, module) -> None:
-        if self._weights_processed_after_loading:
+        if self._weights_processed:
             return
-        self.backend.process_weights_after_loading(module)
-        self._weights_processed_after_loading = True
+
+        tokenspeed_kernel.moe_process_weights(self.plan, module)
+        self._weights_processed = True
+
+    @property
+    def support_routing(self) -> bool:
+        return self.plan["support_routing"]
 
     @property
     def topk_output_format(self):
-        return self.backend.topk_output_format
+        if self.support_routing:
+            return TopKOutputFormat.BYPASSED
+        return TopKOutputFormat.STANDARD
 
     @property
     def supports_deferred_finalize(self) -> bool:
-        return self.backend.supports_deferred_finalize
+        return self.plan["supports_deferred_finalize"]
 
     def forward_zero_experts(self, topk_output):
         zero_expert_limit = self.num_experts
@@ -147,26 +198,31 @@ class MoELayer(torch.nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        topk_output,
+        topk_output: TopKOutput,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         do_finalize: bool = True,
     ):
-        # Only pass ``do_finalize`` through when the caller actually wants
-        # the deferred path. Other backends do not accept this kwarg;
-        # their default (always-finalized) behavior is preserved when we
-        # omit it.
-        kwargs = {}
-        if not do_finalize:
-            assert (
-                self.backend.supports_deferred_finalize
-            ), f"{type(self.backend).__name__} does not support do_finalize=False"
-            kwargs["do_finalize"] = False
-        return self.backend.forward(
-            self,
-            hidden_states,
-            topk_output,
-            num_global_tokens,
-            max_num_tokens_per_gpu,
-            **kwargs,
-        )
+        if not do_finalize and not self.supports_deferred_finalize:
+            raise AssertionError("MoELayer does not support do_finalize=False")
+
+        if self.support_routing:
+            return tokenspeed_kernel.moe_apply(
+                self.plan,
+                hidden_states,
+                self,
+                topk_output.router_logits,
+                num_tokens_global=num_global_tokens,
+                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            )
+        else:
+            return tokenspeed_kernel.moe_apply(
+                self.plan,
+                hidden_states,
+                self,
+                topk_output.router_logits,
+                topk_weights=topk_output.topk_weights,
+                topk_ids=topk_output.topk_ids,
+                num_tokens_global=num_global_tokens,
+                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            )

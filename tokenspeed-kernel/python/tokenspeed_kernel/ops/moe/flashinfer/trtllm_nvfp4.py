@@ -1,0 +1,268 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+import torch
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signature, format_signatures
+
+platform = current_platform()
+next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length()
+
+
+if platform.is_nvidia:
+    from flashinfer import (
+        fp4_quantize,
+        nvfp4_block_scale_interleave,
+        trtllm_fp4_block_scale_moe,
+    )
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices as maybe_get_cached_w3_w1_permute_indices,
+    )
+    from flashinfer.fused_moe.core import (
+        get_w2_permute_indices_with_cache,
+    )
+
+    @register_kernel(
+        "moe",
+        "process_weights",
+        name="flashinfer_trtllm_nvfp4_moe_process_weights",
+        solution="flashinfer_trtllm",
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 0),
+        ),
+        signatures=frozenset({format_signature()}),
+        traits={"weight_dtype": frozenset({"nvfp4"})},
+        priority=Priority.SPECIALIZED,
+    )
+    def flashinfer_trtllm_nvfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
+        num_experts = w.w13_weight.shape[0]
+        intermediate_size = w.w13_weight.shape[1] // 2
+        hidden_size = w.w13_weight.shape[2] * 2
+        group_size = getattr(getattr(w, "quant_config", None), "group_size", 16)
+
+        half_w = w.w13_weight.shape[1] // 2
+        w1_weight = w.w13_weight.data[:, :half_w, :].clone()
+        w.w13_weight.data[:, :half_w, :] = w.w13_weight.data[:, half_w:, :]
+        w.w13_weight.data[:, half_w:, :] = w1_weight
+
+        half_s = w.w13_weight_scale.shape[1] // 2
+        w1_scale = w.w13_weight_scale.data[:, :half_s, :].clone()
+        w.w13_weight_scale.data[:, :half_s, :] = w.w13_weight_scale.data[:, half_s:, :]
+        w.w13_weight_scale.data[:, half_s:, :] = w1_scale
+
+        cache = {}
+        epilogue_tile_m = 128
+        w13_fp4 = w.w13_weight.data.view(torch.float8_e4m3fn).reshape(
+            num_experts, 2 * intermediate_size, hidden_size // 2
+        )
+        w13_scales = w.w13_weight_scale.data.view(torch.float8_e4m3fn).reshape(
+            num_experts, 2 * intermediate_size, hidden_size // group_size
+        )
+        w2_fp4 = w.w2_weight.data.view(torch.float8_e4m3fn).reshape(
+            num_experts, hidden_size, intermediate_size // 2
+        )
+        w2_scales = w.w2_weight_scale.data.view(torch.float8_e4m3fn).reshape(
+            num_experts, hidden_size, intermediate_size // group_size
+        )
+
+        w13_weights_shuffled = []
+        w13_scales_shuffled = []
+        w2_weights_shuffled = []
+        w2_scales_shuffled = []
+        for idx in range(num_experts):
+            perm = maybe_get_cached_w3_w1_permute_indices(
+                cache, w13_fp4[idx].view(torch.uint8), epilogue_tile_m
+            )
+            w13_weights_shuffled.append(
+                w13_fp4[idx].view(torch.uint8)[perm.to(w13_fp4.device)].contiguous()
+            )
+            perm_sf = maybe_get_cached_w3_w1_permute_indices(
+                cache,
+                w13_scales[idx].view(torch.uint8),
+                epilogue_tile_m,
+                num_elts_per_sf=16,
+            )
+            w13_scales_shuffled.append(
+                nvfp4_block_scale_interleave(
+                    w13_scales[idx]
+                    .view(torch.uint8)[perm_sf.to(w13_scales.device)]
+                    .contiguous()
+                )
+            )
+            perm2 = get_w2_permute_indices_with_cache(
+                cache, w2_fp4[idx].view(torch.uint8), epilogue_tile_m
+            )
+            w2_weights_shuffled.append(
+                w2_fp4[idx].view(torch.uint8)[perm2.to(w2_fp4.device)].contiguous()
+            )
+            perm2_sf = get_w2_permute_indices_with_cache(
+                cache,
+                w2_scales[idx].view(torch.uint8),
+                epilogue_tile_m,
+                num_elts_per_sf=16,
+            )
+            w2_scales_shuffled.append(
+                nvfp4_block_scale_interleave(
+                    w2_scales[idx]
+                    .view(torch.uint8)[perm2_sf.to(w2_scales.device)]
+                    .contiguous()
+                )
+            )
+
+        w.gemm1_weights_fp4_shuffled = torch.nn.Parameter(
+            torch.stack(w13_weights_shuffled), requires_grad=False
+        )
+        w.gemm1_scales_fp4_shuffled = torch.nn.Parameter(
+            torch.stack(w13_scales_shuffled)
+            .view(torch.float8_e4m3fn)
+            .reshape(num_experts, 2 * intermediate_size, hidden_size // group_size),
+            requires_grad=False,
+        )
+        w.gemm2_weights_fp4_shuffled = torch.nn.Parameter(
+            torch.stack(w2_weights_shuffled), requires_grad=False
+        )
+        w.gemm2_scales_fp4_shuffled = torch.nn.Parameter(
+            torch.stack(w2_scales_shuffled)
+            .view(torch.float8_e4m3fn)
+            .reshape(num_experts, hidden_size, intermediate_size // group_size),
+            requires_grad=False,
+        )
+
+        w13_ws2 = w.w13_weight_scale_2[:, 0]
+        w13_input_scale = w.w13_input_scale.max().to(torch.float32)
+        w2_input_scale = w.w2_input_scale.max().to(torch.float32)
+        w13_input_scale_quant = (1.0 / w13_input_scale).to(torch.float32)
+        w2_input_scale_quant = (1.0 / w2_input_scale).to(torch.float32)
+        w.w13_input_scale_quant = torch.nn.Parameter(
+            w13_input_scale_quant, requires_grad=False
+        )
+        w.g1_alphas = torch.nn.Parameter(
+            (w13_input_scale * w13_ws2).to(torch.float32), requires_grad=False
+        )
+        w.g2_alphas = torch.nn.Parameter(
+            (w2_input_scale * w.w2_weight_scale_2).to(torch.float32),
+            requires_grad=False,
+        )
+        w.g1_scale_c = torch.nn.Parameter(
+            (w2_input_scale_quant * w.g1_alphas).to(torch.float32),
+            requires_grad=False,
+        )
+        w.intermediate_size_per_partition = intermediate_size
+        return None
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="flashinfer_trtllm_nvfp4_moe_apply",
+        solution="flashinfer_trtllm",
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 0),
+        ),
+        signatures=format_signatures(
+            "x",
+            "dense",
+            {torch.float16, torch.bfloat16},
+        ),
+        traits={
+            "weight_dtype": frozenset({"nvfp4"}),
+            "activation": frozenset({"silu", "swiglu"}),
+            "routing_mode": frozenset({"kernel_routing"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({1}),
+            "internal_activation_dtype": frozenset({"fp4"}),
+            "supports_bias": frozenset({False}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def flashinfer_trtllm_nvfp4_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+    ):
+        routing_config = getattr(w, "routing_config", {})
+        if not isinstance(routing_config, dict):
+            routing_config = {}
+        routing_value = lambda name, default: (
+            routing_config[name]
+            if name in routing_config
+            else getattr(w, name, default)
+        )
+
+        hs_fp4, hs_scale = fp4_quantize(
+            x,
+            w.w13_input_scale_quant,
+            is_sf_swizzled_layout=False,
+            enable_pdl=False,
+        )
+        local_experts = getattr(
+            w, "num_local_experts", w.gemm1_weights_fp4_shuffled.shape[0]
+        )
+        result = trtllm_fp4_block_scale_moe(
+            routing_logits=router_logits.to(torch.float32),
+            routing_bias=routing_value("correction_bias", None),
+            hidden_states=hs_fp4,
+            hidden_states_scale=hs_scale.view(torch.float8_e4m3fn),
+            gemm1_weights=w.gemm1_weights_fp4_shuffled.data,
+            gemm1_weights_scale=w.gemm1_scales_fp4_shuffled.data.view(
+                torch.float8_e4m3fn
+            ),
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=w.gemm2_weights_fp4_shuffled.data,
+            gemm2_weights_scale=w.gemm2_scales_fp4_shuffled.data.view(
+                torch.float8_e4m3fn
+            ),
+            gemm2_bias=None,
+            output1_scale_scalar=w.g1_scale_c.data,
+            output1_scale_gate_scalar=w.g1_alphas.data,
+            output2_scale_scalar=w.g2_alphas.data,
+            num_experts=getattr(w, "num_experts"),
+            top_k=getattr(w, "top_k"),
+            n_group=routing_value("n_group", 0),
+            topk_group=routing_value("topk_group", 0),
+            intermediate_size=w.intermediate_size_per_partition,
+            local_expert_offset=getattr(w, "ep_rank", 0) * local_experts,
+            local_num_experts=local_experts,
+            routed_scaling_factor=routing_value("routed_scaling_factor", 1.0),
+            routing_method_type=routing_value("routing_method_type", 2),
+            do_finalize=True,
+            tune_max_num_tokens=next_power_of_2(x.shape[0]),
+        )
+        return result[0]

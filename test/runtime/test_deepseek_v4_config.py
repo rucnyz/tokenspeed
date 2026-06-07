@@ -80,7 +80,7 @@ from tokenspeed.runtime.layers.attention.registry import (
     _resolve_draft_cache_cell_size_for_profile,
 )
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
-from tokenspeed.runtime.layers.moe.backends.mxfp4.flashinfer import (
+from tokenspeed.runtime.layers.moe_legacy.backends.mxfp4.flashinfer import (
     _get_flashinfer_mxfp4_device_permute_indices,
     _reorder_w1w3_to_w3w1,
 )

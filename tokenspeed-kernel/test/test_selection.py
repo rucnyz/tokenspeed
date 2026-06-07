@@ -731,7 +731,7 @@ class TestSelectKernel:
         reg.register(
             KernelSpec(
                 name="moe_aligned_128",
-                family="moe_v2",
+                family="moe",
                 mode="apply",
                 solution="specialized",
                 format_signatures=frozenset({INPUT_BF16}),
@@ -746,7 +746,7 @@ class TestSelectKernel:
         reg.register(
             KernelSpec(
                 name="moe_aligned_1",
-                family="moe_v2",
+                family="moe",
                 mode="apply",
                 solution="fallback",
                 format_signatures=frozenset({INPUT_BF16}),
@@ -760,14 +760,14 @@ class TestSelectKernel:
         )
 
         fallback = select_kernel(
-            "moe_v2",
+            "moe",
             "apply",
             INPUT_BF16,
             platform=h100_platform,
             traits={"weight_dtype": "unquant", "ispp": 96},
         )
         specialized = select_kernel(
-            "moe_v2",
+            "moe",
             "apply",
             INPUT_BF16,
             platform=h100_platform,

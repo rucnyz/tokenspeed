@@ -18,18 +18,4 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed.runtime.layers.moe.expert import MoELayer
-from tokenspeed.runtime.layers.moe.loader import (
-    MoECheckpointLoader,
-    MoECheckpointLoadError,
-    build_moe_checkpoint_loader,
-)
-from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
-
-__all__ = [
-    "ExpertCheckpointSchema",
-    "MoECheckpointLoadError",
-    "MoECheckpointLoader",
-    "MoELayer",
-    "build_moe_checkpoint_loader",
-]
+import tokenspeed_kernel.ops.moe.triton.mxfp4  # noqa: F401

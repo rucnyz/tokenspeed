@@ -18,18 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed.runtime.layers.moe.expert import MoELayer
-from tokenspeed.runtime.layers.moe.loader import (
-    MoECheckpointLoader,
-    MoECheckpointLoadError,
-    build_moe_checkpoint_loader,
-)
-from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
+import tokenspeed_kernel.ops.moe.flashinfer.cutedsl_deep_nvfp4  # noqa: F401
+import tokenspeed_kernel.ops.moe.flashinfer.cutlass_fp8  # noqa: F401
+import tokenspeed_kernel.ops.moe.flashinfer.cutlass_nvfp4  # noqa: F401
+import tokenspeed_kernel.ops.moe.flashinfer.cutlass_unquant  # noqa: F401
+import tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4  # noqa: F401
+import tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4  # noqa: F401
+import tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant  # noqa: F401
 
-__all__ = [
-    "ExpertCheckpointSchema",
-    "MoECheckpointLoadError",
-    "MoECheckpointLoader",
-    "MoELayer",
-    "build_moe_checkpoint_loader",
-]
+__all__ = []

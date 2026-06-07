@@ -14,8 +14,12 @@ import tokenspeed_kernel  # noqa: E402, F401
 import torch
 from torch import nn
 
-from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import create_mxfp4_weights
-from tokenspeed.runtime.layers.moe.backends.weight_loaders import load_model_weight
+from tokenspeed.runtime.layers.moe_legacy.backends.mxfp4.weights import (
+    create_mxfp4_weights,
+)
+from tokenspeed.runtime.layers.moe_legacy.backends.weight_loaders import (
+    load_model_weight,
+)
 
 
 class _Backend:

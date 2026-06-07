@@ -30,7 +30,7 @@ from tokenspeed_kernel.ops.attention import (
     mha_prefill,
 )
 from tokenspeed_kernel.ops.gemm import mm
-from tokenspeed_kernel.ops.moe_v2 import moe_apply, moe_plan, moe_process_weights
+from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     quantize_fp8_with_scale,

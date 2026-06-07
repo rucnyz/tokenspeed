@@ -41,10 +41,10 @@ from tokenspeed.runtime.execution.cuda_graph_wrapper import (
 )
 from tokenspeed.runtime.layers.layernorm import RMSNorm as _RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
-from tokenspeed.runtime.layers.moe.checkpoint import (
+from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema as _ExpertCheckpointSchema,
 )
-from tokenspeed.runtime.layers.moe.checkpoint import (
+from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader as _build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer as _MoELayer
