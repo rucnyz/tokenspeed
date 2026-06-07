@@ -15,15 +15,22 @@ acceptance, which is only available as a global Prometheus counter).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
-# Severities, in increasing order of concern. "warn" findings are heuristic
-# (gibberish detection has no ground truth); "error" findings indicate a
-# response that is almost certainly wrong (e.g. tokens billed but no content).
+# Severities, in increasing order of concern, and what they do to the run:
+#   info  — diagnostic only.
+#   warn  — recorded + shown in the report; heuristic or single-request scope
+#           (e.g. one stalled request the engine may have lost track of).
+#   error — recorded + shown; a response almost certainly wrong (tokens billed
+#           but no content); gate-eligible via --fail-on-audit.
+#   fatal — server-wide failure (e.g. a global decode wedge): the run is cut
+#           off immediately, a report is still produced, and the exit is
+#           nonzero regardless of any gate.
 SEVERITY_INFO = "info"
 SEVERITY_WARN = "warn"
 SEVERITY_ERROR = "error"
+SEVERITY_FATAL = "fatal"
 
 
 @dataclass
@@ -69,7 +76,13 @@ class AuditConfig:
 
     enabled: tuple = ()  # auditor names to run; empty => none
     content_cap: int = 16384  # max chars of content to retain for auditing
-    stall_timeout_s: float = 120.0  # inter-token gap that trips a stall; 0=off
+    # Per-request inter-token gap that trips a (warn-level) request_stall; 0=off.
+    stall_timeout_s: float = 20.0
+    # Server-wide decode wedge: if requests are in decode (have produced a first
+    # token, not finished) yet NObody yields another token for this long, the
+    # engine has hung => fatal abort. Gated on in-decode requests so the window
+    # can be short and still safe. 0 disables.
+    global_stall_timeout_s: float = 20.0
 
 
 Auditor = Callable[[ResponseRecord], List[Finding]]

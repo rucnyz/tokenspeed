@@ -49,8 +49,14 @@ class RequestStats:
     audit_by_check_severity: Counter = field(default_factory=Counter)
     audit_by_workload: Counter = field(default_factory=Counter)
     audit_examples: Dict[str, str] = field(default_factory=dict)  # check -> detail
-    # Streaming stalls (request_stall events), keyed by stage.
+    # Per-request streaming stalls (request_stall events), keyed by stage.
     stalls: Counter = field(default_factory=Counter)
+    # Server-wide decode wedges (global_stall events): one detail per event.
+    global_stalls: List[str] = field(default_factory=list)
+    # Fatal audit findings (severity=fatal): "check: detail" strings.
+    fatal_findings: List[str] = field(default_factory=list)
+    aborted: bool = False  # run cut off early by a fatal condition
+    breaker_trips: int = 0  # circuit-breaker open events
     # Spec-decode acceptance length samples (from metrics_probe events).
     accept_len: List[float] = field(default_factory=list)
 
@@ -115,6 +121,8 @@ def aggregate(
             run_start = ts
         elif kind == "run_finished":
             run_end = ts
+            if data.get("aborted"):
+                reqs.aborted = True
         elif kind == "request_submitted":
             reqs.submitted += 1
             by_rid[data["rid"]] = {"submit_ts": ts, "first_ts": None}
@@ -157,8 +165,17 @@ def aggregate(
             reqs.audit_by_workload[data.get("workload", "")] += 1
             if check not in reqs.audit_examples and data.get("detail"):
                 reqs.audit_examples[check] = data["detail"]
+            if sev == "fatal":
+                reqs.fatal_findings.append(f"{check}: {data.get('detail', '')}")
         elif kind == "request_stall":
             reqs.stalls[data.get("stage", "unknown")] += 1
+        elif kind == "global_stall":
+            reqs.global_stalls.append(
+                f"in_decode={data.get('in_decode')} "
+                f"inflight={data.get('inflight')} idle={data.get('idle_s')}s"
+            )
+        elif kind == "breaker_open":
+            reqs.breaker_trips += 1
         elif kind == "metrics_probe":
             al = data.get("accept_len")
             if isinstance(al, (int, float)):
@@ -210,6 +227,11 @@ def format_summary(
     rss: Optional[RssStats] = None,
 ) -> str:
     lines: List[str] = []
+    if reqs.aborted or reqs.fatal_findings:
+        lines.append("!!! RUN ABORTED — FATAL CONDITION !!!")
+        for f in reqs.fatal_findings:
+            lines.append(f"  {f}")
+        lines.append("")
     lines.append(f"=== stress summary (duration: {duration:.1f}s) ===")
     lines.append(
         f"requests: submitted={reqs.submitted} completed={reqs.completed} "
@@ -244,6 +266,8 @@ def format_summary(
         lines.append("cancels by stage:")
         for k, v in reqs.cancel_stages.most_common():
             lines.append(f"  {k}: {v}")
+    if reqs.breaker_trips:
+        lines.append(f"circuit-breaker trips: {reqs.breaker_trips}")
     if reqs.invalid_schema:
         lines.append(f"invalid schema responses (legacy): {reqs.invalid_schema}")
         for k, v in reqs.invalid_schema_kinds.most_common():
@@ -254,9 +278,13 @@ def format_summary(
                 lines.append(f"    {k}: {v}")
 
     if reqs.stalls:
-        lines.append(f"stalls: {sum(reqs.stalls.values())}")
+        lines.append(f"per-request stalls (warn): {sum(reqs.stalls.values())}")
         for stage, v in reqs.stalls.most_common():
             lines.append(f"  {stage}: {v}")
+    if reqs.global_stalls:
+        lines.append(f"GLOBAL stalls (fatal): {len(reqs.global_stalls)}")
+        for g in reqs.global_stalls:
+            lines.append(f"  {g}")
 
     if reqs.audit_by_check:
         total = sum(reqs.audit_by_check.values())

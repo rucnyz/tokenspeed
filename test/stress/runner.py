@@ -20,9 +20,9 @@ from typing import AsyncIterator, Optional
 
 import aiohttp
 
-from .audits import AuditConfig
-from .client import ChatRequest, send_chat
-from .events import RUN_FINISHED, RUN_STARTED, JsonlSink
+from .audits import SEVERITY_FATAL, AuditConfig
+from .client import ChatRequest, ProgressCounter, send_chat
+from .events import AUDIT_FINDING, GLOBAL_STALL, RUN_FINISHED, RUN_STARTED, JsonlSink
 
 
 @dataclass
@@ -162,6 +162,9 @@ async def run(
     deadline = start + (arrival.duration_s or 10**9)
     sent = 0
     inflight: set[asyncio.Task] = set()
+    progress = ProgressCounter()
+    abort = asyncio.Event()  # set by the global-stall watcher on a fatal wedge
+    cfg = audit_cfg or AuditConfig()
 
     # Time-varying in-flight cap. For "sawtooth", cap ramps between
     # ``min_concurrency`` and ``max_concurrency``; everything else uses
@@ -174,12 +177,73 @@ async def run(
     async def wait_for_slot() -> None:
         # Simple polling gate (10ms resolution). Adequate for stress
         # tests where actual latency is O(100ms-seconds) per request.
-        while len(inflight) >= current_cap():
+        while len(inflight) >= current_cap() and not abort.is_set():
             await asyncio.sleep(0.01)
 
     async def wait_for_drain() -> None:
-        while inflight:
+        while inflight and not abort.is_set():
             await asyncio.sleep(0.01)
+
+    async def global_stall_watch() -> None:
+        """Fatal decode-wedge detector — caught directly, as early as possible.
+
+        The signal is precise: requests are *in decode* (each has produced a
+        first token and not finished) yet NObody emits another token. Gating on
+        in-decode requests rules out benign lulls (everything still in prefill),
+        so the window can be short — we flag the engine hanging within seconds,
+        well before any downstream symptom (e.g. the gateway evicting the
+        worker). A single stalled request is handled separately (per-request,
+        warn); here the whole fleet's decode has frozen.
+        """
+        timeout = cfg.global_stall_timeout_s
+        if not timeout or timeout <= 0:
+            return
+        last_tokens = progress.tokens
+        last_progress_ts = time.time()
+        # Latch whether any request was mid-decode during the current silent
+        # window. We can't just check in_decode at fire time: a wedge also trips
+        # the per-request stall (same default), which reaps those requests and
+        # drops in_decode back to 0 — that must not reset the wedge clock and
+        # mask the global failure. A genuine idle gap never sets the latch.
+        decode_in_window = False
+        peak_in_decode = 0
+        while not abort.is_set():
+            await asyncio.sleep(min(2.0, timeout / 4))
+            now = time.time()
+            if progress.tokens != last_tokens:
+                last_tokens = progress.tokens
+                last_progress_ts = now
+                decode_in_window = False
+                peak_in_decode = 0
+                continue
+            if progress.in_decode > 0:
+                decode_in_window = True
+                peak_in_decode = max(peak_in_decode, progress.in_decode)
+            elif not decode_in_window:
+                # Genuinely idle (nothing generating this window) — not a wedge.
+                last_progress_ts = now
+            if decode_in_window and now - last_progress_ts > timeout:
+                idle = now - last_progress_ts
+                sink.emit(
+                    GLOBAL_STALL,
+                    in_decode=peak_in_decode,
+                    inflight=len(inflight),
+                    idle_s=round(idle, 1),
+                )
+                sink.emit(
+                    AUDIT_FINDING,
+                    rid="",
+                    workload="__server__",
+                    check="global_stall",
+                    severity=SEVERITY_FATAL,
+                    detail=(
+                        f"{peak_in_decode} requests were in decode but no token "
+                        f"from any for {idle:.0f}s — engine decode wedge"
+                    ),
+                    value=round(idle, 1),
+                )
+                abort.set()
+                return
 
     brk = _Breaker(breaker or BreakerSpec(), sink)
 
@@ -187,6 +251,7 @@ async def run(
         limit=arrival.max_concurrency * 2, force_close=False
     )
     async with aiohttp.ClientSession(connector=connector) as session:
+        stall_watcher = asyncio.create_task(global_stall_watch())
 
         async def _one(req: ChatRequest) -> None:
             outcome = await send_chat(
@@ -197,6 +262,7 @@ async def run(
                 sink,
                 timeout_s=timeout_s,
                 audit_cfg=audit_cfg,
+                progress=progress,
             )
             # Cancellations are an expected test-behaviour, not a server
             # fault: they don't count against the breaker.
@@ -227,10 +293,10 @@ async def run(
             # Dispatch N, drain to 0, sleep, repeat. Explicit drain is
             # the whole point of this mode — it isolates each burst from
             # the previous so the scheduler transitions through empty.
-            while time.time() < deadline:
+            while time.time() < deadline and not abort.is_set():
                 exhausted = False
                 for _ in range(arrival.burst_size):
-                    if not await dispatch_one():
+                    if abort.is_set() or not await dispatch_one():
                         # Workload ran out or --max-requests hit; drain
                         # the in-flight tail then exit.
                         exhausted = True
@@ -244,11 +310,22 @@ async def run(
         else:
             async for _ in _arrival_gate(arrival, deadline):
                 await wait_for_slot()
-                if not await dispatch_one():
+                if abort.is_set() or not await dispatch_one():
                     break
 
-        # Final drain.
+        stall_watcher.cancel()
+        # Drain. On a fatal abort the in-flight requests are wedged, so cancel
+        # them rather than awaiting (which would hang until request-timeout).
+        if abort.is_set():
+            for t in inflight:
+                t.cancel()
         if inflight:
             await asyncio.gather(*inflight, return_exceptions=True)
+        try:
+            await stall_watcher
+        except asyncio.CancelledError:
+            pass
 
-    sink.emit(RUN_FINISHED, sent=sent, duration_s=time.time() - start)
+    sink.emit(
+        RUN_FINISHED, sent=sent, duration_s=time.time() - start, aborted=abort.is_set()
+    )

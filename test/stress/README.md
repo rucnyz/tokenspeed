@@ -185,10 +185,32 @@ functions run by the client on every completed response, emitting
 Select with `--audit <name>` (repeatable; default: all), disable with
 `--no-audit`. Add one by writing a `@register("name")` function in `audits/`.
 
-**Hang / stall detection** — a streaming request that stops producing tokens
-trips `--stall-timeout` (default 120s; 0 disables) and emits `request_stall`
-plus a `stall` error, catching decode wedges long before `--request-timeout`
-(600s) would. Non-streaming hangs are caught by `--request-timeout`.
+**Hang / stall detection** — two distinct levels:
+
+- **Per-request (warn)** — a single streaming request that stops producing
+  tokens for `--stall-timeout` (default 20s; 0 disables) emits `request_stall`
+  and ends as a `stall` error. Scope is one request (the engine may have lost
+  track of it); the rest of the fleet is unaffected, so it does not fail the run
+  on its own.
+- **Global (fatal)** — if requests are **in decode** (have produced a first
+  token, not finished) yet none yields another token for `--global-stall-timeout`
+  (default 20s; 0 disables), that's a server-wide decode wedge. It emits
+  `global_stall`, **aborts the run immediately** (cancelling wedged requests
+  instead of waiting out `--request-timeout`), and exits nonzero. Gating on
+  in-decode requests keeps the short window from false-firing on benign
+  all-prefill lulls.
+
+Non-streaming hangs are caught by `--request-timeout` (600s).
+
+### Severity levels
+
+Every finding carries a severity that decides what it does to the run:
+
+| Severity | Effect | Examples |
+|----------|--------|----------|
+| `warn` | Logged + in the final report. | per-request `request_stall`, `degeneration`, `finish_reason`, `low_visible_ratio`, `spec_acceptance` |
+| `error` | Logged + in the report; counts toward `--fail-on-audit`. | `empty_content`, `json_schema` |
+| `fatal` | Run is **cut off immediately**, report still produced, exit code 2. | `global_stall` |
 
 **Server-wide metrics** (`monitors/metrics.py`) — scrapes `/metrics` and
 derives spec-decode `accept_len = Δaccepted/Δdrafts + 1` over each window,
@@ -238,6 +260,7 @@ Each line of `events.jsonl` is `{"kind", "ts", "data": {...}}`. Kinds:
 - `run_started`, `run_finished`
 - `request_submitted`, `request_first_token`, `request_completed`,
   `request_cancelled`, `request_error`, `request_stall`
+- `global_stall` (fatal server-wide decode wedge; aborts the run)
 - `audit_finding` (per-response and server-wide quality findings)
 - `health_probe`, `health_transition`
 - `rss_probe`, `metrics_probe`

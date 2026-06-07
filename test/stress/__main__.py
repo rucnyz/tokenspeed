@@ -179,6 +179,7 @@ async def _cmd_run(args: argparse.Namespace) -> int:
             enabled=() if args.no_audit else _resolve_auditors(args.audit),
             content_cap=args.audit_content_cap,
             stall_timeout_s=args.stall_timeout,
+            global_stall_timeout_s=args.global_stall_timeout,
         )
 
         workload_args = _kv_pairs(args.workload_arg or [])
@@ -228,6 +229,12 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     reqs, health, duration, rss = aggregate(events_path)
     print(format_summary(reqs, health, duration, rss))
     print(f"\nevents: {events_path}")
+
+    # Fatal conditions (e.g. a global decode wedge) always fail the run,
+    # regardless of the opt-in gate.
+    if reqs.aborted or reqs.fatal_findings:
+        print("\nFATAL: run aborted on a server-wide failure (see above)")
+        return 2
 
     # Opt-in gate: nonzero exit if any --fail-on-audit threshold is exceeded.
     violations = _evaluate_gate(reqs, _parse_fail_on(args.fail_on_audit or []))
@@ -376,10 +383,19 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument(
         "--stall-timeout",
         type=float,
-        default=120.0,
-        help="Flag a streaming request as stalled if no token arrives for this "
-        "many seconds (default: 120; 0 disables). Catches decode wedges well "
-        "before --request-timeout.",
+        default=20.0,
+        help="Per-request (WARN): flag a single streaming request as stalled if "
+        "no token arrives for this many seconds (default: 20; 0 disables). One "
+        "request the engine may have lost track of.",
+    )
+    p_run.add_argument(
+        "--global-stall-timeout",
+        type=float,
+        default=20.0,
+        help="Server-wide (FATAL): if requests are in decode but NObody yields "
+        "a token for this many seconds, the engine has hung — abort the run and "
+        "exit nonzero (default: 20; 0 disables). Catches the wedge directly, "
+        "well before downstream symptoms (e.g. SMG evicting the worker).",
     )
     p_run.add_argument(
         "--no-spec-metrics",

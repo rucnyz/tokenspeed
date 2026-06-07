@@ -26,10 +26,15 @@ REQUEST_ERROR = "request_error"
 # DEPRECATED: superseded by AUDIT_FINDING (check="json_schema"); still emitted
 # by older event files and aggregated for backward compatibility.
 REQUEST_INVALID_SCHEMA = "request_invalid_schema"
-# Emitted when a streaming request stops producing tokens for longer than the
-# stall timeout (a wedge/hang that the total request timeout would catch only
-# much later). Carries {rid, stage, gap_s, workload}.
+# Emitted when a single streaming request stops producing tokens for longer
+# than the per-request stall timeout — a warning (the engine may have lost track
+# of one request); the total request timeout would catch it only much later.
+# Carries {rid, stage, gap_s, workload}.
 REQUEST_STALL = "request_stall"
+# Emitted when NO in-flight request yields a token for the global stall window
+# while the harness still has work outstanding/arriving — a server-wide decode
+# wedge. Fatal: the run is aborted. Carries {inflight, sent, idle_s}.
+GLOBAL_STALL = "global_stall"
 # Emitted per output-quality finding from the auditor pipeline. Carries
 # {rid, check, severity, detail, value, workload}.
 AUDIT_FINDING = "audit_finding"

@@ -22,7 +22,6 @@ import asyncio
 import os
 import signal
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -105,7 +104,7 @@ class ServerProcess:
                         url, timeout=aiohttp.ClientTimeout(total=5.0)
                     ) as resp:
                         if resp.status == 200:
-                            print(f"[stress] /health is 200; server ready", flush=True)
+                            print("[stress] /health is 200; server ready", flush=True)
                             return
                         last_err = f"status={resp.status}"
                 except Exception as e:  # noqa: BLE001

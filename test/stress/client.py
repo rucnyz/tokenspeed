@@ -33,6 +33,24 @@ from .events import (
 )
 
 
+class ProgressCounter:
+    """Shared fleet-wide progress state for global-stall detection.
+
+    ``tokens`` is bumped whenever *any* request yields a token. ``in_decode``
+    counts requests that have received a first token but not yet finished —
+    i.e. requests that *should* be emitting tokens right now. The watcher uses
+    it to tell a real wedge ("requests are mid-generation yet nothing is
+    flowing") apart from a benign lull ("everything's still in prefill"), which
+    lets it flag a hang in seconds rather than waiting out a long timeout.
+    """
+
+    __slots__ = ("tokens", "in_decode")
+
+    def __init__(self) -> None:
+        self.tokens = 0
+        self.in_decode = 0
+
+
 @dataclass
 class ChatRequest:
     messages: List[Dict[str, str]]
@@ -140,6 +158,7 @@ async def send_chat(
     sink: JsonlSink,
     timeout_s: float = 600.0,
     audit_cfg: Optional[AuditConfig] = None,
+    progress: Optional[ProgressCounter] = None,
 ) -> str:
     """Drive one request. Returns outcome: 'completed', 'cancelled', or 'error'.
 
@@ -281,6 +300,8 @@ async def send_chat(
             except Exception:
                 content = ""
             observed_visible_tokens = len(content.split())
+            if progress is not None:
+                progress.tokens += max(1, observed_visible_tokens)
             _add_content(content)
             _audit_completed(stream=False)
             sink.emit(
@@ -374,10 +395,14 @@ async def send_chat(
                         if not first_token.is_set():
                             first_token.set()
                             ttft_s = time.time() - submit_ts
+                            if progress is not None:
+                                progress.in_decode += 1  # entered decode
                             sink.emit(
                                 REQUEST_FIRST_TOKEN, rid=rid, workload=req.workload
                             )
                         observed_visible_tokens += 1
+                        if progress is not None:
+                            progress.tokens += 1
                         _add_content(content)
                 # Some servers put usage only in the final chunk.
                 usage = chunk.get("usage")
@@ -424,6 +449,10 @@ async def send_chat(
             workload=req.workload,
         )
     finally:
+        # Leaving decode (completed, cancelled, errored, or stalled) — balance
+        # the in_decode increment so the global-wedge watcher stays accurate.
+        if progress is not None and first_token.is_set():
+            progress.in_decode -= 1
         canceller.cancel()
         try:
             await canceller
