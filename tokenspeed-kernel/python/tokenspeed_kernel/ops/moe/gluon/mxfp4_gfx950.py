@@ -4738,6 +4738,7 @@ if platform.is_amd and platform.is_cdna4:
         topk_ids: torch.Tensor | None = None,
         num_tokens_global: int | None = None,
         max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
     ):
         swiglu_arg = getattr(w, "swiglu_arg", None)
         swiglu_alpha = swiglu_arg.alpha if swiglu_arg else 1.702

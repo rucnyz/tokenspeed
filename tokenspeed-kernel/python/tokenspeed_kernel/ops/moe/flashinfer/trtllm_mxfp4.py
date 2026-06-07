@@ -318,13 +318,10 @@ if platform.is_nvidia:
         output: torch.Tensor,
     ) -> torch.Tensor:
         routing_logits = router_logits.to(torch.float32)
-        routing_bias = _routing_value(w, "correction_bias", None)
-        if routing_bias is not None:
-            routing_bias = routing_bias.to(routing_logits.dtype)
         local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
         return trtllm_fp4_block_scale_moe(
             routing_logits=routing_logits,
-            routing_bias=routing_bias,
+            routing_bias=None,
             hidden_states=x_quant,
             hidden_states_scale=(
                 None if x_scale is None else x_scale.view(torch.float8_e4m3fn)
@@ -343,13 +340,13 @@ if platform.is_nvidia:
             output2_scale_scalar=None,
             num_experts=getattr(w, "num_experts"),
             top_k=getattr(w, "top_k"),
-            n_group=_routing_value(w, "n_group", None),
-            topk_group=_routing_value(w, "topk_group", None),
+            n_group=None,
+            topk_group=None,
             intermediate_size=getattr(w, "intermediate_size_per_partition"),
             local_expert_offset=getattr(w, "ep_rank", 0) * local_experts,
             local_num_experts=local_experts,
-            routed_scaling_factor=_routing_value(w, "routed_scaling_factor", None),
-            routing_method_type=_routing_value(w, "routing_method_type", 1),
+            routed_scaling_factor=None,
+            routing_method_type=1,
             do_finalize=True,
             tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
             output=output,
@@ -392,6 +389,7 @@ if platform.is_nvidia:
         topk_ids: torch.Tensor | None = None,
         num_tokens_global: int | None = None,
         max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
     ):
         hidden_padded = getattr(w, "hidden_size_padded", w.w2_weight_scale.shape[1])
         hidden_original = getattr(w, "hidden_size_original", hidden_padded)

@@ -132,8 +132,6 @@ def _matmul(
         assert (
             n_tokens is not None
         ), "n_tokens required when n_expts_act > 1 for top-k reduction"
-        if out.ndim == 3:
-            out = out.sum(dim=0)
         return out.view(n_tokens, n_expts_act, out.shape[-1]).sum(dim=1)
     return out
 
@@ -320,6 +318,7 @@ def triton_kernels_mxfp4_moe_apply(
     topk_ids: torch.Tensor | None = None,
     num_tokens_global: int | None = None,
     max_num_tokens_per_gpu: int | None = None,
+    do_finalize: bool = True,
 ):
     top_k = getattr(w, "top_k")
     ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing(
@@ -369,6 +368,7 @@ def triton_kernels_mxfp4_moe_apply(
         gemm2_input,
         w.w2_weight_triton_tensor,
         getattr(w, "w2_weight_bias", None),
+        a_ragged_metadata=ragged_metadata,
         precision_config=getattr(w, "w2_precision_config", None),
         scatter_indx=scatter_indx,
         betas=None,

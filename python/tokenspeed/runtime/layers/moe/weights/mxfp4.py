@@ -40,18 +40,24 @@ def create_mxfp4_weight_pair(
     layer: nn.Module,
     *,
     with_bias: bool = False,
+    solution: str | None = None,
 ) -> None:
     ispp = spec.intermediate_size // spec.tp_size
     platform = current_platform()
-    ispp_padded = (
-        round_up(ispp, 64) if platform.is_blackwell else round_up(ispp, MXFP4_BLOCK)
-    )
+    hidden_size_padded = spec.hidden_size
+    if platform.is_blackwell and solution == "flashinfer_mxfp4":
+        ispp_padded = round_up(ispp, 256)
+        hidden_size_padded = round_up(spec.hidden_size, 256)
+    else:
+        ispp_padded = (
+            round_up(ispp, 64) if platform.is_blackwell else round_up(ispp, MXFP4_BLOCK)
+        )
 
     w13_weight = torch.nn.Parameter(
         torch.zeros(
             spec.num_local_experts,
             2 * ispp_padded,
-            spec.hidden_size // 2,
+            hidden_size_padded // 2,
             dtype=torch.uint8,
         ),
         requires_grad=False,
@@ -60,7 +66,7 @@ def create_mxfp4_weight_pair(
         torch.zeros(
             spec.num_local_experts,
             2 * ispp_padded,
-            spec.hidden_size // MXFP4_BLOCK,
+            hidden_size_padded // MXFP4_BLOCK,
             dtype=torch.uint8,
         ),
         requires_grad=False,
@@ -68,7 +74,7 @@ def create_mxfp4_weight_pair(
     w2_weight = torch.nn.Parameter(
         torch.zeros(
             spec.num_local_experts,
-            spec.hidden_size,
+            hidden_size_padded,
             ispp_padded // 2,
             dtype=torch.uint8,
         ),
@@ -77,7 +83,7 @@ def create_mxfp4_weight_pair(
     w2_weight_scale = torch.nn.Parameter(
         torch.zeros(
             spec.num_local_experts,
-            spec.hidden_size,
+            hidden_size_padded,
             ispp_padded // MXFP4_BLOCK,
             dtype=torch.uint8,
         ),
@@ -100,7 +106,9 @@ def create_mxfp4_weight_pair(
             requires_grad=False,
         )
         w2_weight_bias = torch.nn.Parameter(
-            torch.zeros(spec.num_local_experts, spec.hidden_size, dtype=torch.bfloat16),
+            torch.zeros(
+                spec.num_local_experts, hidden_size_padded, dtype=torch.bfloat16
+            ),
             requires_grad=False,
         )
         layer.register_parameter("w13_weight_bias", w13_weight_bias)

@@ -210,6 +210,7 @@ def moe_apply(
     # token length
     num_tokens_global: int | None = None,
     max_num_tokens_per_gpu: int | None = None,
+    do_finalize: bool = True,
 ):
     """Apply a planned MoE kernel.
 
@@ -242,4 +243,5 @@ def moe_apply(
         topk_ids=topk_ids,
         num_tokens_global=num_tokens_global,
         max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+        do_finalize=do_finalize,
     )

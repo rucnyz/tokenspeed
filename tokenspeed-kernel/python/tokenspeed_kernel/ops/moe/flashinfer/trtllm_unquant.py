@@ -134,7 +134,7 @@ if platform.is_nvidia:
             "weight_dtype": frozenset({"unquant"}),
             "activation": frozenset({"silu", "swiglu"}),
             "routing_mode": frozenset({"kernel_routing"}),
-            "supports_deferred_finalize": frozenset({False}),
+            "supports_deferred_finalize": frozenset({True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({128}),
@@ -152,6 +152,7 @@ if platform.is_nvidia:
         topk_ids: torch.Tensor | None = None,
         num_tokens_global: int | None = None,
         max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
     ):
         routing_config = getattr(w, "routing_config", {})
         if not isinstance(routing_config, dict):
@@ -161,10 +162,17 @@ if platform.is_nvidia:
             if name in routing_config
             else getattr(w, name, default)
         )
+        routing_method_type = routing_value("routing_method_type", 1)
+        routing_logits_dtype = (
+            torch.float32 if int(routing_method_type) in {2, 7} else torch.bfloat16
+        )
+        routing_bias = routing_value("correction_bias", None)
+        if routing_bias is not None:
+            routing_bias = routing_bias.to(routing_logits_dtype)
         local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
         result = trtllm_bf16_moe(
-            routing_logits=router_logits.to(torch.bfloat16),
-            routing_bias=routing_value("correction_bias", None),
+            routing_logits=router_logits.to(routing_logits_dtype),
+            routing_bias=routing_bias,
             hidden_states=x,
             gemm1_weights=w.w13_weight,
             gemm2_weights=w.w2_weight,
@@ -177,10 +185,16 @@ if platform.is_nvidia:
             local_expert_offset=getattr(w, "ep_rank", 0) * local_experts,
             local_num_experts=local_experts,
             routed_scaling_factor=routing_value("routed_scaling_factor", None),
-            routing_method_type=routing_value("routing_method_type", 1),
-            do_finalize=True,
+            routing_method_type=routing_method_type,
+            do_finalize=do_finalize,
             tune_max_num_tokens=next_power_of_2(x.shape[0]),
         )
-        if isinstance(result, (list, tuple)):
+        if do_finalize and isinstance(result, (list, tuple)):
             return result[0]
+        if not do_finalize:
+            gemm2_out, expert_weights, expanded_idx = result
+            if expert_weights.dtype == torch.float32:
+                n, k = expert_weights.size()
+                expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
+            return (gemm2_out, expert_weights, expanded_idx)
         return result

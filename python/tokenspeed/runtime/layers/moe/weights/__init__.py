@@ -36,6 +36,7 @@ def create_layer_weights(
     quant_config,
     *,
     with_bias: bool = False,
+    solution: str | None = None,
 ) -> None:
     if quant_kind == "unquant":
         create_dense_weight_pair(
@@ -70,7 +71,7 @@ def create_layer_weights(
         return
 
     if quant_kind == "mxfp4":
-        create_mxfp4_weight_pair(spec, layer, with_bias=with_bias)
+        create_mxfp4_weight_pair(spec, layer, with_bias=with_bias, solution=solution)
         if quant_config.is_w4a8_fp8:
             create_mxfp4_fp8_input_scales(layer, spec.num_local_experts)
         return

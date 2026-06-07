@@ -127,20 +127,16 @@ class MoELayer(torch.nn.Module):
         ):
             self._quant_kind = quant_config.get_name()
 
-        create_layer_weights(
-            self._spec,
-            self,
-            self._quant_kind,
-            self.quant_config,
-            with_bias=with_bias,
-        )
-
         fp8_scale_block_shape = None
         internal_activation_dtype = None
         if self._quant_kind == "fp8":
             fp8_scale_block_shape = tuple(self.quant_config.weight_block_size)
         if self._quant_kind == "mxfp4" and self.quant_config.is_w4a8_fp8:
             internal_activation_dtype = "fp8"
+
+        input_dtype = torch.get_default_dtype()
+        if input_dtype not in {torch.float16, torch.bfloat16}:
+            input_dtype = torch.float16
 
         deepep_group = None
         if self._spec.use_deepep:
@@ -151,6 +147,7 @@ class MoELayer(torch.nn.Module):
             )
         self.plan = tokenspeed_kernel.moe_plan(
             self._quant_kind,
+            input_dtype=input_dtype,
             activation=self.activation,
             a2a_backend=self._spec.a2a_backend,
             ep_size=self.ep_size,
@@ -159,6 +156,15 @@ class MoELayer(torch.nn.Module):
             internal_activation_dtype=internal_activation_dtype,
             with_bias=with_bias,
             deepep_group=deepep_group,
+        )
+
+        create_layer_weights(
+            self._spec,
+            self,
+            self._quant_kind,
+            self.quant_config,
+            with_bias=with_bias,
+            solution=self.plan["solution"],
         )
         self._weights_processed = False
 
@@ -214,6 +220,7 @@ class MoELayer(torch.nn.Module):
                 topk_output.router_logits,
                 num_tokens_global=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                do_finalize=do_finalize,
             )
         else:
             return tokenspeed_kernel.moe_apply(
@@ -225,4 +232,5 @@ class MoELayer(torch.nn.Module):
                 topk_ids=topk_output.topk_ids,
                 num_tokens_global=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                do_finalize=do_finalize,
             )

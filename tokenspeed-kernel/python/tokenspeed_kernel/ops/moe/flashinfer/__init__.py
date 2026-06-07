@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import tokenspeed_kernel.ops.moe.flashinfer.cutedsl_deep_nvfp4  # noqa: F401
+import tokenspeed_kernel.ops.moe.flashinfer.cutedsl_deepep_nvfp4  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer.cutlass_fp8  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer.cutlass_nvfp4  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer.cutlass_unquant  # noqa: F401
