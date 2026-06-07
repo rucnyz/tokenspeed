@@ -24,11 +24,6 @@ from types import SimpleNamespace
 
 import torch
 from tokenspeed_kernel.ops.communication.deep_ep import DeepEPDispatcher, DeepEPMode
-from tokenspeed_kernel.ops.moe.flashinfer import (
-    grouped_gemm_nt_masked,
-    scaled_fp4_grouped_quantize,
-    silu_and_mul_scaled_nvfp4_experts_quantize,
-)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signature, format_signatures
@@ -43,10 +38,11 @@ apply_signatures = format_signatures(
 
 
 if platform.is_nvidia:
-
-    # ===-----------------------------------------------------------------------===#
-    # NVFP4 MoE
-    # ===-----------------------------------------------------------------------===#
+    from flashinfer import (
+        scaled_fp4_grouped_quantize,
+        silu_and_mul_scaled_nvfp4_experts_quantize,
+    )
+    from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
 
     @register_kernel(
         "moe_v2",
@@ -229,6 +225,3 @@ if platform.is_nvidia:
 
         dispatcher.combine_a(output.permute(2, 0, 1), topk_ids, topk_weights, None)
         return dispatcher.combine_b()
-
-
-__all__ = []

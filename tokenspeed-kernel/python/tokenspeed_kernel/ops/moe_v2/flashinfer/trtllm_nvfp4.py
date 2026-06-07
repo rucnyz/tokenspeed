@@ -21,17 +21,6 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.moe.flashinfer import (
-    convert_to_block_layout,
-    flashinfer_trtllm_bf16_fused_moe,
-    flashinfer_trtllm_fp4_fused_moe,
-    get_w2_permute_indices_with_cache,
-    maybe_get_cached_w3_w1_permute_indices,
-)
-from tokenspeed_kernel.ops.quantization.flashinfer import (
-    fp4_quantize,
-    nvfp4_block_scale_interleave,
-)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signature, format_signatures
@@ -47,10 +36,17 @@ apply_signatures = format_signatures(
 
 
 if platform.is_nvidia:
-
-    # ===-----------------------------------------------------------------------===#
-    # NVFP4 MoE
-    # ===-----------------------------------------------------------------------===#
+    from flashinfer import (
+        fp4_quantize,
+        nvfp4_block_scale_interleave,
+        trtllm_fp4_block_scale_moe,
+    )
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices as maybe_get_cached_w3_w1_permute_indices,
+    )
+    from flashinfer.fused_moe.core import (
+        get_w2_permute_indices_with_cache,
+    )
 
     @register_kernel(
         "moe_v2",
@@ -218,7 +214,7 @@ if platform.is_nvidia:
         local_experts = getattr(
             w, "num_local_experts", w.gemm1_weights_fp4_shuffled.shape[0]
         )
-        result = flashinfer_trtllm_fp4_fused_moe(
+        result = trtllm_fp4_block_scale_moe(
             routing_logits=router_logits.to(torch.float32),
             routing_bias=routing_value("correction_bias", None),
             hidden_states=hs_fp4,
@@ -252,135 +248,3 @@ if platform.is_nvidia:
             tune_max_num_tokens=next_power_of_2(x.shape[0]),
         )
         return result[0]
-
-    # ===-----------------------------------------------------------------------===#
-    # MXFP4 MoE
-    # ===-----------------------------------------------------------------------===#
-
-    # MXFP4 is handled by other solutions in this module set for now.
-
-    # ===-----------------------------------------------------------------------===#
-    # Un-quantized MoE
-    # ===-----------------------------------------------------------------------===#
-
-    @register_kernel(
-        "moe_v2",
-        "process_weights",
-        name="flashinfer_trtllm_unquant_moe_v2_process_weights",
-        solution="flashinfer_trtllm",
-        signatures=process_weight_signature,
-        traits={"weight_dtype": frozenset({"unquant"})},
-        priority=Priority.SPECIALIZED,
-    )
-    def flashinfer_trtllm_unquant_moe_process_weights(plan: dict, w: torch.nn.Module):
-        cache_permute_indices = {}
-        num_experts = w.w13_weight.shape[0]
-        epilogue_tile_m = 128
-        block_k = 128
-
-        half_w = w.w13_weight.shape[1] // 2
-        w1_weight = w.w13_weight.data[:, :half_w, :].clone()
-        w.w13_weight.data[:, :half_w, :] = w.w13_weight.data[:, half_w:, :]
-        w.w13_weight.data[:, half_w:, :] = w1_weight
-
-        old_shape_w13 = w.w13_weight.data[0].shape
-        old_shape_w2 = w.w2_weight.data[0].shape
-        new_shape_w13 = old_shape_w13
-        new_shape_w2 = old_shape_w2
-
-        for idx in range(num_experts):
-            permute_indices = maybe_get_cached_w3_w1_permute_indices(
-                cache_permute_indices,
-                w.w13_weight.data[idx].view(torch.uint8),
-                epilogue_tile_m,
-            )
-            tmp_weights1 = (
-                w.w13_weight.data[idx]
-                .clone()
-                .view(torch.uint8)[permute_indices.to(w.w13_weight.data.device)]
-                .contiguous()
-            )
-            permute_indices = get_w2_permute_indices_with_cache(
-                cache_permute_indices,
-                w.w2_weight.data[idx].view(torch.uint8),
-                epilogue_tile_m,
-            )
-            tmp_weights2 = (
-                w.w2_weight.data[idx]
-                .clone()
-                .view(torch.uint8)[permute_indices.to(w.w2_weight.data.device)]
-                .contiguous()
-            )
-            tmp_weights1 = convert_to_block_layout(
-                tmp_weights1.view(torch.uint8), block_k
-            )
-            tmp_weights2 = convert_to_block_layout(
-                tmp_weights2.view(torch.uint8), block_k
-            )
-            new_shape_w13 = tmp_weights1.view(torch.bfloat16).shape
-            new_shape_w2 = tmp_weights2.view(torch.bfloat16).shape
-            w.w13_weight.data[idx] = (
-                tmp_weights1.view(torch.bfloat16).contiguous().reshape(old_shape_w13)
-            )
-            w.w2_weight.data[idx] = (
-                tmp_weights2.view(torch.bfloat16).contiguous().reshape(old_shape_w2)
-            )
-
-        w.w13_weight.data = w.w13_weight.data.reshape(num_experts, *new_shape_w13)
-        w.w2_weight.data = w.w2_weight.data.reshape(num_experts, *new_shape_w2)
-        return None
-
-    @register_kernel(
-        "moe_v2",
-        "apply",
-        name="flashinfer_trtllm_unquant_moe_v2_apply",
-        solution="flashinfer_trtllm",
-        signatures=apply_signatures,
-        traits={
-            "weight_dtype": frozenset({"unquant"}),
-            "support_routing": frozenset({True}),
-            "supports_deferred_finalize": frozenset({False}),
-        },
-        priority=Priority.SPECIALIZED,
-    )
-    def flashinfer_trtllm_unquant_moe_apply(
-        plan: dict,
-        x: torch.Tensor,
-        w: torch.nn.Module,
-        router_logits: torch.Tensor,
-        topk_weights: torch.Tensor | None = None,
-        topk_ids: torch.Tensor | None = None,
-        num_tokens_global: int | None = None,
-        max_num_tokens_per_gpu: int | None = None,
-    ):
-        routing_config = getattr(w, "routing_config", {})
-        if not isinstance(routing_config, dict):
-            routing_config = {}
-        routing_value = lambda name, default: (
-            routing_config[name]
-            if name in routing_config
-            else getattr(w, name, default)
-        )
-        local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
-        return flashinfer_trtllm_bf16_fused_moe(
-            routing_logits=router_logits.to(torch.bfloat16),
-            routing_bias=routing_value("correction_bias", None),
-            hidden_states=x,
-            gemm1_weights=w.w13_weight,
-            gemm2_weights=w.w2_weight,
-            num_experts=getattr(w, "num_experts"),
-            top_k=getattr(w, "top_k"),
-            n_group=routing_value("n_group", None),
-            topk_group=routing_value("topk_group", None),
-            intermediate_size=getattr(w, "intermediate_size")
-            // getattr(w, "tp_size", 1),
-            local_expert_offset=getattr(w, "ep_rank", 0) * local_experts,
-            local_num_experts=local_experts,
-            routed_scaling_factor=routing_value("routed_scaling_factor", None),
-            routing_method_type=routing_value("routing_method_type", 1),
-            do_finalize=True,
-            tune_max_num_tokens=next_power_of_2(x.shape[0]),
-        )[0]
-
-
-__all__ = []

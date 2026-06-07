@@ -21,9 +21,6 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.moe.flashinfer import ActivationType
-from tokenspeed_kernel.ops.moe.flashinfer import autotune as flashinfer_autotune
-from tokenspeed_kernel.ops.moe.flashinfer import flashinfer_cutlass_fused_moe
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signature, format_signatures
@@ -39,10 +36,7 @@ apply_signatures = format_signatures(
 
 
 if platform.is_nvidia:
-
-    # ===-----------------------------------------------------------------------===#
-    # NVFP4 MoE
-    # ===-----------------------------------------------------------------------===#
+    from flashinfer import ActivationType, cutlass_fused_moe
 
     @register_kernel(
         "moe_v2",
@@ -158,7 +152,7 @@ if platform.is_nvidia:
         output = torch.empty(
             x.shape[0], x.shape[1], dtype=torch.bfloat16, device=x.device
         )
-        return flashinfer_cutlass_fused_moe(
+        return cutlass_fused_moe(
             output=output,
             input=x,
             token_selected_experts=topk_ids.to(torch.int),
@@ -182,152 +176,3 @@ if platform.is_nvidia:
             tune_max_num_tokens=next_power_of_2(x.shape[0]),
             activation_type=ActivationType.Swiglu,
         )[0]
-
-    # ===-----------------------------------------------------------------------===#
-    # FP8 MoE
-    # ===-----------------------------------------------------------------------===#
-
-    @register_kernel(
-        "moe_v2",
-        "process_weights",
-        name="flashinfer_cutlass_fp8_moe_v2_process_weights",
-        solution="flashinfer_cutlass",
-        signatures=process_weight_signature,
-        traits={"weight_dtype": frozenset({"fp8"})},
-        priority=Priority.PERFORMANT + 2,
-    )
-    def flashinfer_cutlass_fp8_moe_process_weights(plan: dict, w: torch.nn.Module):
-        half_w = w.w13_weight.shape[1] // 2
-        first_half = w.w13_weight.data[:, :half_w, :].clone()
-        w.w13_weight.data[:, :half_w, :] = w.w13_weight.data[:, half_w:, :]
-        w.w13_weight.data[:, half_w:, :] = first_half
-
-        half_s = w.w13_weight_scale_inv.shape[1] // 2
-        first_scale = w.w13_weight_scale_inv.data[:, :half_s, :].clone()
-        w.w13_weight_scale_inv.data[:, :half_s, :] = w.w13_weight_scale_inv.data[
-            :, half_s:, :
-        ]
-        w.w13_weight_scale_inv.data[:, half_s:, :] = first_scale
-        w.w13_weight_scale_inv.data.clamp_(min=1e-10)
-        w.w2_weight_scale_inv.data.clamp_(min=1e-10)
-        return None
-
-    @register_kernel(
-        "moe_v2",
-        "apply",
-        name="flashinfer_cutlass_fp8_moe_v2_apply",
-        solution="flashinfer_cutlass",
-        signatures=apply_signatures,
-        traits={
-            "weight_dtype": frozenset({"fp8"}),
-            "support_routing": frozenset({False}),
-            "supports_deferred_finalize": frozenset({False}),
-        },
-        priority=Priority.PERFORMANT + 2,
-    )
-    def flashinfer_cutlass_fp8_moe_apply(
-        plan: dict,
-        x: torch.Tensor,
-        w: torch.nn.Module,
-        router_logits: torch.Tensor,
-        topk_weights: torch.Tensor | None = None,
-        topk_ids: torch.Tensor | None = None,
-        num_tokens_global: int | None = None,
-        max_num_tokens_per_gpu: int | None = None,
-    ):
-        if topk_weights is None or topk_ids is None:
-            scores = torch.softmax(router_logits.float(), dim=-1)
-            topk_weights, topk_ids = torch.topk(
-                scores, k=getattr(w, "top_k"), dim=-1, sorted=False
-            )
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-            topk_weights = topk_weights.to(x.dtype)
-        output = torch.empty(x.shape[0], x.shape[1], dtype=x.dtype, device=x.device)
-        return flashinfer_cutlass_fused_moe(
-            output=output,
-            input=x,
-            token_selected_experts=topk_ids.to(torch.int),
-            token_final_scales=topk_weights,
-            fc1_expert_weights=w.w13_weight,
-            fc2_expert_weights=w.w2_weight,
-            output_dtype=x.dtype,
-            input_sf=None,
-            quant_scales=[w.w13_weight_scale_inv, w.w2_weight_scale_inv],
-            ep_size=getattr(w, "ep_size", 1),
-            ep_rank=getattr(w, "ep_rank", 0),
-            tp_size=getattr(w, "tp_size", 1),
-            tp_rank=getattr(w, "tp_rank", 0),
-            tune_max_num_tokens=max(8192, next_power_of_2(x.shape[0])),
-            activation_type=ActivationType.Swiglu,
-            use_deepseek_fp8_block_scale=True,
-        )[0]
-
-    # ===-----------------------------------------------------------------------===#
-    # Un-quantized MoE
-    # ===-----------------------------------------------------------------------===#
-
-    @register_kernel(
-        "moe_v2",
-        "process_weights",
-        name="flashinfer_cutlass_unquant_moe_v2_process_weights",
-        solution="flashinfer_cutlass",
-        signatures=process_weight_signature,
-        traits={"weight_dtype": frozenset({"unquant"})},
-        priority=Priority.PERFORMANT + 1,
-    )
-    def flashinfer_cutlass_unquant_moe_process_weights(plan: dict, w: torch.nn.Module):
-        half_w = w.w13_weight.shape[1] // 2
-        first_half = w.w13_weight.data[:, :half_w, :].clone()
-        w.w13_weight.data[:, :half_w, :] = w.w13_weight.data[:, half_w:, :]
-        w.w13_weight.data[:, half_w:, :] = first_half
-        return None
-
-    @register_kernel(
-        "moe_v2",
-        "apply",
-        name="flashinfer_cutlass_unquant_moe_v2_apply",
-        solution="flashinfer_cutlass",
-        signatures=apply_signatures,
-        traits={
-            "weight_dtype": frozenset({"unquant"}),
-            "support_routing": frozenset({False}),
-            "supports_deferred_finalize": frozenset({False}),
-        },
-        priority=Priority.PERFORMANT + 1,
-    )
-    def flashinfer_cutlass_unquant_moe_apply(
-        plan: dict,
-        x: torch.Tensor,
-        w: torch.nn.Module,
-        router_logits: torch.Tensor,
-        topk_weights: torch.Tensor | None = None,
-        topk_ids: torch.Tensor | None = None,
-        num_tokens_global: int | None = None,
-        max_num_tokens_per_gpu: int | None = None,
-    ):
-        if topk_weights is None or topk_ids is None:
-            scores = torch.softmax(router_logits.float(), dim=-1)
-            topk_weights, topk_ids = torch.topk(
-                scores, k=getattr(w, "top_k"), dim=-1, sorted=False
-            )
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-            topk_weights = topk_weights.to(x.dtype)
-        with flashinfer_autotune():
-            return flashinfer_cutlass_fused_moe(
-                input=x,
-                token_selected_experts=topk_ids.to(torch.int),
-                token_final_scales=topk_weights,
-                fc1_expert_weights=w.w13_weight,
-                fc2_expert_weights=w.w2_weight,
-                output_dtype=x.dtype,
-                quant_scales=None,
-                ep_size=getattr(w, "ep_size", 1),
-                ep_rank=getattr(w, "ep_rank", 0),
-                tp_size=getattr(w, "tp_size", 1),
-                tp_rank=getattr(w, "tp_rank", 0),
-                tune_max_num_tokens=max(8192, next_power_of_2(x.shape[0])),
-                activation_type=ActivationType.Swiglu,
-            )[0]
-
-
-__all__ = []

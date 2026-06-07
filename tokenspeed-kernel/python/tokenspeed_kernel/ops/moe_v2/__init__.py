@@ -17,11 +17,8 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-import tokenspeed_kernel.ops.moe_v2.flashinfer_cutedsl_deepep  # noqa: F401
-
 # Backend registration (side-effect imports)
-import tokenspeed_kernel.ops.moe_v2.flashinfer_cutlass  # noqa: F401
-import tokenspeed_kernel.ops.moe_v2.flashinfer_trtllm  # noqa: F401
+import tokenspeed_kernel.ops.moe_v2.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe_v2.gluon_gfx950  # noqa: F401
 import tokenspeed_kernel.ops.moe_v2.triton  # noqa: F401
 import tokenspeed_kernel.ops.moe_v2.triton_kernels  # noqa: F401
