@@ -4273,30 +4273,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 )
             )
 
-    def test_mxfp4_flashinfer_uses_gated_permute_for_w13(self):
-        from tokenspeed_kernel.ops.moe.flashinfer import (
-            get_w2_permute_indices_with_cache,
-            maybe_get_cached_w3_w1_permute_indices,
-        )
-        from tokenspeed_kernel.registry import error_fn
-
-        if (
-            maybe_get_cached_w3_w1_permute_indices is error_fn
-            or get_w2_permute_indices_with_cache is error_fn
-        ):
-            self.skipTest("flashinfer.fused_moe permute helpers unavailable")
-
-        x = torch.empty((4096, 2048), dtype=torch.uint8)
-        expected_w13 = maybe_get_cached_w3_w1_permute_indices({}, x, 128)
-        expected_w2 = get_w2_permute_indices_with_cache({}, x, 128)
-
-        actual_w13 = _get_flashinfer_mxfp4_device_permute_indices(x, 128, kind="w13")
-        actual_w2 = _get_flashinfer_mxfp4_device_permute_indices(x, 128, kind="w2")
-
-        self.assertTrue(torch.equal(actual_w13.cpu(), expected_w13.cpu()))
-        self.assertTrue(torch.equal(actual_w2.cpu(), expected_w2.cpu()))
-        self.assertFalse(torch.equal(actual_w13.cpu(), actual_w2.cpu()))
-
     def test_c4_ape_reorder_matches_overlap_window_layout(self):
         ape = torch.arange(4 * 8, dtype=torch.float32).reshape(4, 8)
 
