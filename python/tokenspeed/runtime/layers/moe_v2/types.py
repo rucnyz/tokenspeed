@@ -18,44 +18,26 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
+from __future__ import annotations
 
-bootstrap_profiling_from_env()
+from dataclasses import dataclass
 
-from tokenspeed_kernel.ops.attention import (
-    mha_decode_scheduler_metadata,
-    mha_decode_with_kvcache,
-    mha_extend_with_kvcache,
-    mha_merge_state,
-    mha_prefill,
-)
-from tokenspeed_kernel.ops.gemm import mm
-from tokenspeed_kernel.ops.moe_v2 import moe_apply, moe_plan, moe_process_weights
-from tokenspeed_kernel.ops.quantization import (
-    quantize_fp8,
-    quantize_fp8_with_scale,
-    quantize_mxfp4,
-    quantize_mxfp8,
-    quantize_nvfp4,
-)
 
-__all__ = [
-    # gemm
-    "mm",
-    # attention
-    "mha_prefill",
-    "mha_extend_with_kvcache",
-    "mha_decode_with_kvcache",
-    "mha_merge_state",
-    "mha_decode_scheduler_metadata",
-    # moe
-    "moe_apply",
-    "moe_plan",
-    "moe_process_weights",
-    # quantization
-    "quantize_fp8",
-    "quantize_fp8_with_scale",
-    "quantize_mxfp8",
-    "quantize_nvfp4",
-    "quantize_mxfp4",
-]
+@dataclass(frozen=True)
+class MoELayerSpec:
+    top_k: int
+    num_experts: int
+    num_local_experts: int
+    hidden_size: int
+    intermediate_size: int
+    activation: str
+    tp_rank: int
+    tp_size: int
+    ep_rank: int
+    ep_size: int
+    prefix: str = ""
+    a2a_backend: str = "none"
+
+    @property
+    def use_deepep(self) -> bool:
+        return self.a2a_backend == "deepep"

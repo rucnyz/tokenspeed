@@ -1,0 +1,215 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+
+import tokenspeed_kernel
+import torch
+
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
+from tokenspeed.runtime.layers.activation import SwigluArg
+from tokenspeed.runtime.layers.moe_v2.topk import TopKOutput, TopKOutputFormat
+from tokenspeed.runtime.layers.moe_v2.types import MoELayerSpec
+from tokenspeed.runtime.layers.moe_v2.utils import get_all2all_backend
+from tokenspeed.runtime.layers.moe_v2.weights import create_layer_weights
+from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
+from tokenspeed.runtime.utils.env import global_server_args_dict
+
+
+class MoELayer(torch.nn.Module):
+    def __init__(
+        self,
+        top_k: int,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        quant_config: QuantizationConfig,
+        layer_index: int,
+        prefix: str = "",
+        tp_rank: int | None = None,
+        tp_size: int | None = None,
+        ep_rank: int | None = None,
+        ep_size: int | None = None,
+        zero_expert_type: str = "",
+        activation: str = "silu",
+        activation_alpha=None,
+        swiglu_limit=None,
+        swiglu_beta: float | None = None,
+        w13_input_layout: str = "concatenated",
+        with_bias=False,
+        routing_config: dict = None,
+    ):
+        super().__init__()
+        self.layer_index = layer_index
+        self.prefix = prefix
+        self.top_k = top_k
+        self.num_experts = num_experts
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.quant_config = quant_config
+        self.ep_num_redundant_experts = global_server_args_dict[
+            "ep_num_redundant_experts"
+        ]
+        self.zero_expert_type = zero_expert_type
+        self.activation = activation
+        self.swiglu_arg = None
+        if self.activation == "swiglu":
+            self.swiglu_arg = SwigluArg(alpha=activation_alpha, limit=swiglu_limit)
+        # Per-model knobs the MoE backend reads in process_weights_after_loading.
+        # ``swiglu_beta``: gpt-oss uses silu(α·gate)·(up + 1) and sets 1.0;
+        # standard SwiGLU (e.g. deepseek-v4) leaves it None.
+        # ``w13_input_layout``: "interleaved" for HF gpt-oss-style row layout
+        # ([w1_0, w3_0, w1_1, w3_1, ...]); "concatenated" (default) for the
+        # shared MoE checkpoint loader's [w1_all | w3_all] block layout.
+        self.swiglu_beta = swiglu_beta
+        if w13_input_layout not in {"interleaved", "concatenated"}:
+            raise ValueError(
+                f"w13_input_layout must be 'interleaved' or 'concatenated', "
+                f"got {w13_input_layout!r}"
+            )
+        self.w13_input_layout = w13_input_layout
+
+        if tp_rank is None:
+            assert tp_size is None
+            tp_rank, tp_size = 0, 1
+        self.tp_rank, self.tp_size = tp_rank, tp_size
+        self.moe_tp_size = self.tp_size
+        if ep_rank is None:
+            assert ep_size is None
+            ep_rank, ep_size = 0, 1
+        self.ep_rank, self.ep_size = ep_rank, ep_size
+
+        if tp_size > 1 and ep_size > 1:
+            raise ValueError("Mixed TP and EP is not supported yet.")
+
+        num_local_experts = num_experts // self.ep_size
+
+        self.num_local_experts = num_local_experts
+        self._spec = MoELayerSpec(
+            top_k=top_k,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            ep_rank=self.ep_rank,
+            ep_size=self.ep_size,
+            prefix=prefix,
+            a2a_backend=get_all2all_backend().value,
+        )
+        self.routing_config = routing_config
+
+        self._quant_kind = "unquant"
+        if quant_config is not None and not should_ignore_quant_layer(
+            prefix=self.prefix,
+            ignored_layers=quant_config.ignored_layers,
+        ):
+            self._quant_kind = quant_config.get_name()
+
+        create_layer_weights(
+            self._spec,
+            self,
+            self._quant_kind,
+            self.quant_config,
+            with_bias=with_bias,
+        )
+
+        deepep_group = None
+        if self._spec.use_deepep:
+            mapping = global_server_args_dict["mapping"]
+            deepep_group = pg_manager.get_process_group(
+                "nccl",
+                mapping.moe.tp_ep_group,
+            )
+        self.plan = tokenspeed_kernel.moe_plan(
+            self._quant_kind,
+            a2a_backend=self._spec.a2a_backend,
+            deepep_group=deepep_group,
+        )
+        self._weights_processed = False
+
+    def process_weights_after_loading(self, module) -> None:
+        if self._weights_processed:
+            return
+
+        tokenspeed_kernel.moe_process_weights(self.plan, module)
+        self._weights_processed = True
+
+    @property
+    def support_routing(self) -> bool:
+        return self.plan["support_routing"]
+
+    @property
+    def topk_output_format(self):
+        if self.support_routing:
+            return TopKOutputFormat.BYPASSED
+        return TopKOutputFormat.STANDARD
+
+    @property
+    def supports_deferred_finalize(self) -> bool:
+        return self.plan["supports_deferred_finalize"]
+
+    def forward_zero_experts(self, topk_output):
+        zero_expert_limit = self.num_experts
+        if self.ep_num_redundant_experts is not None:
+            zero_expert_limit = zero_expert_limit - self.ep_num_redundant_experts
+
+        normal_expert_mask = topk_output.topk_ids >= zero_expert_limit
+        topk_output.topk_ids[normal_expert_mask] = -1
+        if self.zero_expert_type == "copy":
+            topk_output.topk_weights[normal_expert_mask] = 1.0
+        if self.zero_expert_type == "drop":
+            topk_output.topk_weights[normal_expert_mask] = 0.0
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+        do_finalize: bool = True,
+    ):
+        if not do_finalize and not self.supports_deferred_finalize:
+            raise AssertionError("MoELayer does not support do_finalize=False")
+
+        if self.support_routing:
+            return tokenspeed_kernel.moe_apply(
+                self.plan,
+                hidden_states,
+                self,
+                topk_output.router_logits,
+                num_tokens_global=num_global_tokens,
+                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            )
+        else:
+            return tokenspeed_kernel.moe_apply(
+                self.plan,
+                hidden_states,
+                self,
+                topk_output.router_logits,
+                topk_weights=topk_output.topk_weights,
+                topk_ids=topk_output.topk_ids,
+                num_tokens_global=num_global_tokens,
+                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            )

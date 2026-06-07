@@ -18,44 +18,22 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
+from dataclasses import dataclass
 
-bootstrap_profiling_from_env()
+import torch
 
-from tokenspeed_kernel.ops.attention import (
-    mha_decode_scheduler_metadata,
-    mha_decode_with_kvcache,
-    mha_extend_with_kvcache,
-    mha_merge_state,
-    mha_prefill,
-)
-from tokenspeed_kernel.ops.gemm import mm
-from tokenspeed_kernel.ops.moe_v2 import moe_apply, moe_plan, moe_process_weights
-from tokenspeed_kernel.ops.quantization import (
-    quantize_fp8,
-    quantize_fp8_with_scale,
-    quantize_mxfp4,
-    quantize_mxfp8,
-    quantize_nvfp4,
-)
 
-__all__ = [
-    # gemm
-    "mm",
-    # attention
-    "mha_prefill",
-    "mha_extend_with_kvcache",
-    "mha_decode_with_kvcache",
-    "mha_merge_state",
-    "mha_decode_scheduler_metadata",
-    # moe
-    "moe_apply",
-    "moe_plan",
-    "moe_process_weights",
-    # quantization
-    "quantize_fp8",
-    "quantize_fp8_with_scale",
-    "quantize_mxfp8",
-    "quantize_nvfp4",
-    "quantize_mxfp4",
-]
+@dataclass
+class ExpertParallelConfig:
+    top_k: int
+    num_experts: int
+    low_latency_max_num_tokens_per_gpu: int
+    max_num_tokens_per_gpu: int
+    hidden_size: int
+    rank: int
+    world_size: int
+    group: torch.distributed.ProcessGroup
+    params_dtype: torch.dtype
+
+
+EPConfig = ExpertParallelConfig
