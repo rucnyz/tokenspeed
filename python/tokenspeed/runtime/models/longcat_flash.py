@@ -136,7 +136,7 @@ def _get_longcat_moe_quant_config(
     if quant_config is None:
         return None
 
-    ignored_layers = getattr(quant_config, "ignored_layers", None)
+    ignored_layers = quant_config.ignored_layers
     if not ignored_layers:
         return quant_config
 

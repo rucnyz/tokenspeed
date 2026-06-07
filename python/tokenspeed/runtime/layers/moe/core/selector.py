@@ -51,21 +51,6 @@ _AUTO_IMPL_PREFERENCE = {
 }
 
 
-def _normalize_quant_kind(quant_config: object, prefix: str = "") -> str:
-    if quant_config is None or should_ignore_quant_layer(
-        prefix=prefix,
-        ignored_layers=getattr(quant_config, "ignored_layers", []),
-    ):
-        return "fp16"
-
-    quant_kind = quant_config.get_name()
-    if quant_kind == "fp8" and quant_config.weight_block_size is None:
-        raise RuntimeError("MoE fp8 requires block-wise weight scales")
-    if quant_kind in _AUTO_IMPL_PREFERENCE:
-        return quant_kind
-    raise RuntimeError(f"Unsupported MoE quant_config: {quant_config}")
-
-
 def _detect_arch() -> str:
     platform = current_platform()
 
@@ -114,7 +99,12 @@ def select_backend(
     quant_config: object,
     routing_config: dict | None = None,
 ):
-    quant_kind = _normalize_quant_kind(quant_config, prefix=spec.prefix)
+    quant_kind = "fp16"
+    if quant_config is not None and not should_ignore_quant_layer(
+        prefix=spec.prefix,
+        ignored_layers=quant_config.ignored_layers,
+    ):
+        quant_kind = quant_config.get_name()
     arch = _detect_arch()
     tried = []
 

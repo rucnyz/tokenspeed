@@ -124,7 +124,7 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             return False
         if should_ignore_quant_layer(
             prefix=spec.prefix,
-            ignored_layers=getattr(quant_config, "ignored_layers", []) or [],
+            ignored_layers=quant_config.ignored_layers,
         ):
             return False
         if quant_config.is_w4a8_fp8:

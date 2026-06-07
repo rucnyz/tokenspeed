@@ -116,9 +116,10 @@ class MoELayer(torch.nn.Module):
             routing_config=routing_config,
         )
         self.backend.create_layer_weights(self, with_bias=with_bias)
+        self._weights_processed_after_loading = False
 
     def process_weights_after_loading(self, module) -> None:
-        if getattr(self, "_weights_processed_after_loading", False):
+        if self._weights_processed_after_loading:
             return
         self.backend.process_weights_after_loading(module)
         self._weights_processed_after_loading = True

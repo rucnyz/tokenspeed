@@ -2472,7 +2472,7 @@ class DeepseekV4MoE(nn.Module):
             self.topk = None
         else:
             routed_quant_config = Mxfp4Config(
-                ignored_layers=getattr(quant_config, "ignored_layers", None),
+                ignored_layers=quant_config.ignored_layers,
                 is_checkpoint_mxfp4_serialized=True,
             )
             self.experts = MoELayer(

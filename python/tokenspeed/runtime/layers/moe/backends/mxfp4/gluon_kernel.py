@@ -126,7 +126,7 @@ class Mxfp4GluonKernelBackend(Mxfp4TritonKernelBackend):
             return False
         if should_ignore_quant_layer(
             prefix=spec.prefix,
-            ignored_layers=getattr(quant_config, "ignored_layers", []) or [],
+            ignored_layers=quant_config.ignored_layers,
         ):
             return False
         # Gluon kernels are only validated for AMD w-mxfp4 / a-fp8.
