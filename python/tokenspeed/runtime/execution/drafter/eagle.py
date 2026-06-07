@@ -222,7 +222,7 @@ class Eagle(BaseDrafter):
         buffers = self.input_buffers
         forward_mode = draft_input.forward_mode
 
-        input_ids, _, gather_ids = self._get_first_step_input(
+        input_ids, unpadded_input_lengths, gather_ids = self._get_first_step_input(
             draft_input, bs, draft_input.input_num_tokens
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
