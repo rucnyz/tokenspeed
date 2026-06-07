@@ -17,6 +17,8 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+from typing import Any
+
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.moe_v2.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe_v2.gluon  # noqa: F401
@@ -33,54 +35,143 @@ __all__ = [
 ]
 
 
+def _normalize_weight_dtype(weight_dtype: str) -> str:
+    if weight_dtype in {"bf16", "fp16", "float16", "bfloat16", "unquantized"}:
+        return "unquant"
+    return weight_dtype
+
+
+def _uses_all_to_all_ep(a2a_backend: str | None) -> bool:
+    return a2a_backend not in {None, "none"}
+
+
+def _validate_a2a_backend(a2a_backend: str | None) -> None:
+    if a2a_backend in {None, "none", "deepep"}:
+        return
+    raise NotImplementedError(
+        f"MoE v2 all-to-all backend is unsupported: {a2a_backend}"
+    )
+
+
+def _build_selection_traits(
+    *,
+    weight_dtype: str,
+    activation: str | None,
+    routing_mode: str | None,
+    requires_deferred_finalize: bool,
+    a2a_backend: str | None,
+    ep_size: int | None,
+    ispp: int | None,
+    fp8_scale_block_shape: tuple[int, int] | None,
+    internal_activation_dtype: str | None,
+    with_bias: bool,
+) -> dict[str, Any]:
+    traits: dict[str, Any] = {"weight_dtype": weight_dtype}
+    if activation is not None:
+        traits["activation"] = activation
+    if routing_mode is not None:
+        traits["routing_mode"] = routing_mode
+    if requires_deferred_finalize:
+        traits["supports_deferred_finalize"] = True
+
+    all_to_all_ep = _uses_all_to_all_ep(a2a_backend)
+    traits["supports_all_to_all_ep"] = all_to_all_ep
+    if all_to_all_ep or (ep_size is not None and ep_size > 1):
+        traits["supports_ep"] = True
+
+    if ispp is not None:
+        traits["ispp"] = int(ispp)
+    if fp8_scale_block_shape is not None:
+        traits["fp8_scale_block_shape"] = tuple(fp8_scale_block_shape)
+    if internal_activation_dtype is not None:
+        traits["internal_activation_dtype"] = internal_activation_dtype
+    if with_bias:
+        traits["supports_bias"] = True
+    return traits
+
+
 def moe_plan(
     weight_dtype: str,
-    solution: str | None = None,
-    *,
+    input_dtype: torch.dtype = torch.bfloat16,
+    activation: str | None = None,
+    routing_mode: str | None = None,
+    requires_deferred_finalize: bool = False,
     a2a_backend: str | None = None,
+    ep_size: int | None = None,
+    ispp: int | None = None,
+    fp8_scale_block_shape: tuple[int, int] | None = None,
+    internal_activation_dtype: str | None = None,
+    with_bias: bool = False,
     deepep_group: object | None = None,
+    solution: str | None = None,
 ) -> dict:
     """Create a MoE v2 execution plan.
 
     Args:
         weight_dtype: Logical MoE weight dtype. fp16, bf16, float16,
             bfloat16, and unquantized aliases map to unquant.
-        solution: Optional kernel solution to force through normal selection.
-            None leaves the concrete kernel choice to the registry.
+        input_dtype: Hidden-state dtype used for the apply-kernel signature.
+        activation: Optional activation name required by the layer.
+        routing_mode: Optional routing behavior requirement:
+            precomputed_topk or kernel_routing.
+        requires_deferred_finalize: Require a kernel that can defer finalize.
         a2a_backend: Optional all-to-all backend. deepep selects the DeepEP
             solution when solution is not set.
+        ep_size: Optional expert-parallel size. Values > 1 require EP support.
+        ispp: Optional intermediate size per partition for alignment checks.
+        fp8_scale_block_shape: Optional FP8 block-scale shape requirement.
+        internal_activation_dtype: Optional internal activation dtype requirement.
+        with_bias: Whether the selected kernel must support expert bias tensors.
         deepep_group: Runtime-created process group used by DeepEP plans.
+        solution: Optional kernel solution to force through normal selection.
+            None leaves the concrete kernel choice to the registry.
 
     The selected apply kernel owns plan metadata. A plan with support_routing
     false requires precomputed top-k ids and weights when calling moe_apply.
     Process-weights follows the selected apply solution when weights are loaded.
     """
-    if weight_dtype in {"bf16", "fp16", "float16", "bfloat16", "unquantized"}:
-        weight_dtype = "unquant"
+    weight_dtype = _normalize_weight_dtype(weight_dtype)
+    _validate_a2a_backend(a2a_backend)
     if solution is None and a2a_backend == "deepep":
         solution = "flashinfer_cutedsl_deepep"
+
+    selection_traits = _build_selection_traits(
+        weight_dtype=weight_dtype,
+        activation=activation,
+        routing_mode=routing_mode,
+        requires_deferred_finalize=requires_deferred_finalize,
+        a2a_backend=a2a_backend,
+        ep_size=ep_size,
+        ispp=ispp,
+        fp8_scale_block_shape=fp8_scale_block_shape,
+        internal_activation_dtype=internal_activation_dtype,
+        with_bias=with_bias,
+    )
 
     kernel = select_kernel(
         "moe_v2",
         "apply",
-        format_signature(x=dense_tensor_format(torch.bfloat16)),
-        traits={"weight_dtype": weight_dtype},
+        format_signature(x=dense_tensor_format(input_dtype)),
+        traits=selection_traits,
         solution=solution,
     )
     spec = KernelRegistry.get().get_by_name(kernel.name)
     if spec is None:
         raise RuntimeError(f"Kernel spec not found for selected kernel {kernel.name}")
-    support_routing = True in spec.traits.get("support_routing", frozenset({False}))
+    routing_modes = spec.traits.get("routing_mode", frozenset())
+    support_routing = "kernel_routing" in routing_modes
     supports_deferred_finalize = True in spec.traits.get(
         "supports_deferred_finalize", frozenset({False})
     )
     return {
         "weight_dtype": weight_dtype,
+        "kernel_name": spec.name,
         "solution": spec.solution,
         "a2a_backend": a2a_backend,
         "deepep_group": deepep_group,
         "support_routing": support_routing,
         "supports_deferred_finalize": supports_deferred_finalize,
+        "selection_traits": selection_traits,
     }
 
 
@@ -135,7 +226,7 @@ def moe_apply(
         "moe_v2",
         "apply",
         format_signature(x=dense_tensor_format(x.dtype)),
-        traits={"weight_dtype": plan["weight_dtype"]},
+        traits=plan.get("selection_traits", {"weight_dtype": plan["weight_dtype"]}),
         solution=plan["solution"],
     )
     return kernel(

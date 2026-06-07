@@ -25,7 +25,7 @@ from contextlib import contextmanager
 import tokenspeed_kernel
 import torch
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signature, format_signatures
 
@@ -63,12 +63,6 @@ from triton_kernels.tensor_details import layout
 from triton_kernels.topk import topk
 
 platform = current_platform()
-process_weight_signature = frozenset({format_signature()})
-apply_signatures = format_signatures(
-    "x",
-    "dense",
-    {torch.float16, torch.bfloat16},
-)
 
 
 def _is_bf16_mxfp4(x, w, precision_config):
@@ -180,7 +174,7 @@ def _routing(
     "process_weights",
     name="triton_kernels_mxfp4_moe_v2_process_weights",
     solution="triton_kernels",
-    signatures=process_weight_signature,
+    signatures=frozenset({format_signature()}),
     traits={"weight_dtype": frozenset({"mxfp4"})},
     priority=Priority.PERFORMANT,
 )
@@ -275,13 +269,47 @@ def triton_kernels_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
     "apply",
     name="triton_kernels_mxfp4_moe_v2_apply",
     solution="triton_kernels",
-    signatures=apply_signatures,
+    signatures=format_signatures(
+        "x",
+        "dense",
+        {torch.float16, torch.bfloat16},
+    ),
     traits={
         "weight_dtype": frozenset({"mxfp4"}),
-        "support_routing": frozenset({True}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "routing_mode": frozenset({"kernel_routing"}),
         "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({False}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({1}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "supports_bias": frozenset({True}),
     },
     priority=Priority.PERFORMANT,
+)
+@register_kernel(
+    "moe_v2",
+    "apply",
+    name="triton_kernels_mxfp4_fp8_activation_moe_v2_apply",
+    solution="triton_kernels",
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+    signatures=format_signatures(
+        "x",
+        "dense",
+        {torch.float16, torch.bfloat16},
+    ),
+    traits={
+        "weight_dtype": frozenset({"mxfp4"}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "routing_mode": frozenset({"kernel_routing"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({False}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({1}),
+        "internal_activation_dtype": frozenset({"fp8"}),
+        "supports_bias": frozenset({True}),
+    },
+    priority=Priority.PERFORMANT - 1,
 )
 def triton_kernels_mxfp4_moe_apply(
     plan: dict,

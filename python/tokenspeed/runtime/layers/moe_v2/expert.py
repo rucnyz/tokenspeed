@@ -135,6 +135,13 @@ class MoELayer(torch.nn.Module):
             with_bias=with_bias,
         )
 
+        fp8_scale_block_shape = None
+        internal_activation_dtype = None
+        if self._quant_kind == "fp8":
+            fp8_scale_block_shape = tuple(self.quant_config.weight_block_size)
+        if self._quant_kind == "mxfp4" and self.quant_config.is_w4a8_fp8:
+            internal_activation_dtype = "fp8"
+
         deepep_group = None
         if self._spec.use_deepep:
             mapping = global_server_args_dict["mapping"]
@@ -144,7 +151,13 @@ class MoELayer(torch.nn.Module):
             )
         self.plan = tokenspeed_kernel.moe_plan(
             self._quant_kind,
+            activation=self.activation,
             a2a_backend=self._spec.a2a_backend,
+            ep_size=self.ep_size,
+            ispp=self.intermediate_size // self.tp_size,
+            fp8_scale_block_shape=fp8_scale_block_shape,
+            internal_activation_dtype=internal_activation_dtype,
+            with_bias=with_bias,
             deepep_group=deepep_group,
         )
         self._weights_processed = False

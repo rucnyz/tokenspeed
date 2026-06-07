@@ -30,7 +30,11 @@ from tokenspeed_kernel._triton import (
     gluon,
     redirect_triton_to_tokenspeed_triton,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signature, format_signatures
 
@@ -56,12 +60,6 @@ with redirect_triton_to_tokenspeed_triton():
     from triton_kernels.topk import topk
 
 platform = current_platform()
-process_weight_signature = frozenset({format_signature()})
-apply_signatures = format_signatures(
-    "x",
-    "dense",
-    {torch.float16, torch.bfloat16},
-)
 
 __all__ = [
     "_gluon_mxfp_ragged_matmul",
@@ -4619,7 +4617,12 @@ if platform.is_amd and platform.is_cdna4:
         "process_weights",
         name="gluon_gfx950_mxfp4_moe_v2_process_weights",
         solution="gluon_gfx950",
-        signatures=process_weight_signature,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=frozenset({format_signature()}),
         traits={"weight_dtype": frozenset({"mxfp4"})},
         priority=Priority.SPECIALIZED,
     )
@@ -4703,11 +4706,26 @@ if platform.is_amd and platform.is_cdna4:
         "apply",
         name="gluon_gfx950_mxfp4_moe_v2_apply",
         solution="gluon_gfx950",
-        signatures=apply_signatures,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures(
+            "x",
+            "dense",
+            {torch.float16, torch.bfloat16},
+        ),
         traits={
             "weight_dtype": frozenset({"mxfp4"}),
-            "support_routing": frozenset({True}),
+            "activation": frozenset({"silu", "swiglu"}),
+            "routing_mode": frozenset({"kernel_routing"}),
             "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({False}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({1}),
+            "internal_activation_dtype": frozenset({"fp8"}),
+            "supports_bias": frozenset({True}),
         },
         priority=Priority.SPECIALIZED,
     )

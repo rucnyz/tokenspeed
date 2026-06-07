@@ -21,18 +21,16 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signature, format_signatures
 
 platform = current_platform()
 next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length()
-process_weight_signature = frozenset({format_signature()})
-apply_signatures = format_signatures(
-    "x",
-    "dense",
-    {torch.float16, torch.bfloat16},
-)
 
 
 if platform.is_nvidia:
@@ -50,7 +48,12 @@ if platform.is_nvidia:
         "process_weights",
         name="flashinfer_trtllm_unquant_moe_v2_process_weights",
         solution="flashinfer_trtllm",
-        signatures=process_weight_signature,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 0),
+        ),
+        signatures=frozenset({format_signature()}),
         traits={"weight_dtype": frozenset({"unquant"})},
         priority=Priority.SPECIALIZED,
     )
@@ -117,11 +120,26 @@ if platform.is_nvidia:
         "apply",
         name="flashinfer_trtllm_unquant_moe_v2_apply",
         solution="flashinfer_trtllm",
-        signatures=apply_signatures,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 0),
+        ),
+        signatures=format_signatures(
+            "x",
+            "dense",
+            {torch.bfloat16},
+        ),
         traits={
             "weight_dtype": frozenset({"unquant"}),
-            "support_routing": frozenset({True}),
+            "activation": frozenset({"silu", "swiglu"}),
+            "routing_mode": frozenset({"kernel_routing"}),
             "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({128}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({False}),
         },
         priority=Priority.SPECIALIZED,
     )
