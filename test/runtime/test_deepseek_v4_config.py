@@ -20,11 +20,11 @@ from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_topk_prefill,
     indexer_topk_prefill,
 )
-from tokenspeed_kernel.ops.routing.cuda import (
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.thirdparty.cuda import (
     hash_softplus_sqrt_topk_flash,
     softplus_sqrt_topk_flash,
 )
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     deepseek_v4_indexer_fp8_row_bytes,

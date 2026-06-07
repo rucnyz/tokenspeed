@@ -52,15 +52,15 @@ from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_indexer_decode_metadata_compute,
 )
-from tokenspeed_kernel.ops.moe.triton import (
-    stage_deepseek_v4_mega_moe_inputs as _stage_deepseek_v4_mega_moe_inputs,
-)
-from tokenspeed_kernel.ops.routing.cuda import (
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.thirdparty.cuda import (
     dsv3_router_gemm,
     hash_softplus_sqrt_topk_flash,
     softplus_sqrt_topk_flash,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.thirdparty.triton import (
+    stage_deepseek_v4_mega_moe_inputs as _stage_deepseek_v4_mega_moe_inputs,
+)
 from tokenspeed_kernel.thirdparty.trtllm import (
     fast_topk_v2,
 )
