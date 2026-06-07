@@ -23,14 +23,12 @@ from __future__ import annotations
 from tokenspeed.runtime.layers.moe.backends.fp8.flashinfer_cutlass import (
     Fp8FlashinferCutlassBackend,
 )
-from tokenspeed.runtime.layers.moe.backends.fp8.triton import Fp8TritonBackend
 from tokenspeed.runtime.layers.moe.backends.fp16.flashinfer_cutlass import (
     Fp16FlashinferCutlassBackend,
 )
 from tokenspeed.runtime.layers.moe.backends.fp16.flashinfer_trtllm import (
     Fp16FlashinferTrtllmBackend,
 )
-from tokenspeed.runtime.layers.moe.backends.fp16.triton import Fp16TritonBackend
 from tokenspeed.runtime.layers.moe.backends.mxfp4.flashinfer import (
     Mxfp4FlashinferMxfp4Backend,
 )
@@ -52,10 +50,8 @@ from tokenspeed.runtime.layers.moe.backends.nvfp4.flashinfer_trtllm import (
 from tokenspeed.runtime.layers.moe.core.registry import register_backend_family
 
 _BACKEND_SPECS = {
-    ("fp16", "triton"): Fp16TritonBackend,
     ("fp16", "flashinfer_cutlass"): Fp16FlashinferCutlassBackend,
     ("fp16", "flashinfer_trtllm"): Fp16FlashinferTrtllmBackend,
-    ("fp8", "triton"): Fp8TritonBackend,
     ("fp8", "flashinfer_cutlass"): Fp8FlashinferCutlassBackend,
     ("nvfp4", "flashinfer_cutlass"): Nvfp4FlashinferCutlassBackend,
     ("nvfp4", "flashinfer_cutedsl"): Nvfp4FlashinferCuteDslBackend,

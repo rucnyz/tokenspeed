@@ -18,6 +18,4 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed.runtime.layers.moe.backends.fp8.triton import Fp8TritonBackend
-
-__all__ = ["Fp8TritonBackend"]
+__all__ = []

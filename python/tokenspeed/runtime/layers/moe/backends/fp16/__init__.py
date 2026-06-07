@@ -24,10 +24,8 @@ from tokenspeed.runtime.layers.moe.backends.fp16.flashinfer_cutlass import (
 from tokenspeed.runtime.layers.moe.backends.fp16.flashinfer_trtllm import (
     Fp16FlashinferTrtllmBackend,
 )
-from tokenspeed.runtime.layers.moe.backends.fp16.triton import Fp16TritonBackend
 
 __all__ = [
     "Fp16FlashinferCutlassBackend",
     "Fp16FlashinferTrtllmBackend",
-    "Fp16TritonBackend",
 ]

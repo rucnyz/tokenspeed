@@ -32,7 +32,6 @@ _AUTO_IMPL_PREFERENCE = {
     "fp16": (
         "flashinfer_trtllm",
         "flashinfer_cutlass",
-        "triton",
     ),
     "nvfp4": (
         "flashinfer_trtllm",
@@ -44,10 +43,7 @@ _AUTO_IMPL_PREFERENCE = {
         "triton_kernel",
         "gluon_kernel",
     ),
-    "fp8": (
-        "flashinfer_cutlass",
-        "triton",
-    ),
+    "fp8": ("flashinfer_cutlass",),
 }
 
 
@@ -70,11 +66,7 @@ def _resolve_impl_candidates(quant_kind: str) -> tuple[str, ...]:
     auto_candidates = _AUTO_IMPL_PREFERENCE.get(quant_kind, ())
     platform = current_platform()
     if backend.is_auto() and platform.is_amd:
-        if quant_kind in {"fp16", "fp8"}:
-            auto_candidates = tuple(
-                impl for impl in auto_candidates if impl == "triton"
-            )
-        elif quant_kind == "mxfp4":
+        if quant_kind == "mxfp4":
             auto_candidates = tuple(
                 impl
                 for impl in auto_candidates

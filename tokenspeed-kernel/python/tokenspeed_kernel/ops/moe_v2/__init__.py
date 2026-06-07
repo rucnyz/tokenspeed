@@ -20,7 +20,6 @@
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.moe_v2.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe_v2.gluon_gfx950  # noqa: F401
-import tokenspeed_kernel.ops.moe_v2.triton  # noqa: F401
 import tokenspeed_kernel.ops.moe_v2.triton_kernels  # noqa: F401
 import torch
 from tokenspeed_kernel.registry import KernelRegistry
