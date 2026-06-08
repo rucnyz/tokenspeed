@@ -170,9 +170,12 @@ async def run(
     # ``min_concurrency`` and ``max_concurrency``; everything else uses
     # a constant cap equal to ``max_concurrency``.
     def current_cap() -> int:
+        # Clamp to >=1: a cap of 0 (e.g. --max-concurrency 0, or a sawtooth
+        # floor of 0) makes wait_for_slot() spin forever (len(inflight) >= 0 is
+        # always true) and dispatch nothing.
         if arrival.kind == "sawtooth":
-            return _sawtooth_cap(arrival, time.time() - start)
-        return arrival.max_concurrency
+            return max(1, _sawtooth_cap(arrival, time.time() - start))
+        return max(1, arrival.max_concurrency)
 
     async def wait_for_slot() -> None:
         # Simple polling gate (10ms resolution). Adequate for stress

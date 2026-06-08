@@ -136,6 +136,8 @@ async def reality_mix(
     seed: int = 0,
     max_tokens_cap: int = 0,
     very_long_weight: int = 5,
+    prompt_tokens_max: int = 0,
+    temperature: float = -1.0,
 ) -> AsyncIterator[ChatRequest]:
     rng = random.Random(seed)
     grammar_names = list(_PASSING)
@@ -158,6 +160,9 @@ async def reality_mix(
         prompt_bucket = _weighted_choice(_PROMPT_BUCKETS, rng)
         gen_bucket = _weighted_choice(gen_buckets, rng)
         prompt_tokens = rng.randint(prompt_bucket[1], prompt_bucket[2])
+        # Clamp prompts to fit a smaller model context (e.g. gpt-oss at 80k).
+        if prompt_tokens_max > 0:
+            prompt_tokens = min(prompt_tokens, prompt_tokens_max)
         max_tokens = rng.randint(gen_bucket[1], gen_bucket[2])
 
         is_grammar = rng.random() < grammar_fraction
@@ -223,10 +228,13 @@ async def reality_mix(
             # useful and blows past any sensible schema response size.
             max_tokens = min(max_tokens, 800)
 
+        req_temperature = (
+            temperature if temperature >= 0.0 else (0.7 if not is_grammar else 0.0)
+        )
         yield ChatRequest(
             messages=messages,
             max_tokens=max_tokens,
-            temperature=0.7 if not is_grammar else 0.0,
+            temperature=req_temperature,
             stream=True,
             cancel_at_stage=cancel_stage,
             extra=extra,

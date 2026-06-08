@@ -71,6 +71,13 @@ then publishes the summary to the run page. It's **manual only** (Actions →
 branch/tag/commit (`ref`, default `main`). Add a scenario by dropping a new
 script in `scripts/` and selecting it with the `scenario` input.
 
+Current scenarios:
+
+| Script | Purpose |
+|--------|---------|
+| `kimi-k2.5-nvfp4-reality-mix` | Kimi-K2.5 NVFP4 TP8 soak under `reality_mix`. |
+| `gpt-oss-120b-eagle3-hang-repro` | Cheap (TP2) repro of the all-reduce-fusion decode wedge. **Expected to fail while the bug is open** (fatal global-stall → exit 2); becomes a regression gate once fixed. |
+
 ## Quick start
 
 ```bash

@@ -118,34 +118,52 @@ class ServerProcess:
     def stop(self) -> None:
         if self._proc is None:
             return
-        if self._proc.poll() is not None:
-            # Already exited on its own.
-            self._close_log()
-            return
-        pgid = os.getpgid(self._proc.pid)
-        print(f"[stress] stopping server (pgid={pgid})", flush=True)
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError:
-            self._close_log()
-            return
-        try:
-            self._proc.wait(timeout=self.cfg.shutdown_grace_s)
-        except subprocess.TimeoutExpired:
-            print(
-                f"[stress] server did not exit in {self.cfg.shutdown_grace_s}s; "
-                "escalating to SIGKILL",
-                flush=True,
-            )
+        # start_new_session=True makes the leader its own process-group leader,
+        # so the pgid equals the leader pid. Use that directly — os.getpgid()
+        # raises once the leader has been reaped.
+        pgid = self._proc.pid
+        if self._proc.poll() is None:
+            print(f"[stress] stopping server (pgid={pgid})", flush=True)
             try:
-                os.killpg(pgid, signal.SIGKILL)
+                os.killpg(pgid, signal.SIGTERM)
             except ProcessLookupError:
-                pass
+                self._sweep_group(pgid)
+                self._close_log()
+                return
             try:
-                self._proc.wait(timeout=10.0)
+                self._proc.wait(timeout=self.cfg.shutdown_grace_s)
             except subprocess.TimeoutExpired:
-                print("[stress] SIGKILL did not reap the group; giving up", flush=True)
+                print(
+                    f"[stress] server did not exit in {self.cfg.shutdown_grace_s}s; "
+                    "escalating to SIGKILL",
+                    flush=True,
+                )
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    self._proc.wait(timeout=10.0)
+                except subprocess.TimeoutExpired:
+                    print(
+                        "[stress] SIGKILL did not reap the leader; giving up",
+                        flush=True,
+                    )
+        # Final sweep: the leader may have exited (gracefully, or on its own
+        # before we got here) while forked TP workers / the C++ scheduler linger
+        # in the same process group holding GPUs — proc.wait() only reaps the
+        # leader. SIGKILL the whole group to guarantee no orphans.
+        self._sweep_group(pgid)
         self._close_log()
+
+    @staticmethod
+    def _sweep_group(pgid: int) -> None:
+        """SIGKILL any remaining members of the process group. No-op (and not an
+        error) if the group is already empty."""
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
     def _close_log(self) -> None:
         if self._log_fp is not None:

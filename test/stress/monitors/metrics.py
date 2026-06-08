@@ -109,13 +109,23 @@ class MetricsMonitor:
             "spec_drafts_total": drafts,
         }
         accept_len: Optional[float] = None
-        if self._prev is not None:
+        if self._prev is None:
+            self._prev = (accepted, drafts)
+        else:
             d_acc = accepted - self._prev[0]
             d_draft = drafts - self._prev[1]
-            if d_draft >= self.min_window_drafts:
+            if d_draft < 0 or d_acc < 0:
+                # Counters went backwards => server restart (Prometheus counters
+                # reset to 0). Re-baseline; do NOT emit a spurious negative.
+                self._prev = (accepted, drafts)
+            elif d_draft >= self.min_window_drafts:
+                # Window closed: compute and re-baseline. Only advance _prev here
+                # so that under frequent scrapes / low traffic the window keeps
+                # accumulating until it has enough drafts (otherwise d_draft stays
+                # below threshold forever and accept_len is never computed).
                 accept_len = d_acc / d_draft + 1.0
                 fields["accept_len"] = round(accept_len, 4)
-        self._prev = (accepted, drafts)
+                self._prev = (accepted, drafts)
 
         self.sink.emit(METRICS_PROBE, **fields)
 

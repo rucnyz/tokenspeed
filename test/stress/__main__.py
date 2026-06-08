@@ -127,12 +127,16 @@ async def _cmd_run(args: argparse.Namespace) -> int:
             )
         )
 
+    # Initialized before the try so the finally can always stop them, even if
+    # server.start()/wait_ready() or run() raises before they're created.
+    monitor = None
+    rss_monitor = None
+    metrics_monitor = None
     try:
         if server is not None:
             server.start()
             await server.wait_ready()
 
-        monitor = None
         if not args.no_health:
             monitor = HealthMonitor(
                 args.base_url,
@@ -144,7 +148,6 @@ async def _cmd_run(args: argparse.Namespace) -> int:
 
         # RSS monitor: prefer explicit --server-pid, else fall back to the
         # launched server's pid. Skipped if neither is available or --no-rss.
-        rss_monitor = None
         if not args.no_rss:
             rss_pid: "int | None" = args.server_pid
             if rss_pid is None and server is not None and server.running:
@@ -165,7 +168,6 @@ async def _cmd_run(args: argparse.Namespace) -> int:
                 )
 
         # Spec-decode acceptance (and other server-wide gauges) via /metrics.
-        metrics_monitor = None
         if not args.no_spec_metrics:
             metrics_monitor = MetricsMonitor(
                 args.base_url,
@@ -215,13 +217,15 @@ async def _cmd_run(args: argparse.Namespace) -> int:
             audit_cfg=audit_cfg,
         )
 
+    finally:
+        # Stop monitors in finally so a crash/abort in run() can't leak the
+        # poller tasks (which would keep emitting into a closed sink).
         if monitor is not None:
             await monitor.stop()
         if rss_monitor is not None:
             await rss_monitor.stop()
         if metrics_monitor is not None:
             await metrics_monitor.stop()
-    finally:
         sink.close()
         if server is not None:
             server.stop()

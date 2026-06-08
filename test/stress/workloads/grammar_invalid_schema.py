@@ -41,7 +41,8 @@ async def grammar_invalid_schema(
 ) -> AsyncIterator[ChatRequest]:
     idx = 0
     while True:
-        schema = _BAD_SCHEMAS[idx % len(_BAD_SCHEMAS)]
+        variant = idx % len(_BAD_SCHEMAS)
+        schema = _BAD_SCHEMAS[variant]
         idx += 1
         yield ChatRequest(
             messages=[{"role": "user", "content": "Output a JSON object."}],
@@ -60,5 +61,5 @@ async def grammar_invalid_schema(
             },
             # Don't set validate_schema — we expect the server to
             # reject these at compile, not to generate valid output.
-            workload=f"grammar_invalid_schema/variant{idx % len(_BAD_SCHEMAS)}",
+            workload=f"grammar_invalid_schema/variant{variant}",
         )
