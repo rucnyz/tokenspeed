@@ -1,0 +1,297 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Gluon argmax kernels optimized for AMD GFX950 sampling."""
+
+from __future__ import annotations
+
+import torch
+from tokenspeed_kernel._triton import gl, gluon, triton
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
+
+__all__ = [
+    "argmax",
+    "argmax_pair",
+    "gluon_argmax_gfx950",
+]
+
+cdna4 = gl.amd.cdna4
+
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_SUPPORTED_OUT_DTYPES = (torch.int32, torch.int64)
+_MIN_GLUON_VOCAB_SIZE = 4096
+_scratch_cache: dict[
+    tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+] = {}
+
+
+@gluon.jit
+def _argmax_combine(value1, index1, value2, index2):
+    take1 = (value1 > value2) | ((value1 == value2) & (index1 < index2))
+    value = gl.where(take1, value1, value2)
+    index = gl.where(take1, index1, index2)
+    return value, index
+
+
+@gluon.constexpr_function
+def _argmax_layout(BLOCK: gl.constexpr, NUM_WARPS: gl.constexpr):
+    return gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+
+
+@gluon.jit
+def _argmax_tile(
+    logits, row, start, stride_m: gl.constexpr, N: gl.constexpr, BLOCK: gl.constexpr
+):
+    offs = gl.arange(0, BLOCK, layout=_argmax_layout(BLOCK, gl.num_warps()))
+    cols = start + offs
+    mask = cols < N
+    vals = cdna4.buffer_load(
+        logits,
+        row * stride_m + cols,
+        mask=mask,
+        other=-float("inf"),
+    ).to(gl.float32)
+    indices = gl.where(mask, cols.to(gl.int32), 2147483647)
+    return gl.reduce((vals, indices), axis=0, combine_fn=_argmax_combine)
+
+
+@gluon.jit
+def _argmax_one_stage_kernel(
+    logits,
+    out,
+    stride_m: gl.constexpr,
+    out_stride: gl.constexpr,
+    N: gl.constexpr,
+    BLOCK: gl.constexpr,
+):
+    row = gl.program_id(0)
+    best_val = gl.full((), -float("inf"), gl.float32)
+    best_idx = gl.full((), 2147483647, gl.int32)
+
+    for start in range(0, N, BLOCK):
+        tile_val, tile_idx = _argmax_tile(logits, row, start, stride_m, N, BLOCK)
+        best_val, best_idx = _argmax_combine(best_val, best_idx, tile_val, tile_idx)
+
+    gl.store(out + row * out_stride, best_idx.to(out.dtype.element_ty))
+
+
+@gluon.jit
+def _argmax_split_atomic_kernel(
+    logits,
+    partial_values,
+    partial_indices,
+    counters,
+    out,
+    stride_m: gl.constexpr,
+    out_stride: gl.constexpr,
+    N: gl.constexpr,
+    NUM_SPLITS: gl.constexpr,
+    BLOCK: gl.constexpr,
+    REDUCE_BLOCK: gl.constexpr,
+):
+    row = gl.program_id(0)
+    split = gl.program_id(1)
+    tile_val, tile_idx = _argmax_tile(logits, row, split * BLOCK, stride_m, N, BLOCK)
+    partial_offset = row * NUM_SPLITS + split
+    gl.store(partial_values + partial_offset, tile_val)
+    gl.store(partial_indices + partial_offset, tile_idx)
+
+    old = gl.atomic_add(counters + row, 1, sem="acq_rel", scope="gpu")
+    if old == NUM_SPLITS - 1:
+        offs = gl.arange(
+            0, REDUCE_BLOCK, layout=_argmax_layout(REDUCE_BLOCK, gl.num_warps())
+        )
+        mask = offs < NUM_SPLITS
+        base = row * NUM_SPLITS + offs
+        vals = gl.load(
+            partial_values + base, mask=mask, other=-float("inf"), volatile=True
+        )
+        indices = gl.load(partial_indices + base, mask=mask, other=2147483647)
+        _, best_idx = gl.reduce((vals, indices), axis=0, combine_fn=_argmax_combine)
+        gl.store(out + row * out_stride, best_idx.to(out.dtype.element_ty))
+        gl.store(counters + row, 0)
+
+
+def _validate_argmax_out(logits: torch.Tensor, out: torch.Tensor) -> None:
+    if out.shape != (logits.shape[0],):
+        raise ValueError(
+            f"out must have shape (M,)={(logits.shape[0],)}, got {tuple(out.shape)}"
+        )
+    if out.dtype not in _SUPPORTED_OUT_DTYPES:
+        raise ValueError(f"out must be int32 or int64; got {out.dtype}")
+    if out.device != logits.device:
+        raise ValueError("out must be on the same device as logits")
+
+
+def _validate_argmax_pair_out(logits: torch.Tensor, out: torch.Tensor) -> None:
+    shape = (logits.shape[0], 2)
+    if out.shape != shape:
+        raise ValueError(f"out must have shape (M, 2)={shape}, got {tuple(out.shape)}")
+    if out.dtype != torch.float32 or out.device != logits.device:
+        raise ValueError("out must be float32 on the same device as logits")
+
+
+def _argmax_torch_fallback(
+    logits: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if out is not None:
+        _validate_argmax_out(logits, out)
+    result = torch.argmax(logits, dim=-1)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+def _argmax_pair_torch_fallback(
+    logits: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if logits.dim() != 2:
+        raise ValueError(f"argmax_pair expects 2D input, got {logits.dim()}D")
+    if out is None:
+        out = torch.empty(
+            (logits.shape[0], 2), dtype=torch.float32, device=logits.device
+        )
+    else:
+        _validate_argmax_pair_out(logits, out)
+    max_vals, max_indices = torch.max(logits, dim=-1, keepdim=True)
+    out[:, 0:1].copy_(max_vals.to(torch.float32))
+    out[:, 1:2].copy_(max_indices.to(torch.float32))
+    return out
+
+
+def _supports_gluon(logits: torch.Tensor) -> bool:
+    if logits.dim() != 2 or not logits.is_cuda:
+        return False
+    if logits.dtype not in _SUPPORTED_DTYPES:
+        return False
+    if logits.shape[1] < _MIN_GLUON_VOCAB_SIZE:
+        return False
+    if logits.stride(1) != 1:
+        return False
+    return True
+
+
+def _get_atomic_scratch(
+    M: int, num_splits: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    key = (device_index, M, num_splits)
+    scratch = _scratch_cache.get(key)
+    if scratch is None:
+        partial_values = torch.empty(
+            (M, num_splits), dtype=torch.float32, device=device
+        )
+        partial_indices = torch.empty((M, num_splits), dtype=torch.int32, device=device)
+        counters = torch.zeros((M,), dtype=torch.int32, device=device)
+        scratch = (partial_values, partial_indices, counters)
+        _scratch_cache[key] = scratch
+    return scratch
+
+
+def _select_config(M: int, N: int) -> tuple[int, int, bool]:
+    """Return Gluon launch config for ``M x N`` logits.
+
+    Returns ``(block, num_warps, use_split_atomic)``: the tile width,
+    wave grouping, and whether to use the split-tile atomic reduction path.
+    """
+    if M <= 32:
+        return 16384, 4, True
+    if M <= 64:
+        block = 32768 if N >= 180000 else 16384
+        return block, 4, True
+    return 8192, 4, False
+
+
+@register_kernel(
+    "sampling",
+    "argmax",
+    name="gluon_argmax_gfx950",
+    solution="gluon",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    signatures=format_signatures("logits", "dense", set(_SUPPORTED_DTYPES)),
+    priority=Priority.SPECIALIZED,
+    tags={"latency", "determinism"},
+)
+def gluon_argmax_gfx950(
+    logits: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if out is not None:
+        _validate_argmax_out(logits, out)
+
+    if not _supports_gluon(logits):
+        return _argmax_torch_fallback(logits, out=out)
+
+    M, N = logits.shape
+    if out is None:
+        out = torch.empty((M,), dtype=torch.int64, device=logits.device)
+    if M == 0:
+        return out
+
+    block, num_warps, use_split = _select_config(M, N)
+    if use_split:
+        num_splits = triton.cdiv(N, block)
+        split_block = triton.next_power_of_2(num_splits)
+        partial_values, partial_indices, counters = _get_atomic_scratch(
+            M, num_splits, logits.device
+        )
+        _argmax_split_atomic_kernel[(M, num_splits)](
+            logits,
+            partial_values,
+            partial_indices,
+            counters,
+            out,
+            stride_m=logits.stride(0),
+            out_stride=out.stride(0),
+            N=N,
+            NUM_SPLITS=num_splits,
+            BLOCK=block,
+            REDUCE_BLOCK=split_block,
+            num_warps=num_warps,
+        )
+    else:
+        _argmax_one_stage_kernel[(M,)](
+            logits,
+            out,
+            stride_m=logits.stride(0),
+            out_stride=out.stride(0),
+            N=N,
+            BLOCK=block,
+            num_warps=num_warps,
+        )
+    return out
+
+
+argmax = gluon_argmax_gfx950
+argmax_pair = _argmax_pair_torch_fallback
