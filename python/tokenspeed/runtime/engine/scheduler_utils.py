@@ -64,6 +64,7 @@ def make_config(
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
     disable_prefix_cache: bool = False,
+    has_sliding_window: bool = False,
     enable_mamba: bool = False,
     mamba_cache_chunk_size: int = 64,
     mamba_pool_total_chunks: int = 0,
@@ -93,6 +94,7 @@ def make_config(
     cfg.num_device_pages = num_device_pages
     cfg.decode_input_tokens = decode_input_tokens
     cfg.disable_prefix_cache = disable_prefix_cache
+    cfg.has_sliding_window = has_sliding_window
     cfg.disable_l2_cache = disable_l2_cache
 
     cfg.enable_mamba = enable_mamba

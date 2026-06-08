@@ -179,6 +179,10 @@ class EventLoop:
         has_mamba = getattr(self.model_config, "mambaish_config", None) is not None or (
             text_config is not None and hasattr(text_config, "mamba2_cache_params")
         )
+        # Sliding-window-attention models must not publish their prefix mid-flight (they
+        # publish only at FinishEvent); the SWA prefix-reuse path corrupts outputs
+        # otherwise. Mirror ModelRunner's SWA detection (hf_config.sliding_window).
+        has_sliding_window = getattr(hf_config, "sliding_window", None) is not None
 
         model_executor_config = ModelExecutorConfig.from_server_args(
             server_args=server_args,
@@ -327,6 +331,7 @@ class EventLoop:
                 else 1
             ),
             disable_prefix_cache=not server_args.enable_prefix_caching,
+            has_sliding_window=has_sliding_window,
             enable_mamba=has_mamba,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
             mamba_pool_total_chunks=mamba_pool_total_chunks,

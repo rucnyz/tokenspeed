@@ -53,7 +53,14 @@ namespace tokenspeed::fsm {
 struct PrefetchDone;
 struct Prefetching;
 
-void InsertHybridCache(HybridPrefixCache* hybrid_prefix_cache,
+// Publish a request's freshly-computed prefix into the device radix tree *mid-flight*
+// (during prefill / at the prefill->decode transition) so other in-flight requests that
+// share the prefix can reuse it -- instead of only after the request finishes
+// (FinishEvent). Works for both the plain KV prefix cache (kv_prefix_cache) and, when
+// present, the hybrid cache (which additionally publishes the Mamba checkpoint). The
+// published node is pinned via the request's device_node_ref so it is not evicted while
+// the request is still using it.
+void InsertPrefixCache(KVPrefixCache* kv_prefix_cache, HybridPrefixCache* hybrid_prefix_cache,
                        const std::vector<std::span<const std::int32_t>>& full_paged_tokens,
                        std::unique_ptr<DeviceNodeRef>& device_node_ref, LocalKVAllocator* local_kv_allocator,
                        LocalMambaAllocator* local_mamba_allocator, std::int32_t chunk_begin, std::int32_t chunk_size,
@@ -107,10 +114,11 @@ private:
 struct SchedulePrefillEvent : InvalidTransitionHandler<SchedulePrefillEvent> {
     using InvalidTransitionHandler<SchedulePrefillEvent>::operator();
     SchedulePrefillEvent(std::int32_t tokens_this_round, std::int32_t reserve_num_tokens_in_next_schedule_event,
-                         HybridPrefixCache* hybrid_prefix_cache = nullptr)
+                         HybridPrefixCache* hybrid_prefix_cache = nullptr, KVPrefixCache* kv_prefix_cache = nullptr)
         : tokens_this_round_(tokens_this_round),
           reserve_num_tokens_in_next_schedule_event_(reserve_num_tokens_in_next_schedule_event),
-          hybrid_prefix_cache_(hybrid_prefix_cache) {}
+          hybrid_prefix_cache_(hybrid_prefix_cache),
+          kv_prefix_cache_(kv_prefix_cache) {}
 
     // Returns PrefillDone (last chunk) or Prefilling (more chunks remain).
     std::variant<PrefillDone, Prefilling> operator()(Prefilling&& state);
@@ -119,13 +127,17 @@ private:
     std::int32_t tokens_this_round_{};
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
     HybridPrefixCache* hybrid_prefix_cache_{};
+    KVPrefixCache* kv_prefix_cache_{};
 };
 
 struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
     using InvalidTransitionHandler<ScheduleDecodeEvent>::operator();
 
-    ScheduleDecodeEvent(std::int32_t decode_input_tokens, HybridPrefixCache* hybrid_prefix_cache = nullptr)
-        : decode_input_tokens_(decode_input_tokens), hybrid_prefix_cache_(hybrid_prefix_cache) {}
+    ScheduleDecodeEvent(std::int32_t decode_input_tokens, HybridPrefixCache* hybrid_prefix_cache = nullptr,
+                        KVPrefixCache* kv_prefix_cache = nullptr)
+        : decode_input_tokens_(decode_input_tokens),
+          hybrid_prefix_cache_(hybrid_prefix_cache),
+          kv_prefix_cache_(kv_prefix_cache) {}
 
     Decoding operator()(PrefillDone&& state);
     Decoding operator()(Decoding&& state);
@@ -133,6 +145,7 @@ struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
 private:
     std::int32_t decode_input_tokens_;
     HybridPrefixCache* hybrid_prefix_cache_{};
+    KVPrefixCache* kv_prefix_cache_{};
 };
 
 struct ScheduleDecodeFromRetractedEvent : InvalidTransitionHandler<ScheduleDecodeFromRetractedEvent> {
@@ -347,8 +360,10 @@ public:
         auto host_node_ref = std::move(state).TakeHostNodeRef();
 
         if (new_page_count > 0 && local_kv_allocator->PageCount() >= new_page_count) {
-            InsertHybridCache(hybrid_prefix_cache_, full_paged_tokens, device_node_ref, local_kv_allocator.get(),
-                              local_mamba_allocator.get(), chunk_begin,
+            // Hybrid (MTP) path: kv_prefix_cache is unused for hybrid models (they publish
+            // via hybrid_cache), so pass nullptr.
+            InsertPrefixCache(/*kv_prefix_cache=*/nullptr, hybrid_prefix_cache_, full_paged_tokens, device_node_ref,
+                              local_kv_allocator.get(), local_mamba_allocator.get(), chunk_begin,
                               static_cast<std::int32_t>(result_tokens_.size()), page_size, &prefix_pages);
             hybrid_prefix_cache_->CommitChunk(request_id_, device_node_ref->Node());
         }

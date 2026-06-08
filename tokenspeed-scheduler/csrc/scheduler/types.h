@@ -101,6 +101,10 @@ struct SchedulerConfig {
     Role role{Role::kFused};
 
     bool disable_prefix_cache{false};
+    // Sliding-window-attention models publish their prefix only at FinishEvent: the
+    // mid-flight publish (prefill->decode) enables an SWA prefix-reuse path that
+    // corrupts outputs, so the scheduler skips it for these models.
+    bool has_sliding_window{false};
     bool enable_mamba{false};
     std::int32_t mamba_cache_chunk_size{64};
     std::int32_t mamba_pool_total_chunks{0};

@@ -102,12 +102,19 @@ bool ShouldPublishMambaCheckpoint(tokenspeed::HybridPrefixCache* hybrid_cache, s
 
 namespace tokenspeed::fsm {
 
-void InsertHybridCache(HybridPrefixCache* hybrid_cache,
+void InsertPrefixCache(KVPrefixCache* kv_prefix_cache, HybridPrefixCache* hybrid_cache,
                        const std::vector<std::span<const std::int32_t>>& full_paged_tokens,
                        std::unique_ptr<DeviceNodeRef>& device_node_ref, LocalKVAllocator* local_kv_allocator,
                        LocalMambaAllocator* local_mamba_allocator, std::int32_t chunk_begin, std::int32_t chunk_size,
                        std::int32_t page_size, const std::vector<std::int32_t>* prefix_pages_override) {
-    if (hybrid_cache == nullptr) return;
+    // Hybrid models publish through the hybrid cache's wrapped KV cache (and additionally
+    // track a Mamba checkpoint); plain (non-hybrid) models publish through the base KV
+    // prefix cache, making the freshly-computed prefix matchable by concurrent requests
+    // now rather than only at FinishEvent. A null kv_prefix_cache (passed by the scheduler
+    // for sliding-window-attention models) disables this mid-flight publish, so SWA models
+    // fall back to the finish-only publish whose prefix reuse is known-correct.
+    KVPrefixCache* kv = (hybrid_cache != nullptr) ? &hybrid_cache->GetKVPrefixCache() : kv_prefix_cache;
+    if (kv == nullptr) return;
 
     std::vector<std::int32_t> computed_prefix_pages;
     const std::vector<std::int32_t>* prefix_pages = prefix_pages_override;
@@ -125,10 +132,10 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
     }
 
     OwnedPages pages_to_insert = local_kv_allocator->TakeFirst(new_page_count);
-    auto insert_result = hybrid_cache->GetKVPrefixCache().Insert<ResourceType::Device>(full_paged_tokens, *prefix_pages,
-                                                                                       std::move(pages_to_insert));
+    auto insert_result = kv->Insert<ResourceType::Device>(full_paged_tokens, *prefix_pages, std::move(pages_to_insert));
 
-    if (local_mamba_allocator != nullptr && local_mamba_allocator->HasCheckpoint()) {
+    // Mamba checkpoint publication is hybrid-only.
+    if (hybrid_cache != nullptr && local_mamba_allocator != nullptr && local_mamba_allocator->HasCheckpoint()) {
         if (ShouldPublishMambaCheckpoint(hybrid_cache, chunk_begin, chunk_size, page_size)) {
             hybrid_cache->InsertMamba(insert_result.last_node, local_mamba_allocator->DetachCheckpoint());
         } else {
@@ -218,7 +225,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
     if (end_of_window_pages < static_cast<std::int32_t>(paged_tokens.size())) {
         paged_tokens.resize(end_of_window_pages);
     }
-    InsertHybridCache(hybrid_prefix_cache_, paged_tokens, device_node_ref, local_kv_allocator.get(),
+    InsertPrefixCache(kv_prefix_cache_, hybrid_prefix_cache_, paged_tokens, device_node_ref, local_kv_allocator.get(),
                       local_mamba_allocator.get(), state.window.begin, state.window.size, state.GetPageSize());
     // Allocate KV pages for the new chunk
     local_kv_allocator->Acquire(tokens_this_round_);
@@ -268,7 +275,7 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
     if (end_of_window_pages < static_cast<std::int32_t>(paged_tokens.size())) {
         paged_tokens.resize(end_of_window_pages);
     }
-    InsertHybridCache(hybrid_prefix_cache_, paged_tokens, device_node_ref, local_kv_allocator.get(),
+    InsertPrefixCache(kv_prefix_cache_, hybrid_prefix_cache_, paged_tokens, device_node_ref, local_kv_allocator.get(),
                       local_mamba_allocator.get(), state.window.begin, state.window.size, state.GetPageSize());
     // Allocate fresh checkpoint for decode-phase mamba state tracking
     if (hybrid_prefix_cache_ != nullptr && local_mamba_allocator != nullptr) {

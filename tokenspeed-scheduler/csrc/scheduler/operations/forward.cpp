@@ -191,8 +191,11 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         return {};
     }
 
+    // Sliding-window-attention models pass a null kv_prefix_cache so InsertPrefixCache
+    // skips the mid-flight publish; their prefix is published only at FinishEvent.
     return fsm::SchedulePrefillEvent{tokens_this_round, reserve_num_tokens_in_next_schedule_event,
-                                     hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
+                                     hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
+                                     config_.has_sliding_window ? nullptr : &kv_prefix_cache_};
 }
 
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* request,
@@ -217,8 +220,10 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
         return {};
     }
 
+    // SWA models: skip mid-flight publish (see schedulePrefill) -- publish only at FinishEvent.
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens,
-                                    hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
+                                    hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
+                                    config_.has_sliding_window ? nullptr : &kv_prefix_cache_};
 }
 
 std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFromRetracted(
