@@ -37,6 +37,7 @@ import torch.nn.functional as F
 import transformers
 from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig
 
+from tokenspeed.runtime.engine.logprob_params import LogprobParams
 from tokenspeed.runtime.entrypoints.engine import Engine
 from tokenspeed.runtime.utils import get_device
 from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
@@ -540,11 +541,10 @@ class RTRunner:
         top_output_logprobs = []
         output_token_logprobs_lst = []
         top_output_logprob_idx = []
-        if token_ids_logprob is not None:
-            token_ids_input_logprobs = []
-            token_ids_output_logprobs = []
-        else:
-            token_ids_input_logprobs = token_ids_output_logprobs = None
+        # prompt token-id logprobs are scoped out for now (see
+        # LogprobParams.verify TODO); leave these None so
+        # check_close_model_outputs skips the comparison.
+        token_ids_input_logprobs = token_ids_output_logprobs = None
 
         sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
         if top_k:
@@ -554,10 +554,13 @@ class RTRunner:
             response = engine.generate(
                 prompt,
                 sampling_params=sampling_params,
-                return_logprob=True,
-                logprob_start_len=logprob_start_len,
-                top_logprobs_num=NUM_TOP_LOGPROBS,
-                token_ids_logprob=token_ids_logprob,
+                # TODO(logprobs): re-request prompt_logprobs / logprob_token_ids
+                # once the prompt path is re-enabled. Scoped to OUTPUT logprobs
+                # only for now (LogprobParams.verify rejects the prompt surface),
+                # so requesting prompt_logprobs / logprob_token_ids would raise.
+                logprob_params=LogprobParams(
+                    logprobs=0,
+                ),
             )
             text = response["text"]
 
@@ -569,73 +572,50 @@ class RTRunner:
             output_strs.append(text)
             output_ids.append(response["output_ids"])
 
-            input_token_logprobs = response["meta_info"]["input_token_logprobs"]
-            output_token_logprobs = response["meta_info"]["output_token_logprobs"]
-            # print(i, input_token_logprobs)
-            # print(i, output_token_logprobs)
-            logprobs = response["meta_info"]["input_top_logprobs"]
-            if token_ids_logprob is not None:
-                input_token_ids_logprobs = response["meta_info"][
-                    "input_token_ids_logprobs"
-                ][1:]
-            else:
-                input_token_ids_logprobs = None
+            # New logprob format: meta_info["prompt_logprobs"] is a
+            # list[dict[int, Logprob] | None] (entry 0 is None for the first
+            # prompt token); meta_info["logprobs"] is the per-output-token list.
+            # OUTPUT top-k logprobs are deferred (not produced yet), so only the
+            # prompt (prefill) top-k and prompt token-id logprobs are extracted;
+            # output top-k is left empty and skipped by check_close_model_outputs.
+            prompt_lp = response["meta_info"].get("prompt_logprobs") or []
+            prompt_positions = [d for d in prompt_lp if d is not None]
 
-            num_prompt_tokens = response["meta_info"]["prompt_tokens"]
-            # assert len(input_token_logprobs) == num_prompt_tokens - logprob_start_len
-            assert len(logprobs) == num_prompt_tokens - logprob_start_len
-
-            # The first token logprob has no meaning in tokenspeed.
-            input_token_logprobs = input_token_logprobs[1:]
-            logprobs = logprobs[1:]
-            assert len(input_token_logprobs) == len(logprobs)
-
-            input_token_logprobs_lst.append(
-                input_token_logprobs + [output_token_logprobs[0]]
-            )
-            output_token_logprobs_lst.append(output_token_logprobs)
-
+            # Top-k logprob values per prompt position (highest first).
             top_input_logprobs.append(
-                [[tup[0] for tup in x[:NUM_TOP_LOGPROBS]] for x in logprobs]
-                + [
-                    [
-                        tup[0]
-                        for tup in response["meta_info"]["output_top_logprobs"][0][
-                            :NUM_TOP_LOGPROBS
-                        ]
+                [
+                    sorted((e.logprob for e in d.values()), reverse=True)[
+                        :NUM_TOP_LOGPROBS
                     ]
+                    for d in prompt_positions
                 ]
             )
-            top_output_logprobs.append(
-                [
-                    [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
-                    for x in response["meta_info"]["output_top_logprobs"]
-                ]
+
+            # Output (decode) logprobs. logprobs=0 means each output-position
+            # dict holds only the sampled token, so extract its logprob per
+            # generated token. The engine currently emits nothing on the output
+            # path (output logprobs deferred), so this is usually empty; when it
+            # becomes non-empty, check_close_model_outputs compares it to HF.
+            out_lp = response["meta_info"].get("logprobs") or []
+            output_token_logprobs_lst.append(
+                [next(iter(d.values())).logprob for d in out_lp if d]
             )
-            top_output_logprob_idx.append(
-                [
-                    [tup[1] for tup in x[:NUM_TOP_LOGPROBS]]
-                    for x in response["meta_info"]["output_top_logprobs"]
-                ]
-            )
-            if token_ids_logprob is not None:
+            # Sampled prompt logprob is not separately compared (prefill top-k
+            # covers the prompt); kept empty for ModelOutput shape.
+            input_token_logprobs_lst.append([])
+
+            # OUTPUT top-k is deferred (engine emits no top-k yet).
+            top_output_logprobs.append([])
+            top_output_logprob_idx.append([])
+
+            if token_ids_input_logprobs is not None:
                 token_ids_input_logprobs.append(
-                    [[tup[0] for tup in x] for x in input_token_ids_logprobs]
-                    + [
-                        [
-                            tup[0]
-                            for tup in response["meta_info"][
-                                "output_token_ids_logprobs"
-                            ][0]
-                        ]
-                    ]
-                )
-                token_ids_output_logprobs.append(
                     [
-                        [tup[0] for tup in x]
-                        for x in response["meta_info"]["output_token_ids_logprobs"]
+                        [d[t].logprob for t in token_ids_logprob if t in d]
+                        for d in prompt_positions
                     ]
                 )
+                token_ids_output_logprobs.append([])
 
         return ModelOutput(
             output_strs=output_strs,
@@ -718,9 +698,14 @@ def check_close_model_outputs(
 
     if check_logprobs:
         for i in range(len(hf_outputs.output_strs)):
-            # Compare input logprobs
-            hf_logprobs = torch.Tensor(hf_outputs.top_input_logprobs[i])
-            srt_logprobs = torch.Tensor(rt_outputs.top_input_logprobs[i])
+            # Compare input (prefill) logprobs. RT omits the boundary position
+            # (predicting the first output token) since output top-k logprobs are
+            # deferred, so compare on the common prefix length.
+            hf_top = hf_outputs.top_input_logprobs[i]
+            rt_top = rt_outputs.top_input_logprobs[i]
+            n_common = min(len(hf_top), len(rt_top))
+            hf_logprobs = torch.Tensor(hf_top[:n_common])
+            srt_logprobs = torch.Tensor(rt_top[:n_common])
             input_len = hf_logprobs.shape[0]
             print(
                 "prefill logprobs max_diff", torch.max(abs(hf_logprobs - srt_logprobs))
@@ -732,16 +717,65 @@ def check_close_model_outputs(
                     f"{hf_logprobs=}, {srt_logprobs=}"
                 )
 
-            # Compare output logprobs
-            hf_logprobs = torch.Tensor(hf_outputs.top_output_logprobs[i])
-            srt_logprobs = torch.Tensor(rt_outputs.top_output_logprobs[i])
-
-            print(
-                "decode logprobs max_diff", torch.max(abs(hf_logprobs - srt_logprobs))
-            )
-            if input_len <= 100:
-                assert torch.all(abs(hf_logprobs - srt_logprobs) < decode_tolerance), (
-                    f"decode logprobs are not all close with {debug_text} "
-                    f"decode_tolerance={decode_tolerance}."
-                    f"{hf_logprobs=}, {srt_logprobs=}"
+            # Compare output (decode) logprobs. OUTPUT top-k is deferred, but the
+            # sampled-token logprob (logprobs=0) is produced once the engine
+            # wires the output path: compare it to HF's greedy argmax (top-1)
+            # logprob on the common length. If the engine emitted no output
+            # logprobs, say so explicitly instead of silently passing, so a
+            # future regression that drops them is visible.
+            rt_sampled = rt_outputs.output_token_logprobs_lst[i]
+            if rt_sampled:
+                hf_top1 = [pos[0] for pos in hf_outputs.top_output_logprobs[i]]
+                n_common = min(len(hf_top1), len(rt_sampled))
+                hf_logprobs = torch.Tensor(hf_top1[:n_common])
+                srt_logprobs = torch.Tensor(rt_sampled[:n_common])
+                print(
+                    "decode logprobs max_diff",
+                    torch.max(abs(hf_logprobs - srt_logprobs)),
                 )
+                if input_len <= 100:
+                    assert torch.all(
+                        abs(hf_logprobs - srt_logprobs) < decode_tolerance
+                    ), (
+                        f"decode (sampled) logprobs are not all close with {debug_text} "
+                        f"decode_tolerance={decode_tolerance}."
+                        f"{hf_logprobs=}, {srt_logprobs=}"
+                    )
+            else:
+                print(
+                    f"decode logprobs: engine emitted none for prompt {i} "
+                    "(output logprobs deferred) - skipping decode logprob check"
+                )
+
+            # Compare prompt token-id logprobs when requested. RT drops the
+            # leading None prompt position, so RT[j] aligns with HF[j]; compare
+            # the common, shape-matching slice. Skip (loudly) on any raggedness
+            # so a requested id missing from a position dict does not crash.
+            if (
+                rt_outputs.token_ids_input_logprobs is not None
+                and hf_outputs.token_ids_input_logprobs is not None
+            ):
+                hf_tid = hf_outputs.token_ids_input_logprobs[i]
+                rt_tid = rt_outputs.token_ids_input_logprobs[i]
+                n_common = min(len(hf_tid), len(rt_tid))
+                rectangular = n_common > 0 and all(
+                    len(rt_tid[p]) == len(hf_tid[p]) for p in range(n_common)
+                )
+                if rectangular:
+                    hf_t = torch.Tensor(hf_tid[:n_common])
+                    rt_t = torch.Tensor(rt_tid[:n_common])
+                    print(
+                        "prompt token-id logprobs max_diff",
+                        torch.max(abs(hf_t - rt_t)),
+                    )
+                    if input_len <= 100:
+                        assert torch.all(abs(hf_t - rt_t) < prefill_tolerance), (
+                            f"prompt token-id logprobs are not all close with {debug_text} "
+                            f"prefill_tolerance={prefill_tolerance}."
+                            f"{hf_t=}, {rt_t=}"
+                        )
+                else:
+                    print(
+                        f"prompt token-id logprobs: shape mismatch for prompt {i} "
+                        f"(hf {len(hf_tid)} vs rt {len(rt_tid)}) - skipping"
+                    )

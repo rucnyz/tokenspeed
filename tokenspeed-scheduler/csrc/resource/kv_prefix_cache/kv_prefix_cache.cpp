@@ -161,6 +161,12 @@ void KVPrefixCache::recordDeviceBlockRemoved(TreeNode* node) {
 }
 
 MatchResult KVPrefixCache::Match(const token_vec_t& token_ids, MatchIntent intent) {
+    // SkipRead: caller wants no prefix reuse (prompt-logprob requests must
+    // recompute every prompt position). Return the same valid root-only match
+    // the disabled-cache path uses, so downstream invariants hold.
+    if (intent == MatchIntent::SkipRead) {
+        return RootMatch();
+    }
     if (disable_prefix_cache_ && intent == MatchIntent::PrefixReuse) {
         const std::int32_t page_size = tree_.PageSize();
         if (token_ids.size() % page_size != 0) {

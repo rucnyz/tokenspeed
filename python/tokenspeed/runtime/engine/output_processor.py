@@ -128,13 +128,12 @@ class OutputProcessor:
             }
             logprobs_info = state.logprobs_info if not state.obj.stream else {}
 
-            if getattr(state.obj, "return_logprob", False):
+            lp_params = getattr(state.obj, "logprob_params", None)
+            if lp_params is not None and lp_params.requested:
                 try:
                     self.logprobs_processor.convert_logprob_style(
                         logprobs_info,
-                        state.obj.top_logprobs_num,
-                        state.obj.token_ids_logprob,
-                        state.obj.return_text_in_logprobs,
+                        lp_params,
                         recv_obj,
                         i,
                     )

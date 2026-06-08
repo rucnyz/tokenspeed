@@ -50,6 +50,11 @@ HybridPrefixCache::HybridPrefixCache(KVPrefixCache& kv_prefix_cache, MambaChunkA
 
 MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids, MatchIntent intent) {
     auto match = kv_prefix_cache_.Match(token_ids, intent);
+    // SkipRead returns a root-only match; do not augment with paged/mamba hits
+    // so the request reuses nothing and recomputes every prompt position.
+    if (intent == MatchIntent::SkipRead) {
+        return match;
+    }
     augmentMatch(match);
     augmentMatchPagedCache(match);
     return match;
@@ -58,6 +63,9 @@ MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids, MatchIntent i
 MatchResult HybridPrefixCache::Match(const std::vector<std::span<const std::int32_t>>& token_pages,
                                      MatchIntent intent) {
     auto match = kv_prefix_cache_.Match(token_pages, intent);
+    if (intent == MatchIntent::SkipRead) {
+        return match;
+    }
     augmentMatch(match);
     augmentMatchPagedCache(match);
     return match;

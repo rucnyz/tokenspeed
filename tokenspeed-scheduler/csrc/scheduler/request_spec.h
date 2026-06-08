@@ -32,6 +32,12 @@ struct RequestSpec {
     std::vector<std::int32_t> tokens;
     std::vector<std::string> rolling_hashes;
     std::int32_t storage_hit_pages{0};
+    // Per-prompt-token logprobs requested when >= 0 (the count N). -1 (default)
+    // means not requested.
+    std::int32_t prompt_logprobs{-1};
+    // Specific token ids to score at each prompt position. Empty = none.
+    // Only meaningful when prompt_logprobs >= 0.
+    std::vector<std::int32_t> logprob_token_ids;
 };
 
 struct PrefillInfo {

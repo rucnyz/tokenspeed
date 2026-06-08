@@ -248,7 +248,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("request_id", &tokenspeed::RequestSpec::request_id)
         .def_rw("tokens", &tokenspeed::RequestSpec::tokens)
         .def_rw("rolling_hashes", &tokenspeed::RequestSpec::rolling_hashes)
-        .def_rw("storage_hit_pages", &tokenspeed::RequestSpec::storage_hit_pages);
+        .def_rw("storage_hit_pages", &tokenspeed::RequestSpec::storage_hit_pages)
+        .def_rw("prompt_logprobs", &tokenspeed::RequestSpec::prompt_logprobs)
+        .def_rw("logprob_token_ids", &tokenspeed::RequestSpec::logprob_token_ids);
 
     nb::module_ forward_event = m.def_submodule("ForwardEvent");
     nb::class_<tokenspeed::forward::ExtendResult>(forward_event, "ExtendResult")
@@ -320,6 +322,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     flat_fwd_op.def_ro("input_ids", &tokenspeed::FlatForwardOperation::input_ids)
         .def_ro("shifted_input_ids", &tokenspeed::FlatForwardOperation::shifted_input_ids)
         .def_ro("extend_prefix_lens", &tokenspeed::FlatForwardOperation::extend_prefix_lens)
+        .def_ro("prompt_logprobs", &tokenspeed::FlatForwardOperation::prompt_logprobs)
+        .def_ro("logprob_token_ids", &tokenspeed::FlatForwardOperation::logprob_token_ids)
         .def_prop_ro(
             "prefill_lengths",
             [](const tokenspeed::FlatForwardOperation& op) -> const std::vector<std::int32_t>& {

@@ -44,10 +44,21 @@ _CACHE_EVENT_TYPES = {
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
-def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
+def make_spec(
+    rid: str,
+    tokens: list[int],
+    prompt_logprobs: int = -1,
+    logprob_token_ids: list[int] | None = None,
+) -> RequestSpec:
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
+    # >=0 (count N) activates the prompt/input-logprob path in the scheduler;
+    # -1 (default) leaves it off.
+    spec.prompt_logprobs = prompt_logprobs
+    # Specific token ids to score at each prompt position (empty = none). Only
+    # meaningful when prompt_logprobs >= 0.
+    spec.logprob_token_ids = list(logprob_token_ids) if logprob_token_ids else []
     return spec
 
 

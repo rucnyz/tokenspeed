@@ -173,10 +173,12 @@ class InputProcessor:
                 input_ids = pad_input_tokens(list(input_ids), multimodal_inputs)
 
         if self.engine.is_generation:
-            return_logprob = obj.return_logprob
-            logprob_start_len = obj.logprob_start_len
-            top_logprobs_num = obj.top_logprobs_num
-            token_ids_logprob = obj.token_ids_logprob
+            logprob_params = obj.logprob_params
+            if logprob_params is not None:
+                logprob_params.verify(
+                    vocab_size=self.engine.model_config.vocab_size,
+                    max_logprobs=self.engine.model_config.vocab_size,
+                )
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
@@ -218,10 +220,7 @@ class InputProcessor:
                 input_text,
                 input_ids,
                 sampling_params,
-                return_logprob,
-                logprob_start_len,
-                top_logprobs_num,
-                token_ids_logprob,
+                logprob_params,
                 obj.stream,
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,

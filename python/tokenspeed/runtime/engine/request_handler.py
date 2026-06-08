@@ -206,9 +206,18 @@ class RequestHandler:
         if recv_req.bootstrap_port is None:
             recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+        lp = getattr(recv_req, "logprob_params", None)
+        prompt_logprobs = lp.num_prompt_logprobs() if lp is not None else None
+        prompt_token_ids = (
+            lp.logprob_token_ids
+            if (lp is not None and prompt_logprobs is not None)
+            else None
+        )
         req_spec = make_spec(
             rid=recv_req.rid,
             tokens=recv_req.input_ids,
+            prompt_logprobs=-1 if prompt_logprobs is None else prompt_logprobs,
+            logprob_token_ids=prompt_token_ids,
         )
         req_state = RequestState.from_recv_req(
             recv_req,

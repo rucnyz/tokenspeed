@@ -88,6 +88,10 @@ public:
 
     const StorageInfo& GetStorageInfo() const { return storage_info_; }
 
+    std::int32_t PromptLogprobs() const { return prompt_logprobs_; }
+
+    const std::vector<std::int32_t>& LogprobTokenIds() const { return logprob_token_ids_; }
+
     std::vector<std::span<const std::int32_t>> GetFullPagedTokens(bool except_last) const {
         return token_container_.GetFullPagedTokens(page_size_, except_last);
     }
@@ -277,6 +281,8 @@ private:
     std::int32_t page_size_;
     fsm::State state_;
     StorageInfo storage_info_;
+    std::int32_t prompt_logprobs_{-1};
+    std::vector<std::int32_t> logprob_token_ids_;
 };
 
 using ConstRequestVector = std::vector<const Request*>;

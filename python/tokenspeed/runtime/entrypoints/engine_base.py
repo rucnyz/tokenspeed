@@ -30,6 +30,8 @@ from collections.abc import Iterator
 
 import torch
 
+from tokenspeed.runtime.engine.logprob_params import LogprobParams
+
 
 class EngineBase(ABC):
     """Abstract base class for engine interfaces.
@@ -44,7 +46,9 @@ class EngineBase(ABC):
         prompt: list[str] | str | None = None,
         sampling_params: list[dict] | dict | None = None,
         input_ids: list[list[int]] | list[int] | None = None,
-        return_logprob: list[bool] | bool | None = False,
+        logprob_params: list[LogprobParams] | LogprobParams | None = None,
+        # Deprecated logprob request fields, kept for backward compatibility.
+        return_logprob: list[bool] | bool | None = None,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,
         token_ids_logprob: list[list[int]] | list[int] | None = None,

@@ -185,9 +185,11 @@ class CudaGraphWrapper:
 
     Callers always use the same interface::
 
-        output_tokens, output_lengths, output_logprobs = runner(
-            bs, ctx, sampling_info, req_to_page,
-            extend_with_prefix=..., extend_prefix_lens=...,
+        output_tokens, output_lengths, output_logprobs, input_token_logprobs = (
+            runner(
+                bs, ctx, sampling_info, req_to_page,
+                extend_with_prefix=..., extend_prefix_lens=...,
+            )
         )
 
     Internally the wrapper owns both paths and calls init_forward_metadata
@@ -907,7 +909,10 @@ class CudaGraphWrapper:
             with nvtx_range("graph_replay", color="red"):
                 self.graphs[padded_bs].replay()
 
-            output_tokens, output_lengths, output_logprobs = self.output_buffers[
+            # Captured output buffers carry _forward_step's 4-tuple; the 4th
+            # entry (input/prompt logprobs) is only produced on the eager
+            # pure-extend path, never in a captured decode graph, so discard it.
+            output_tokens, output_lengths, output_logprobs, _ = self.output_buffers[
                 padded_bs
             ]
 
@@ -919,6 +924,10 @@ class CudaGraphWrapper:
                     if output_logprobs is not None
                     else None
                 ),
+                # Input/prompt logprobs only flow through the eager (pure-extend)
+                # path; the captured decode/target-verify graph never produces
+                # them, so pad the tuple to keep the caller's 4-way unpack uniform.
+                None,
             )
 
         else:

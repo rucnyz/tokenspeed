@@ -51,6 +51,8 @@ import types
 import unittest
 from typing import Any, Dict, List, Optional
 
+from tokenspeed.runtime.engine.logprob_params import LogprobParams
+
 # CI registration (AST-parsed, runtime no-op).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -858,22 +860,19 @@ class _LogprobReqObj(_StubReqObj):
         self,
         *,
         rid: str = "r1",
-        top_logprobs_num: int = 0,
-        token_ids_logprob: Optional[List[int]] = None,
+        logprob_params=None,
     ) -> None:
         super().__init__(stream=True, return_logprob=True, rid=rid)
-        self.top_logprobs_num = top_logprobs_num
-        # Keep None as None — do NOT coerce to []. See class docstring.
-        self.token_ids_logprob = token_ids_logprob
-        self.return_text_in_logprobs = False
+        # New request-config object read by the output processor.
+        self.logprob_params = logprob_params
 
 
-def _mk_logprob_state(*, rid: str = "r1", top_logprobs_num: int = 0) -> ReqState:
+def _mk_logprob_state(*, rid: str = "r1", logprob_params=None) -> ReqState:
     return ReqState(
         RequestOutputCollector(),
         False,
         __import__("asyncio").Event(),
-        _LogprobReqObj(rid=rid, top_logprobs_num=top_logprobs_num),
+        _LogprobReqObj(rid=rid, logprob_params=logprob_params),
         created_time=0.0,
     )
 
@@ -904,38 +903,7 @@ class TestInlineLogprobPassThrough(unittest.TestCase):
 
     def test_flat_output_token_logprobs_flow_through_inline_branch(self):
         mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
-        state = _mk_logprob_state(rid="r1", top_logprobs_num=0)
-        _register(mgr, state)
-
-        ids = self.tok.encode("Hello")
-        recv = _batch_token_id_out(
-            ["r1"],
-            decode_ids=[ids],
-            finished_reasons=[{"type": "stop", "matched": None}],
-            input_token_logprobs_val=[[-0.1, -0.2, -0.3]],
-            input_token_logprobs_idx=[[10, 20, 30]],
-            output_token_logprobs_val=[[-0.5, -0.6]],
-            output_token_logprobs_idx=[[1, 2]],
-        )
-        mgr.output_processor.handle_batch_output(recv)
-        out = state.collector.take()
-
-        meta = out["meta_info"]
-        self.assertIn("input_token_logprobs", meta)
-        self.assertIn("output_token_logprobs", meta)
-        # ``detokenize_logprob_tokens`` is stubbed out by ``processor=None``
-        # on ``_StubTokenizerManager``, so the detokenized entries are
-        # ``(val, idx, None)`` tuples. What matters for this gap-fill is
-        # that the recv_obj arrays reach ``meta_info`` at all.
-        self.assertEqual(len(meta["output_token_logprobs"]), 2)
-        self.assertEqual(
-            [entry[0] for entry in meta["output_token_logprobs"]], [-0.5, -0.6]
-        )
-        self.assertEqual([entry[1] for entry in meta["output_token_logprobs"]], [1, 2])
-
-    def test_top_logprobs_flow_through_inline_branch_when_requested(self):
-        mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
-        state = _mk_logprob_state(rid="r1", top_logprobs_num=2)
+        state = _mk_logprob_state(rid="r1", logprob_params=LogprobParams(logprobs=0))
         _register(mgr, state)
 
         ids = self.tok.encode("Hello")
@@ -945,10 +913,34 @@ class TestInlineLogprobPassThrough(unittest.TestCase):
             finished_reasons=[{"type": "stop", "matched": None}],
             input_token_logprobs_val=[[]],
             input_token_logprobs_idx=[[]],
-            output_token_logprobs_val=[[]],
-            output_token_logprobs_idx=[[]],
-            input_top_logprobs_val=[[[-0.1, -0.2]]],
-            input_top_logprobs_idx=[[[10, 20]]],
+            output_token_logprobs_val=[[-0.5, -0.6]],
+            output_token_logprobs_idx=[[1, 2]],
+        )
+        mgr.output_processor.handle_batch_output(recv)
+        out = state.collector.take()
+
+        meta = out["meta_info"]
+        # New shape: output "logprobs" is a list[dict[int, Logprob]] per token.
+        self.assertIn("logprobs", meta)
+        self.assertEqual(len(meta["logprobs"]), 2)
+        self.assertEqual(meta["logprobs"][0][1].logprob, -0.5)
+        self.assertEqual(meta["logprobs"][0][1].rank, 0)
+        self.assertEqual(meta["logprobs"][1][2].logprob, -0.6)
+
+    def test_top_logprobs_flow_through_inline_branch_when_requested(self):
+        mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
+        state = _mk_logprob_state(rid="r1", logprob_params=LogprobParams(logprobs=2))
+        _register(mgr, state)
+
+        ids = self.tok.encode("Hello")
+        recv = _batch_token_id_out(
+            ["r1"],
+            decode_ids=[ids],
+            finished_reasons=[{"type": "stop", "matched": None}],
+            input_token_logprobs_val=[[]],
+            input_token_logprobs_idx=[[]],
+            output_token_logprobs_val=[[-0.5]],
+            output_token_logprobs_idx=[[7]],
             output_top_logprobs_val=[[[-0.3, -0.4]]],
             output_top_logprobs_idx=[[[1, 2]]],
         )
@@ -956,20 +948,13 @@ class TestInlineLogprobPassThrough(unittest.TestCase):
         out = state.collector.take()
 
         meta = out["meta_info"]
-        self.assertIn("input_top_logprobs", meta)
-        self.assertIn("output_top_logprobs", meta)
-        self.assertEqual(len(meta["output_top_logprobs"]), 1)
-        # First top-k bucket corresponds to one generation step; its
-        # entries are (val, idx, None) tuples in the same shape the
-        # string branch would produce.
-        self.assertEqual(
-            [entry[0] for entry in meta["output_top_logprobs"][0]],
-            [-0.3, -0.4],
-        )
-        self.assertEqual(
-            [entry[1] for entry in meta["output_top_logprobs"][0]],
-            [1, 2],
-        )
+        # One output position: sampled token 7 (slot 0) + top-2 alternatives.
+        self.assertIn("logprobs", meta)
+        self.assertEqual(len(meta["logprobs"]), 1)
+        pos = meta["logprobs"][0]
+        self.assertEqual(pos[7].rank, 0)
+        self.assertEqual(pos[1].logprob, -0.3)
+        self.assertEqual(pos[2].logprob, -0.4)
 
 
 if __name__ == "__main__":

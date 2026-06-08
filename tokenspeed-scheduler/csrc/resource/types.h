@@ -44,6 +44,10 @@ enum class ResourceType {
 enum class MatchIntent {
     PrefixReuse,
     StateRecovery,
+    // No prefix reuse: return a root-only match (depth 0) so every prompt
+    // position is recomputed. Used for prompt-logprob requests, which need a
+    // logit (hence a logprob) at every prompt position.
+    SkipRead,
 };
 
 template <ResourceType RType>

@@ -62,3 +62,14 @@ class ForwardContext:
 
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None
+
+    # --- input/prompt logprobs (off-policy); set by _maybe_set_input_logprob_ctx ---
+    extend_return_logprob: bool = False
+    extend_logprob_start_lens_cpu: list[int] | None = None
+    extend_seq_lens_cpu: list[int] | None = None
+    extend_logprob_pruned_lens_cpu: list[int] | None = None
+    extend_input_logprob_token_ids_gpu: torch.Tensor | None = None
+    top_logprobs_nums: list[int] | None = None
+    token_ids_logprobs: list[list[int]] | None = None
+    extend_return_top_logprob: bool = False
+    extend_token_ids_logprob: bool = False

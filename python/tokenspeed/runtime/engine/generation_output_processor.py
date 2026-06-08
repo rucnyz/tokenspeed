@@ -74,6 +74,7 @@ class RequestState:
         token_ids_logprob: list[int] | None = None,
         multimodal_inputs=None,
         prompt_input_ids_unpadded: list[int] | None = None,
+        return_prompt_logprob: bool = False,
     ) -> None:
         # --- Extracted from recv_req (immutable) ---
         self.prompt_input_ids: list[int] = prompt_input_ids
@@ -91,6 +92,7 @@ class RequestState:
         self.return_logprob = return_logprob
         self.top_logprobs_num = top_logprobs_num
         self.token_ids_logprob = token_ids_logprob
+        self.return_prompt_logprob = return_prompt_logprob
 
         # --- generation state (updated with forward step) ---
         self.output_ids: list[int] = []
@@ -107,6 +109,30 @@ class RequestState:
         self.output_token_logprobs_idx: list[int] | None = (
             [] if return_logprob else None
         )
+        # Prompt/input-token logprobs, accumulated across (possibly chunked)
+        # prefill ops. None unless the request asked for prompt_logprobs.
+        self.input_token_logprobs_val: list[float] | None = (
+            [] if return_prompt_logprob else None
+        )
+        self.input_token_logprobs_idx: list[int] | None = (
+            [] if return_prompt_logprob else None
+        )
+        # Per-position top-k prompt logprobs (prompt_logprobs>0). Each entry is
+        # a [k] list parallel to the base prompt-logprob accumulators above.
+        self.input_top_logprobs_val: list | None = [] if return_prompt_logprob else None
+        self.input_top_logprobs_idx: list | None = [] if return_prompt_logprob else None
+        # Per-position token-id prompt logprobs (logprob_token_ids requested).
+        # Each entry is a [num_token_ids] list parallel to the base prompt-logprob
+        # accumulators above.
+        self.input_token_ids_logprobs_val: list | None = (
+            [] if return_prompt_logprob else None
+        )
+        self.input_token_ids_logprobs_idx: list | None = (
+            [] if return_prompt_logprob else None
+        )
+        # Number of prompt-logprob entries already shipped to the detokenizer,
+        # so multi-chunk / multi-step streaming only sends the un-shipped tail.
+        self.sent_prompt_logprob_offset: int = 0
 
         # --- Streaming bookkeeping (internal) ---
         self._surr_offset: int | None = None
@@ -152,17 +178,27 @@ class RequestState:
         tokenizer,
         eos_token_ids: list[int],
     ) -> RequestState:
+        # Translate the LogprobParams into the scheduler-internal
+        # scalar attrs the rest of the pipeline already understands. Output-token
+        # logprob collection is gated on ``return_logprob`` below; the prompt
+        # (off-policy) path is wired separately in full Phase B.
+        lp = getattr(recv_req, "logprob_params", None)
+        return_logprob = lp is not None and lp.num_logprobs() is not None
+        top_logprobs_num = lp.num_logprobs() or 0 if return_logprob else 0
+        token_ids_logprob = lp.logprob_token_ids if lp is not None else None
+        return_prompt_logprob = lp is not None and lp.num_prompt_logprobs() is not None
         return cls(
             prompt_input_ids=recv_req.input_ids,
             sampling_params=recv_req.sampling_params,
             stream=recv_req.stream,
             tokenizer=tokenizer,
             eos_token_ids=eos_token_ids,
-            return_logprob=getattr(recv_req, "return_logprob", False),
-            top_logprobs_num=getattr(recv_req, "top_logprobs_num", 0),
-            token_ids_logprob=getattr(recv_req, "token_ids_logprob", None),
+            return_logprob=return_logprob,
+            top_logprobs_num=top_logprobs_num,
+            token_ids_logprob=token_ids_logprob,
             multimodal_inputs=getattr(recv_req, "multimodal_inputs", None),
             prompt_input_ids_unpadded=getattr(recv_req, "input_ids_unpadded", None),
+            return_prompt_logprob=return_prompt_logprob,
         )
 
     @property
@@ -534,6 +570,31 @@ class OutputProcesser:
             if model_execution_results.output_logprobs is not None
             else None
         )
+        _input_lp = getattr(model_execution_results, "input_token_logprobs", None)
+        input_logprobs_list = _input_lp.tolist() if _input_lp is not None else None
+        _input_lp_ids = getattr(
+            model_execution_results, "input_logprob_token_ids", None
+        )
+        input_logprob_ids_list = (
+            _input_lp_ids.tolist() if _input_lp_ids is not None else None
+        )
+        # Top-k prompt logprobs are already CPU Python lists partitioned per
+        # extend request (index by extend request i, NOT the flat ilp_pt).
+        input_top_val_list = getattr(
+            model_execution_results, "input_top_logprobs_val", None
+        )
+        input_top_idx_list = getattr(
+            model_execution_results, "input_top_logprobs_idx", None
+        )
+        # Token-id prompt logprobs are likewise CPU Python lists partitioned per
+        # extend request (index by extend request i, NOT the flat ilp_pt).
+        input_tid_val_list = getattr(
+            model_execution_results, "input_token_ids_logprobs_val", None
+        )
+        input_tid_idx_list = getattr(
+            model_execution_results, "input_token_ids_logprobs_idx", None
+        )
+        ilp_pt = 0
         pt = 0
         for i, rid in enumerate(forward_op.request_ids):
             output_length = model_execution_results.output_lengths[i].item()
@@ -551,11 +612,61 @@ class OutputProcesser:
             else:
                 pt += output_length
 
+            # Prompt/input-token logprobs (pure-extend prompt_logprobs path).
+            # The flat array carries one entry per scored prefill position for
+            # every i < num_extends (the ctx activates input logprobs for the
+            # whole pure-extend batch), so advance ilp_pt unconditionally here —
+            # before the rid_to_state / prefill-finished guards — to keep the
+            # pointer aligned with the flat array even for delayed/chunked rows.
+            seg_val = None
+            seg_idx = None
+            pl_req = -1
+            if input_logprobs_list is not None and i < num_extends:
+                plen = int(forward_op.input_lengths[i])
+                pl_req = int(forward_op.prompt_logprobs[i])
+                seg_val = input_logprobs_list[ilp_pt : ilp_pt + plen]
+                seg_idx = (
+                    input_logprob_ids_list[ilp_pt : ilp_pt + plen]
+                    if input_logprob_ids_list is not None
+                    else []
+                )
+                ilp_pt += plen
+
             if rid not in self.rid_to_state:
                 # means it's delayed token, do not process
                 continue
 
             request_state: RequestState = self.rid_to_state[rid]
+
+            if (
+                seg_val is not None
+                and pl_req >= 0
+                and request_state.input_token_logprobs_val is not None
+            ):
+                request_state.input_token_logprobs_val.extend(seg_val)
+                request_state.input_token_logprobs_idx.extend(seg_idx)
+                if (
+                    input_top_val_list is not None
+                    and i < len(input_top_val_list)
+                    and request_state.input_top_logprobs_val is not None
+                ):
+                    request_state.input_top_logprobs_val.extend(input_top_val_list[i])
+                    if input_top_idx_list is not None and i < len(input_top_idx_list):
+                        request_state.input_top_logprobs_idx.extend(
+                            input_top_idx_list[i]
+                        )
+                if (
+                    input_tid_val_list is not None
+                    and i < len(input_tid_val_list)
+                    and request_state.input_token_ids_logprobs_val is not None
+                ):
+                    request_state.input_token_ids_logprobs_val.extend(
+                        input_tid_val_list[i]
+                    )
+                    if input_tid_idx_list is not None and i < len(input_tid_idx_list):
+                        request_state.input_token_ids_logprobs_idx.extend(
+                            input_tid_idx_list[i]
+                        )
 
             # Do not output chunking result
             if not request_state.prefill_finished:
@@ -737,6 +848,12 @@ class OutputProcesser:
         output_extra_infos: list[dict] = []
         output_token_logprobs_val: list[list[float]] = []
         output_token_logprobs_idx: list[list[int]] = []
+        input_token_logprobs_val: list[list[float]] = []
+        input_token_logprobs_idx: list[list[int]] = []
+        input_top_logprobs_val: list = []
+        input_top_logprobs_idx: list = []
+        input_token_ids_logprobs_val: list = []
+        input_token_ids_logprobs_idx: list = []
 
         for i, rs in enumerate(output_states):
             # For finished requests, always output (unless already output)
@@ -816,6 +933,49 @@ class OutputProcesser:
                 output_token_logprobs_val.append([])
                 output_token_logprobs_idx.append([])
 
+            # Prompt/input-token logprobs: ship the un-shipped tail of the
+            # accumulated prompt logprobs (accumulated across chunked prefill in
+            # post_process_forward_op). Tracked with sent_prompt_logprob_offset
+            # so later decode-step streams don't resend the prompt logprobs.
+            if rs.return_prompt_logprob and rs.input_token_logprobs_val is not None:
+                off = rs.sent_prompt_logprob_offset
+                input_token_logprobs_val.append(rs.input_token_logprobs_val[off:])
+                input_token_logprobs_idx.append(rs.input_token_logprobs_idx[off:])
+                # Top-k prompt logprobs are parallel (one [k] list per position),
+                # so ship the same un-shipped tail using the same offset.
+                if rs.input_top_logprobs_val is not None:
+                    input_top_logprobs_val.append(rs.input_top_logprobs_val[off:])
+                    input_top_logprobs_idx.append(
+                        rs.input_top_logprobs_idx[off:]
+                        if rs.input_top_logprobs_idx is not None
+                        else []
+                    )
+                else:
+                    input_top_logprobs_val.append([])
+                    input_top_logprobs_idx.append([])
+                # Token-id prompt logprobs are parallel (one [num_token_ids] list
+                # per position), so ship the same un-shipped tail using off.
+                if rs.input_token_ids_logprobs_val is not None:
+                    input_token_ids_logprobs_val.append(
+                        rs.input_token_ids_logprobs_val[off:]
+                    )
+                    input_token_ids_logprobs_idx.append(
+                        rs.input_token_ids_logprobs_idx[off:]
+                        if rs.input_token_ids_logprobs_idx is not None
+                        else []
+                    )
+                else:
+                    input_token_ids_logprobs_val.append([])
+                    input_token_ids_logprobs_idx.append([])
+                rs.sent_prompt_logprob_offset = len(rs.input_token_logprobs_val)
+            else:
+                input_token_logprobs_val.append([])
+                input_token_logprobs_idx.append([])
+                input_top_logprobs_val.append([])
+                input_top_logprobs_idx.append([])
+                input_token_ids_logprobs_val.append([])
+                input_token_ids_logprobs_idx.append([])
+
         # Don't send empty batch to detokenizer
         if len(rids_to_send) == 0:
             return
@@ -835,16 +995,23 @@ class OutputProcesser:
             completion_tokens=completion_tokens,
             cached_tokens=cached_tokens,
             spec_verify_ct=spec_verify_ct,
-            input_token_logprobs_val=[],
-            input_token_logprobs_idx=[],
+            input_token_logprobs_val=input_token_logprobs_val,
+            input_token_logprobs_idx=input_token_logprobs_idx,
             output_token_logprobs_val=output_token_logprobs_val,
             output_token_logprobs_idx=output_token_logprobs_idx,
-            input_top_logprobs_val=[],
-            input_top_logprobs_idx=[],
+            input_top_logprobs_val=input_top_logprobs_val,
+            input_top_logprobs_idx=input_top_logprobs_idx,
+            # TODO(logprobs): OUTPUT top-k / token-id logprobs (logprobs=N>0 or
+            # logprob_token_ids on output) are not populated yet. Output logprobs
+            # flow through the captured CUDA-graph decode path, so top-k must be
+            # computed in the sampler and captured into the graph output buffers
+            # (unlike the prompt path, which is eager/prefill). Until then,
+            # logprobs=N>0 returns only the sampled token's logprob per position
+            # (its value is correct; the top-N alternatives are absent).
             output_top_logprobs_val=[],
             output_top_logprobs_idx=[],
-            input_token_ids_logprobs_val=[],
-            input_token_ids_logprobs_idx=[],
+            input_token_ids_logprobs_val=input_token_ids_logprobs_val,
+            input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
             output_token_ids_logprobs_val=[],
             output_token_ids_logprobs_idx=[],
             output_hidden_states=[],

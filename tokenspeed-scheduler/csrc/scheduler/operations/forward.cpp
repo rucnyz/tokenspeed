@@ -81,8 +81,13 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     Request* request, std::int32_t remaining, std::int32_t decode_input_tokens, bool disable_l2_cache,
     std::map<std::string, std::int32_t>& simulated_free) {
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
-    MatchResult match_result = hybrid_prefix_cache_ ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true))
-                                                    : kv_prefix_cache_.Match(request->GetFullPagedTokens(true));
+    // Prompt-logprob requests must recompute every prompt position to emit a
+    // logprob for each, so they must not reuse a cached prefix. SkipRead returns
+    // a valid root-only match (no reuse) without breaking allocator invariants.
+    const MatchIntent match_intent = request->PromptLogprobs() >= 0 ? MatchIntent::SkipRead : MatchIntent::PrefixReuse;
+    MatchResult match_result = hybrid_prefix_cache_
+                                   ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true), match_intent)
+                                   : kv_prefix_cache_.Match(request->GetFullPagedTokens(true), match_intent);
     std::int32_t loadback_tokens = 0;
     std::int32_t unscheduled = 0;
     std::vector<TreeNode*> loadback_diff;
@@ -413,6 +418,8 @@ static PrefillOperation applyPrefillEvent(Request* request, Event event) {
     op.input_ids = std::vector<std::int32_t>(info.input_ids.begin(), info.input_ids.end());
     op.shifted_input_ids = std::move(info.shifted_input_ids);
     op.extend_prefix_len = info.already_scheduled_len;
+    op.prompt_logprobs = request->PromptLogprobs();
+    op.logprob_token_ids = request->LogprobTokenIds();
 
     auto* mamba = request->GetLocalMambaAllocator();
     if (mamba != nullptr && mamba->HasWorking()) {

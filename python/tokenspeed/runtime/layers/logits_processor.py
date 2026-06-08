@@ -233,6 +233,10 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: torch.Tensor | None = None,
     ) -> LogitsProcessorOutput:
         # Get the last hidden states and last logits for the next token prediction
+        # NOTE: ``extend_return_logprob`` is only ever set True once the
+        # prompt-logprob (off-policy) path is wired in Phase B (the
+        # model_executor ctx-setup driven by ``prompt_logprobs``). Until then
+        # this branch is always taken (output-token logprobs only).
         if not logits_metadata.extend_return_logprob:
             gather_ids = logits_metadata.gather_ids
             if gather_ids is not None:

@@ -528,7 +528,60 @@ class ModelExecutor:
             ] = next_round_input_ids.to(torch.int32)
 
         output_logprobs = logits_output.next_token_logprobs
-        return output_tokens, accept_lengths, output_logprobs
+        input_token_logprobs = getattr(logits_output, "input_token_logprobs", None)
+        input_top_val = getattr(logits_output, "input_top_logprobs_val", None)
+        input_top_idx = getattr(logits_output, "input_top_logprobs_idx", None)
+        input_tid_val = getattr(logits_output, "input_token_ids_logprobs_val", None)
+        input_tid_idx = getattr(logits_output, "input_token_ids_logprobs_idx", None)
+        return (
+            output_tokens,
+            accept_lengths,
+            output_logprobs,
+            (
+                input_token_logprobs,
+                input_top_val,
+                input_top_idx,
+                input_tid_val,
+                input_tid_idx,
+            ),
+        )
+
+    def _maybe_set_input_logprob_ctx(self, ctx, forward_op, bs, num_extends):
+        """Activate the prompt-logprob (input) path for a pure-extend batch when
+        any request asked for prompt_logprobs. Prompt logprobs span the whole
+        prompt, so each request's window starts at the chunk boundary (relative
+        start 0)."""
+        if num_extends == 0 or num_extends != bs:
+            return
+        prompt_lp = [int(x) for x in forward_op.prompt_logprobs[:num_extends]]
+        if not any(p >= 0 for p in prompt_lp):
+            return
+        seq_lens = [
+            int(x)
+            for x in self.input_buffers.extend_seq_lens_cpu[:num_extends].tolist()
+        ]
+        start_lens = [0 for _ in seq_lens]
+        pruned = [el - sl for sl, el in zip(start_lens, seq_lens)]
+        if any(p <= 0 for p in pruned):
+            return
+        shifted = self.input_buffers.shifted_prefill_ids_buf
+        idx_slices = []
+        pt = 0
+        for sl, el in zip(start_lens, seq_lens):
+            idx_slices.append(shifted[pt + sl : pt + el])
+            pt += el
+        ctx.extend_return_logprob = True
+        ctx.extend_logprob_start_lens_cpu = start_lens
+        ctx.extend_seq_lens_cpu = seq_lens
+        ctx.extend_logprob_pruned_lens_cpu = pruned
+        ctx.extend_input_logprob_token_ids_gpu = (
+            torch.cat(idx_slices) if idx_slices else None
+        )
+        ctx.top_logprobs_nums = [max(p, 0) for p in prompt_lp]
+        ctx.extend_return_top_logprob = any(p > 0 for p in prompt_lp)
+        tid_lists = [list(t) for t in forward_op.logprob_token_ids[:num_extends]]
+        ctx.token_ids_logprobs = tid_lists
+        ctx.extend_token_ids_logprob = any(len(t) > 0 for t in tid_lists)
 
     @nvtx_range("update_runtime_state", color="orange")
     def _update_runtime_state(
@@ -1233,6 +1286,11 @@ class ModelExecutor:
                 output_tokens = torch.zeros(0, dtype=torch.int32, device=self.device)
                 output_lengths = torch.zeros(bs, dtype=torch.int32, device=self.device)
                 output_logprobs = None
+                input_token_logprobs = None
+                input_top_logprobs_val = None
+                input_top_logprobs_idx = None
+                input_token_ids_logprobs_val = None
+                input_token_ids_logprobs_idx = None
             else:
                 gather_ids = None
                 if num_extends > 0:
@@ -1286,6 +1344,7 @@ class ModelExecutor:
                     gather_ids=gather_ids,
                     decode_input_ids=decode_input_ids,
                 )
+                self._maybe_set_input_logprob_ctx(ctx, forward_op, bs, num_extends)
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:
                         raise RuntimeError(
@@ -1358,7 +1417,12 @@ class ModelExecutor:
                         device=self.device,
                         num_reqs=bs,
                     )
-                    output_tokens, output_lengths, output_logprobs = self.forward_step(
+                    (
+                        output_tokens,
+                        output_lengths,
+                        output_logprobs,
+                        _input_lp_bundle,
+                    ) = self.forward_step(
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
@@ -1382,6 +1446,20 @@ class ModelExecutor:
                         ),
                         **mamba_kwargs,
                     )
+                    if _input_lp_bundle is None:
+                        input_token_logprobs = None
+                        input_top_logprobs_val = None
+                        input_top_logprobs_idx = None
+                        input_token_ids_logprobs_val = None
+                        input_token_ids_logprobs_idx = None
+                    else:
+                        (
+                            input_token_logprobs,
+                            input_top_logprobs_val,
+                            input_top_logprobs_idx,
+                            input_token_ids_logprobs_val,
+                            input_token_ids_logprobs_idx,
+                        ) = _input_lp_bundle
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
                 self._update_runtime_state(
@@ -1438,6 +1516,18 @@ class ModelExecutor:
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)
 
+                input_logprob_token_ids = None
+                if input_token_logprobs is not None:
+                    input_token_logprobs = input_token_logprobs.to(
+                        "cpu", non_blocking=True
+                    )
+                    if ctx.extend_input_logprob_token_ids_gpu is not None:
+                        input_logprob_token_ids = (
+                            ctx.extend_input_logprob_token_ids_gpu.to(
+                                "cpu", non_blocking=True
+                            )
+                        )
+
                 copy_event = torch.cuda.Event()
                 copy_event.record()
 
@@ -1445,6 +1535,12 @@ class ModelExecutor:
             output_tokens=output_tokens,
             output_lengths=output_lengths,
             output_logprobs=output_logprobs,
+            input_token_logprobs=input_token_logprobs,
+            input_logprob_token_ids=input_logprob_token_ids,
+            input_top_logprobs_val=input_top_logprobs_val,
+            input_top_logprobs_idx=input_top_logprobs_idx,
+            input_token_ids_logprobs_val=input_token_ids_logprobs_val,
+            input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
             copy_event=copy_event,
             grammar_completion=grammar_completion,
             next_input_ids=next_input_ids,
