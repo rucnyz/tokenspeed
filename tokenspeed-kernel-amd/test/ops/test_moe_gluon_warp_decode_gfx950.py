@@ -2,15 +2,39 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe.gluon import _gluon_mxfp4_fp8_warp_decode_moe
-from tokenspeed_kernel.ops.moe.triton_kernels import (
-    FlexCtx,
-    InFlexData,
-    PrecisionConfig,
+
+
+def _is_gfx950() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+    return "gfx950" in arch
+
+
+if not _is_gfx950():
+    pytest.skip(
+        "AMD GFX950 is required for Gluon warp-decode tests",
+        allow_module_level=True,
+    )
+
+
+from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (  # noqa: E402
+    _gluon_mxfp4_fp8_warp_decode_moe,
 )
-from tokenspeed_kernel.platform import current_platform
+
+try:
+    from tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel import (
+        swizzle_mxfp4,
+    )
+except ImportError as exc:
+    pytest.skip(
+        f"tokenspeed runtime MXFP4 swizzle helper is required: {exc}",
+        allow_module_level=True,
+    )
 
 # Standard OCP MXFP4 (E2M1) value table; index is the 4-bit code.
 _E2M1_VALUES = [
@@ -33,6 +57,13 @@ _E2M1_VALUES = [
 ]
 
 _FP8_DTYPE = torch.float8_e4m3fn
+
+
+@dataclass
+class PrecisionConfig:
+    b_mx_scale: torch.Tensor
+    b_microblock_size: int = 32
+    out_dtype: torch.dtype | None = None
 
 
 def _mxfp4_dequant(packed: torch.Tensor) -> torch.Tensor:
@@ -62,8 +93,6 @@ def _build_case(
     seed: int = 123,
 ) -> dict:
     """Construct kernel inputs plus the raw weights kept for the reference."""
-    from tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel import swizzle_mxfp4
-
     torch.manual_seed(seed)
     hidden = torch.randn((M, D), device=device, dtype=torch.bfloat16)
     router = torch.randn((M, E), device=device, dtype=torch.float32)
@@ -80,26 +109,12 @@ def _build_case(
         torch.randn((E, D), device=device, dtype=torch.float32) if use_bias else None
     )
 
-    wt13, flex13, st13 = swizzle_mxfp4(w13, s13, 8)
-    wt2, flex2, st2 = swizzle_mxfp4(w2, s2, 8)
+    wt13, _w13_flex, st13 = swizzle_mxfp4(w13, s13, 8)
+    wt2, _w2_flex, st2 = swizzle_mxfp4(w2, s2, 8)
     scale1 = torch.ones((1,), device=device, dtype=torch.float32)
     scale2 = torch.ones((1,), device=device, dtype=torch.float32)
-    pc1 = PrecisionConfig(
-        flex_ctx=FlexCtx(
-            lhs_data=InFlexData(dtype=_FP8_DTYPE, scale=scale1), rhs_data=flex13
-        ),
-        b_mx_scale=st13,
-        b_microblock_size=32,
-        out_dtype=torch.bfloat16,
-    )
-    pc2 = PrecisionConfig(
-        flex_ctx=FlexCtx(
-            lhs_data=InFlexData(dtype=_FP8_DTYPE, scale=scale2), rhs_data=flex2
-        ),
-        b_mx_scale=st2,
-        b_microblock_size=32,
-        out_dtype=torch.bfloat16,
-    )
+    pc1 = PrecisionConfig(b_mx_scale=st13, out_dtype=torch.bfloat16)
+    pc2 = PrecisionConfig(b_mx_scale=st2, out_dtype=torch.bfloat16)
     return {
         "M": M,
         "E": E,
@@ -122,6 +137,13 @@ def _build_case(
     }
 
 
+def _quantize_fp8(
+    x: torch.Tensor, *, scale: torch.Tensor, solution: str | None = None
+) -> torch.Tensor:
+    del scale, solution
+    return x.to(_FP8_DTYPE)
+
+
 def _run_kernel(case: dict) -> torch.Tensor:
     return _gluon_mxfp4_fp8_warp_decode_moe(
         case["hidden"],
@@ -135,6 +157,7 @@ def _run_kernel(case: dict) -> torch.Tensor:
         w13_act_scale=case["scale1"],
         w2_act_scale=case["scale2"],
         top_k=case["topk"],
+        quantize_fp8_fn=_quantize_fp8,
     )
 
 
@@ -182,10 +205,6 @@ def _reference(case: dict) -> torch.Tensor:
     return ref
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
-@pytest.mark.skipif(
-    not current_platform().is_cdna4, reason="Gluon warp-decode helpers are gfx950-only"
-)
 @pytest.mark.parametrize("use_bias", [False, True])
 @pytest.mark.parametrize("M", [1, 2, 4, 8, 16])
 def test_fp8_mxfp4_warp_decode_moe(M: int, use_bias: bool):
