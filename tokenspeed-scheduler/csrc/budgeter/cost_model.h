@@ -21,39 +21,21 @@
 #pragma once
 
 #include <cstdint>
-#include <queue>
-#include <unordered_set>
-#include <vector>
 
-#include "resource/radix_tree/tree_node.h"
 #include "resource/eviction_config.h"
 
 namespace tokenspeed {
 
-class MambaChunkAllocator;
+struct CostModel {
+    EvictionConfig eviction_config{};
+    double c_xfer_us_per_page{70.0};
+    double w_q_us{1000.0};
 
-class MambaEvictionManager {
-public:
-    explicit MambaEvictionManager(MambaChunkAllocator* allocator, EvictionConfig eviction_config = {});
-
-    void SetEvictionConfig(EvictionConfig config) { eviction_config_ = std::move(config); }
-
-    void TrackNode(TreeNode* node);
-    void UntrackNode(TreeNode* node);
-    void UpdateLeaf(TreeNode* node);
-
-    std::int32_t Evict(std::int32_t num_slots, TreeNode* protected_node = nullptr);
-    bool EnsureCapacity(std::int32_t required_slots, TreeNode* protected_node = nullptr);
-
-    std::int32_t EvictableSlots() const;
-
-private:
-    bool isMambaLeaf(const TreeNode* node) const;
-    bool hasChildWithMamba(const TreeNode* node) const;
-
-    MambaChunkAllocator* allocator_;
-    EvictionConfig eviction_config_{};
-    std::unordered_set<TreeNode*> mamba_leaves_;
+    double CXferUs(std::int32_t num_pages) const { return c_xfer_us_per_page * num_pages; }
+    double CMigrateUs() const { return eviction_config.c_m; }
+    double CEvictUs(double seq_len_tokens, std::int64_t bytes) const;
+    double CRecomputeUs(double seq_len_tokens, bool is_mamba = false) const;
+    double WQueueUs() const { return w_q_us; }
 };
 
 }  // namespace tokenspeed

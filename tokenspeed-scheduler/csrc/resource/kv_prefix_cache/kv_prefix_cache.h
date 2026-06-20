@@ -30,6 +30,7 @@
 
 #include "resource/radix_tree/radix_tree.h"
 #include "resource/radix_tree/tree_resource.h"
+#include "resource/eviction_config.h"
 #include "resource/types.h"
 #include "scheduler/kv_cache_events.h"
 
@@ -43,8 +44,11 @@ using KvEventSink = std::function<void(KvCacheEvent)>;
 
 class KVPrefixCache {
 public:
-    KVPrefixCache(PageAllocator* device_allocator, PageAllocator* host_allocator, bool enable_l3_storage = false,
+    KVPrefixCache(PageAllocator* device_allocator, PageAllocator* host_allocator,
+                  EvictionConfig eviction_config = {}, bool enable_l3_storage = false,
                   bool disable_prefix_cache = false);
+
+    const EvictionConfig& GetEvictionConfig() const { return eviction_config_; }
 
     void SetKvEventSink(KvEventSink sink);
     MatchResult Match(const token_vec_t& token_ids, MatchIntent intent = MatchIntent::PrefixReuse);
@@ -114,6 +118,7 @@ private:
     KvEventSink kv_event_sink_{};
     std::unordered_set<std::uint64_t> published_device_blocks_;
     bool disable_prefix_cache_{false};
+    EvictionConfig eviction_config_{};
 };
 
 }  // namespace tokenspeed

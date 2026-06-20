@@ -43,6 +43,7 @@
 #include "resource/allocator/mamba_chunk_allocator.h"
 #include "resource/allocator/mamba_host_allocator.h"
 #include "resource/hybrid_prefix_cache/hybrid_prefix_cache.h"
+#include "budgeter/budget_agent.h"
 
 #include "fsm/forward_events.h"
 #include "fsm/cache_events.h"
@@ -76,6 +77,9 @@ public:
                                                           const std::string& group_id) const;
     // Compact-view base logical-page offset; 0 for full-history / unseen.
     std::int32_t GetRequestPagedCacheBaseLogicalPage(const std::string& request_id, const std::string& group_id) const;
+
+    void BudgetTick();
+    std::optional<XPoolFirePlan> PendingXPoolFire() const;
 
 private:
     // Second element is LoadBackOperation list (normal path) or WriteBackOperation list (retract triggered).
@@ -121,6 +125,8 @@ private:
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
 
+    PoolSnapshot MakePoolSnapshot() const;
+
 private:
     Request* find_request(std::string rid) {
         auto it = requests_.find(rid);
@@ -138,6 +144,7 @@ private:
     KVPrefixCache kv_prefix_cache_;
     ReqPoolAllocator req_pool_allocator_;
     std::optional<HybridPrefixCache> hybrid_prefix_cache_{};
+    std::optional<BudgetAgent> budget_agent_{};
 
 private:
     std::unordered_map<std::string, std::unique_ptr<Request>> requests_;

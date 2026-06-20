@@ -230,6 +230,18 @@ class ServerArgs:
     # Runtime options
     disable_pdl: bool = False
     enable_prefix_caching: bool = True
+    radix_eviction_policy: str = "lru"
+    lpb_window_s: float = 60.0
+    lpb_hit_deque_maxlen: int = 4096
+    csigma_kv_alpha: float = 1.02e-7
+    csigma_kv_beta: float = 0.0246
+    csigma_kv_gamma: float = 5.97
+    csigma_m: float = 0.0
+    enable_budgeter: bool = False
+    enable_admitter: bool = False
+    enable_xpool_dynamic_capacity: bool = False
+    budgeter_tick_s: float = 1.0
+    budgeter_pages_per_fire: int = 64
     disable_kvstore: bool = False
     enforce_eager: bool = False
     disable_cuda_graph_padding: bool = False
@@ -1486,6 +1498,79 @@ class ServerArgs:
             dest="enable_prefix_caching",
             action="store_false",
             help="Disable prefix caching.",
+        )
+        parser.add_argument(
+            "--radix-eviction-policy",
+            type=str,
+            choices=["lru", "lpb"],
+            default=ServerArgs.radix_eviction_policy,
+            help="Radix cache eviction policy: lru (recency) or lpb (loss-per-byte).",
+        )
+        parser.add_argument(
+            "--lpb-window-s",
+            type=float,
+            default=ServerArgs.lpb_window_s,
+            help="LPB sliding hit-count window in seconds.",
+        )
+        parser.add_argument(
+            "--lpb-hit-deque-maxlen",
+            type=int,
+            default=ServerArgs.lpb_hit_deque_maxlen,
+            help="LPB per-node hit deque maximum length.",
+        )
+        parser.add_argument(
+            "--csigma-kv-alpha",
+            type=float,
+            default=ServerArgs.csigma_kv_alpha,
+            help="LPB KV re-prefill cost quadratic coefficient (microseconds).",
+        )
+        parser.add_argument(
+            "--csigma-kv-beta",
+            type=float,
+            default=ServerArgs.csigma_kv_beta,
+            help="LPB KV re-prefill cost linear coefficient (microseconds).",
+        )
+        parser.add_argument(
+            "--csigma-kv-gamma",
+            type=float,
+            default=ServerArgs.csigma_kv_gamma,
+            help="LPB KV re-prefill cost constant term (microseconds).",
+        )
+        parser.add_argument(
+            "--csigma-m",
+            type=float,
+            default=ServerArgs.csigma_m,
+            help="LPB mamba re-prefill cost (default 0 for single-curve design).",
+        )
+        parser.add_argument(
+            "--enable-budgeter",
+            action="store_true",
+            default=ServerArgs.enable_budgeter,
+            help="Enable HiMA periodic budgeter for inter-pool rebalancing.",
+        )
+        parser.add_argument(
+            "--enable-admitter",
+            action="store_true",
+            default=ServerArgs.enable_admitter,
+            help="Enable HiMA per-request admitter cross-pool decisions.",
+        )
+        parser.add_argument(
+            "--enable-xpool-dynamic-capacity",
+            action="store_true",
+            default=ServerArgs.enable_xpool_dynamic_capacity,
+            help="Enable dynamic grow/shrink page allocator for inter-pool transfer.",
+        )
+        parser.add_argument(
+            "--budgeter-tick-s",
+            type=float,
+            default=ServerArgs.budgeter_tick_s,
+            help="Budgeter tick period in seconds.",
+        )
+        parser.add_argument(
+            "--budgeter-pages-per-fire",
+            type=int,
+            default=ServerArgs.budgeter_pages_per_fire,
+            help="Pages moved per inter-pool fire.",
         )
         parser.add_argument(
             "--enforce-eager",

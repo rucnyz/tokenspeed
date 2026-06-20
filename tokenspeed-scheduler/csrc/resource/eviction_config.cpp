@@ -18,42 +18,33 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#pragma once
-
-#include <cstdint>
-#include <queue>
-#include <unordered_set>
-#include <vector>
-
-#include "resource/radix_tree/tree_node.h"
 #include "resource/eviction_config.h"
+
+#include <algorithm>
+#include <cctype>
+#include <stdexcept>
 
 namespace tokenspeed {
 
-class MambaChunkAllocator;
+EvictionPolicy EvictionConfig::ParsePolicy(const std::string& name) {
+    std::string lower = name;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (lower == "lru") {
+        return EvictionPolicy::kLru;
+    }
+    if (lower == "lpb") {
+        return EvictionPolicy::kLpb;
+    }
+    throw std::invalid_argument("EvictionConfig: unknown eviction policy '" + name + "'");
+}
 
-class MambaEvictionManager {
-public:
-    explicit MambaEvictionManager(MambaChunkAllocator* allocator, EvictionConfig eviction_config = {});
-
-    void SetEvictionConfig(EvictionConfig config) { eviction_config_ = std::move(config); }
-
-    void TrackNode(TreeNode* node);
-    void UntrackNode(TreeNode* node);
-    void UpdateLeaf(TreeNode* node);
-
-    std::int32_t Evict(std::int32_t num_slots, TreeNode* protected_node = nullptr);
-    bool EnsureCapacity(std::int32_t required_slots, TreeNode* protected_node = nullptr);
-
-    std::int32_t EvictableSlots() const;
-
-private:
-    bool isMambaLeaf(const TreeNode* node) const;
-    bool hasChildWithMamba(const TreeNode* node) const;
-
-    MambaChunkAllocator* allocator_;
-    EvictionConfig eviction_config_{};
-    std::unordered_set<TreeNode*> mamba_leaves_;
-};
+double EvictionConfig::RecomputeCostUs(double seq_len_tokens, bool is_mamba) const {
+    if (is_mamba) {
+        return c_m;
+    }
+    const double l = seq_len_tokens;
+    return c_kv_alpha * l * l + c_kv_beta * l + c_kv_gamma;
+}
 
 }  // namespace tokenspeed

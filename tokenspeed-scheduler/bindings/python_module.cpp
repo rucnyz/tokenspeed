@@ -241,7 +241,26 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("mamba_cache_chunk_size", &tokenspeed::SchedulerConfig::mamba_cache_chunk_size)
         .def_rw("mamba_pool_total_chunks", &tokenspeed::SchedulerConfig::mamba_pool_total_chunks)
         .def_rw("enable_mamba_l2", &tokenspeed::SchedulerConfig::enable_mamba_l2)
-        .def_rw("mamba_l2_host_slots", &tokenspeed::SchedulerConfig::mamba_l2_host_slots);
+        .def_rw("mamba_l2_host_slots", &tokenspeed::SchedulerConfig::mamba_l2_host_slots)
+        .def_rw("eviction_policy", &tokenspeed::SchedulerConfig::eviction_policy)
+        .def_rw("lpb_window_s", &tokenspeed::SchedulerConfig::lpb_window_s)
+        .def_rw("lpb_hit_deque_maxlen", &tokenspeed::SchedulerConfig::lpb_hit_deque_maxlen)
+        .def_rw("c_kv_alpha", &tokenspeed::SchedulerConfig::c_kv_alpha)
+        .def_rw("c_kv_beta", &tokenspeed::SchedulerConfig::c_kv_beta)
+        .def_rw("c_kv_gamma", &tokenspeed::SchedulerConfig::c_kv_gamma)
+        .def_rw("c_m", &tokenspeed::SchedulerConfig::c_m)
+        .def_rw("kv_bytes_per_page", &tokenspeed::SchedulerConfig::kv_bytes_per_page)
+        .def_rw("mamba_bytes_per_slot", &tokenspeed::SchedulerConfig::mamba_bytes_per_slot)
+        .def_rw("enable_budgeter", &tokenspeed::SchedulerConfig::enable_budgeter)
+        .def_rw("enable_admitter", &tokenspeed::SchedulerConfig::enable_admitter)
+        .def_rw("enable_xpool_dynamic_capacity", &tokenspeed::SchedulerConfig::enable_xpool_dynamic_capacity)
+        .def_rw("budgeter_tick_s", &tokenspeed::SchedulerConfig::budgeter_tick_s)
+        .def_rw("budgeter_pages_per_fire", &tokenspeed::SchedulerConfig::budgeter_pages_per_fire)
+        .def_rw("xpool_ewma_tau_s", &tokenspeed::SchedulerConfig::xpool_ewma_tau_s)
+        .def_rw("xpool_nb_margin", &tokenspeed::SchedulerConfig::xpool_nb_margin)
+        .def_rw("xpool_mamba_floor_slots", &tokenspeed::SchedulerConfig::xpool_mamba_floor_slots)
+        .def_rw("xpool_xfer_us_per_page", &tokenspeed::SchedulerConfig::xpool_xfer_us_per_page)
+        .def_rw("xpool_queue_wait_us", &tokenspeed::SchedulerConfig::xpool_queue_wait_us);
 
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
@@ -378,6 +397,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("dst_pages_by_kind", &tokenspeed::FlatWriteBackOperation::dst_pages_by_kind)
         .def_ro("is_retract", &tokenspeed::FlatWriteBackOperation::is_retract);
 
+    nb::class_<tokenspeed::XPoolFireOperation>(cache, "XPoolFireOp")
+        .def_ro("op_id", &tokenspeed::XPoolFireOperation::op_id)
+        .def_ro("direction", &tokenspeed::XPoolFireOperation::direction)
+        .def_ro("page_ids", &tokenspeed::XPoolFireOperation::page_ids);
+
     auto collect_forward = [](const tokenspeed::ExecutionPlan& plan) -> nb::list {
         nb::list result;
         for (const auto& op : plan.Operations()) {
@@ -402,6 +426,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<>())
         .def_prop_ro("forward", collect_forward)
         .def_prop_ro("cache", collect_cache);
+
+    nb::class_<tokenspeed::XPoolFirePlan>(m, "XPoolFirePlan")
+        .def(nb::init<>())
+        .def_rw("direction", &tokenspeed::XPoolFirePlan::direction)
+        .def_rw("page_ids", &tokenspeed::XPoolFirePlan::page_ids)
+        .def_rw("op_id", &tokenspeed::XPoolFirePlan::op_id);
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")
         .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config") = tokenspeed::SchedulerConfig{})
@@ -438,5 +468,15 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("get_request_paged_cache_page_ids", &tokenspeed::Scheduler::GetRequestPagedCachePageIds,
              nb::arg("request_id"), nb::arg("group_id"))
         .def("get_request_paged_cache_base_logical_page", &tokenspeed::Scheduler::GetRequestPagedCacheBaseLogicalPage,
-             nb::arg("request_id"), nb::arg("group_id"));
+             nb::arg("request_id"), nb::arg("group_id"))
+        .def("budget_tick", &tokenspeed::Scheduler::BudgetTick)
+        .def(
+            "pending_xpool_fire",
+            [](tokenspeed::Scheduler& s) -> nb::object {
+                auto plan = s.PendingXPoolFire();
+                if (!plan.has_value()) {
+                    return nb::none();
+                }
+                return nb::cast(*plan);
+            });
 }

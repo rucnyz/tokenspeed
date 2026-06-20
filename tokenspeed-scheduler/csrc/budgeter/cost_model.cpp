@@ -18,42 +18,19 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#pragma once
-
-#include <cstdint>
-#include <queue>
-#include <unordered_set>
-#include <vector>
-
-#include "resource/radix_tree/tree_node.h"
-#include "resource/eviction_config.h"
+#include "budgeter/cost_model.h"
 
 namespace tokenspeed {
 
-class MambaChunkAllocator;
+double CostModel::CEvictUs(double seq_len_tokens, std::int64_t bytes) const {
+    if (bytes <= 0) {
+        return 0.0;
+    }
+    return CRecomputeUs(seq_len_tokens, false);
+}
 
-class MambaEvictionManager {
-public:
-    explicit MambaEvictionManager(MambaChunkAllocator* allocator, EvictionConfig eviction_config = {});
-
-    void SetEvictionConfig(EvictionConfig config) { eviction_config_ = std::move(config); }
-
-    void TrackNode(TreeNode* node);
-    void UntrackNode(TreeNode* node);
-    void UpdateLeaf(TreeNode* node);
-
-    std::int32_t Evict(std::int32_t num_slots, TreeNode* protected_node = nullptr);
-    bool EnsureCapacity(std::int32_t required_slots, TreeNode* protected_node = nullptr);
-
-    std::int32_t EvictableSlots() const;
-
-private:
-    bool isMambaLeaf(const TreeNode* node) const;
-    bool hasChildWithMamba(const TreeNode* node) const;
-
-    MambaChunkAllocator* allocator_;
-    EvictionConfig eviction_config_{};
-    std::unordered_set<TreeNode*> mamba_leaves_;
-};
+double CostModel::CRecomputeUs(double seq_len_tokens, bool is_mamba) const {
+    return eviction_config.RecomputeCostUs(seq_len_tokens, is_mamba);
+}
 
 }  // namespace tokenspeed

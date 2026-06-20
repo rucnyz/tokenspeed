@@ -21,39 +21,42 @@
 #pragma once
 
 #include <cstdint>
-#include <queue>
+#include <optional>
 #include <unordered_set>
 #include <vector>
 
-#include "resource/radix_tree/tree_node.h"
-#include "resource/eviction_config.h"
-
 namespace tokenspeed {
 
-class MambaChunkAllocator;
-
-class MambaEvictionManager {
+// Cap-barrier aware free list for HiMA-style cross-pool transfer. Capped page ids
+// never appear in the allocatable free list; tail_lo tracks a contiguous capped
+// suffix without materializing it.
+class CappedFreeList {
 public:
-    explicit MambaEvictionManager(MambaChunkAllocator* allocator, EvictionConfig eviction_config = {});
+    static constexpr std::int32_t kNoTail = -1;
 
-    void SetEvictionConfig(EvictionConfig config) { eviction_config_ = std::move(config); }
+    void Reset(std::int32_t size, std::vector<std::int32_t> initial_free);
 
-    void TrackNode(TreeNode* node);
-    void UntrackNode(TreeNode* node);
-    void UpdateLeaf(TreeNode* node);
+    std::optional<std::int32_t> Allocate();
+    void Deallocate(std::int32_t page_id);
 
-    std::int32_t Evict(std::int32_t num_slots, TreeNode* protected_node = nullptr);
-    bool EnsureCapacity(std::int32_t required_slots, TreeNode* protected_node = nullptr);
+    void MarkCapped(std::int32_t page_id);
+    void UnmarkCapped(std::int32_t page_id);
+    void SetCap(std::int32_t tail_lo);
 
-    std::int32_t EvictableSlots() const;
+    bool IsCapped(std::int32_t page_id) const;
+    std::int32_t Live() const;
+    std::int32_t Available() const { return static_cast<std::int32_t>(free_ids_.size()); }
+    std::int32_t NumCapped() const { return n_capped_; }
+    std::int32_t Size() const { return size_; }
 
 private:
-    bool isMambaLeaf(const TreeNode* node) const;
-    bool hasChildWithMamba(const TreeNode* node) const;
+    bool inTail(std::int32_t page_id) const;
 
-    MambaChunkAllocator* allocator_;
-    EvictionConfig eviction_config_{};
-    std::unordered_set<TreeNode*> mamba_leaves_;
+    std::int32_t size_{0};
+    std::int32_t n_capped_{0};
+    std::int32_t tail_lo_{kNoTail};
+    std::vector<std::int32_t> free_ids_{};
+    std::unordered_set<std::int32_t> marks_{};
 };
 
 }  // namespace tokenspeed

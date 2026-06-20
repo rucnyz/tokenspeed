@@ -33,6 +33,7 @@
 
 #include "resource/allocator/paged_cache_group.h"
 #include "resource/hybrid_prefix_cache/mamba_eviction_manager.h"
+#include "resource/eviction_config.h"
 #include "resource/radix_tree/mamba_slot.h"
 #include "scheduler/operations/cache.h"
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
@@ -49,7 +50,7 @@ class HybridPrefixCache {
 public:
     // `mamba_allocator` may be null; paged-cache adjunct is enabled separately.
     HybridPrefixCache(KVPrefixCache& prefix_cache, MambaChunkAllocator* allocator, std::int32_t mamba_cache_chunk_size,
-                      MambaHostAllocator* mamba_host_allocator = nullptr);
+                      MambaHostAllocator* mamba_host_allocator = nullptr, EvictionConfig eviction_config = {});
 
     MatchResult Match(const token_vec_t& token_ids, MatchIntent intent = MatchIntent::PrefixReuse);
     MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages,

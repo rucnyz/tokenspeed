@@ -30,6 +30,7 @@
 
 #include "fsm/forward_events.h"
 #include "resource/allocator/paged_cache_group.h"
+#include "resource/eviction_config.h"
 #include "resource/types.h"
 #include "scheduler/operations/inc.h"
 
@@ -106,6 +107,29 @@ struct SchedulerConfig {
     std::int32_t mamba_pool_total_chunks{0};
     bool enable_mamba_l2{false};
     std::int32_t mamba_l2_host_slots{0};
+
+    // Intra-pool eviction policy (LRU baseline or LPB loss-per-byte).
+    std::string eviction_policy{"lru"};
+    double lpb_window_s{60.0};
+    std::int32_t lpb_hit_deque_maxlen{4096};
+    double c_kv_alpha{1.02e-7};
+    double c_kv_beta{0.0246};
+    double c_kv_gamma{5.97};
+    double c_m{0.0};
+    std::int64_t kv_bytes_per_page{0};
+    std::int64_t mamba_bytes_per_slot{0};
+
+    // Inter-pool HiMA (XPool) controls.
+    bool enable_budgeter{false};
+    bool enable_admitter{false};
+    bool enable_xpool_dynamic_capacity{false};
+    double budgeter_tick_s{1.0};
+    std::int32_t budgeter_pages_per_fire{64};
+    double xpool_ewma_tau_s{1.0};
+    double xpool_nb_margin{0.05};
+    std::int32_t xpool_mamba_floor_slots{32};
+    double xpool_xfer_us_per_page{70.0};
+    double xpool_queue_wait_us{1000.0};
 };
 
 }  // namespace tokenspeed

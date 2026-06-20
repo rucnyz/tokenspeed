@@ -20,6 +20,8 @@
 
 #include "scheduler/scheduler.h"
 
+#include "budgeter/budget_agent.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -43,6 +45,7 @@
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
+#include "resource/eviction_config.h"
 #include "resource/radix_tree/radix_tree.h"
 #include "resource/radix_tree/tree_node.h"
 #include "scheduler/execution_event.h"
@@ -54,12 +57,33 @@
 
 namespace tokenspeed {
 
+namespace {
+
+EvictionConfig MakeEvictionConfig(const SchedulerConfig& config) {
+    EvictionConfig out;
+    out.policy = EvictionConfig::ParsePolicy(config.eviction_policy);
+    out.lpb_window_s = config.lpb_window_s;
+    out.lpb_hit_deque_maxlen = config.lpb_hit_deque_maxlen;
+    out.c_kv_alpha = config.c_kv_alpha;
+    out.c_kv_beta = config.c_kv_beta;
+    out.c_kv_gamma = config.c_kv_gamma;
+    out.c_m = config.c_m;
+    out.kv_bytes_per_page = config.kv_bytes_per_page;
+    out.mamba_bytes_per_slot = config.mamba_bytes_per_slot;
+    out.mamba_cache_chunk_size = config.mamba_cache_chunk_size;
+    return out;
+}
+
+}  // namespace
+
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{std::move(config)},
-      device_allocator_{config_.page_size, config_.device_allocator.total_pages},
+      device_allocator_{config_.page_size, config_.device_allocator.total_pages,
+                        config_.enable_xpool_dynamic_capacity},
       host_allocator_{config_.page_size, config_.host_allocator.total_pages},
       mamba_allocator_{},
-      kv_prefix_cache_{&device_allocator_, &host_allocator_, config_.enable_l3_storage, config_.disable_prefix_cache},
+      kv_prefix_cache_{&device_allocator_, &host_allocator_, MakeEvictionConfig(config_),
+                       config_.enable_l3_storage, config_.disable_prefix_cache},
       req_pool_allocator_{config_.max_batch_size} {
     if (auto* env = std::getenv("SPDLOG_LEVEL")) {
         std::string level_str{env};
@@ -87,7 +111,8 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (has_mamba_adjunct || has_prefix_cache_adjunct || has_paged_cache_groups) {
         MambaChunkAllocator* mamba_ptr = has_mamba_adjunct ? &*mamba_allocator_ : nullptr;
         MambaHostAllocator* mamba_host_ptr = has_mamba_l2_pool ? &*mamba_host_allocator_ : nullptr;
-        hybrid_prefix_cache_.emplace(kv_prefix_cache_, mamba_ptr, config_.mamba_cache_chunk_size, mamba_host_ptr);
+        hybrid_prefix_cache_.emplace(kv_prefix_cache_, mamba_ptr, config_.mamba_cache_chunk_size, mamba_host_ptr,
+                                     MakeEvictionConfig(config_));
         kv_prefix_cache_.GetDeviceManager().SetEvictionCallback(
             [this](TreeNode* node) { hybrid_prefix_cache_->OnKVEvict(node); });
         kv_prefix_cache_.GetHostManager().SetEvictionCallback(
@@ -136,6 +161,9 @@ Scheduler::Scheduler(SchedulerConfig config)
             hybrid_prefix_cache_->EnablePagedCacheAdjunct(spec.required_groups, std::move(sliding_window_per_group));
         }
     }
+    if (config_.enable_budgeter || config_.enable_admitter) {
+        budget_agent_.emplace(config_);
+    }
 }
 
 std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
@@ -171,6 +199,9 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     for (const auto& spec : request_specs) {
         auto req = std::make_unique<Request>(spec, config_.page_size, config_.role);
         requests_.emplace(spec.request_id, std::move(req));
+        if (budget_agent_) {
+            budget_agent_->OnRequestArrival(static_cast<std::int32_t>(spec.tokens.size()), MakePoolSnapshot());
+        }
     }
 }
 
@@ -427,6 +458,31 @@ void Scheduler::Advance(const ExecutionEvent& event) {
     for (const auto& item : event.Events()) {
         std::visit([&](const auto& outer) { std::visit(dispatch, outer); }, item);
     }
+}
+
+PoolSnapshot Scheduler::MakePoolSnapshot() const {
+    PoolSnapshot snapshot;
+    snapshot.kv_free_pages = device_allocator_.AvailablePages();
+    snapshot.kv_evictable_pages = kv_prefix_cache_.GetDeviceManager().EvictablePagesNum();
+    if (mamba_allocator_) {
+        snapshot.mamba_free_slots = mamba_allocator_->AvailableSlots();
+    }
+    snapshot.queue_len = static_cast<std::int32_t>(WaitingSize());
+    return snapshot;
+}
+
+void Scheduler::BudgetTick() {
+    if (!budget_agent_) {
+        return;
+    }
+    budget_agent_->Tick(MakePoolSnapshot());
+}
+
+std::optional<XPoolFirePlan> Scheduler::PendingXPoolFire() const {
+    if (!budget_agent_) {
+        return std::nullopt;
+    }
+    return budget_agent_->PendingFire();
 }
 
 }  // namespace tokenspeed

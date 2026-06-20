@@ -25,7 +25,8 @@
 
 namespace tokenspeed {
 
-MambaEvictionManager::MambaEvictionManager(MambaChunkAllocator* allocator) : allocator_{allocator} {}
+MambaEvictionManager::MambaEvictionManager(MambaChunkAllocator* allocator, EvictionConfig eviction_config)
+    : allocator_{allocator}, eviction_config_{std::move(eviction_config)} {}
 
 bool MambaEvictionManager::hasChildWithMamba(const TreeNode* node) const {
     for (const auto& [_, child] : node->Children()) {
@@ -64,17 +65,13 @@ void MambaEvictionManager::UpdateLeaf(TreeNode* node) {
 }
 
 std::int32_t MambaEvictionManager::Evict(std::int32_t num_slots, TreeNode* protected_node) {
-    // TP-determinism: ties on Time() must resolve identically across ranks.
-    // mamba_leaves_ is unordered_set<TreeNode*> whose iteration order is
-    // pointer-hash-randomized per-process, so the priority_queue's push order
-    // (and thus internal heap structure for tied elements) diverges across
-    // ranks. Comparing only on Time() leaves ties resolved by heap order →
-    // different ranks evict different leaves on Time ties → cascading parent
-    // re-insertions cause mamba_leaves_ membership to permanently diverge,
-    // eventually wedging the next NCCL collective.
-    // SeqId() is assigned monotonically at TreeNode construction; all ranks
-    // construct nodes in the same order, so SeqId() is identical across ranks.
-    auto older = [](const TreeNode* a, const TreeNode* b) {
+    // TP-determinism: ties must resolve identically across ranks via SeqId.
+    auto older = [this](const TreeNode* a, const TreeNode* b) {
+        const double pa = a->EvictionPriority(eviction_config_, static_cast<std::int32_t>(a->DepthInTokens()),
+                                              eviction_config_.mamba_bytes_per_slot, /*is_mamba=*/true);
+        const double pb = b->EvictionPriority(eviction_config_, static_cast<std::int32_t>(b->DepthInTokens()),
+                                              eviction_config_.mamba_bytes_per_slot, /*is_mamba=*/true);
+        if (pa != pb) return pa > pb;
         if (a->Time() != b->Time()) return a->Time() > b->Time();
         return a->SeqId() > b->SeqId();
     };

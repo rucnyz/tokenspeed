@@ -51,6 +51,29 @@ def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
     return spec
 
 
+def compute_lpb_byte_sizes(
+    token_to_kv_pool: Any,
+    page_size: int,
+    mamba_pool: Any | None = None,
+) -> tuple[int, int]:
+    """Return (kv_bytes_per_page, mamba_bytes_per_slot) for LPB eviction."""
+    inner = getattr(token_to_kv_pool, "inner", token_to_kv_pool)
+    pool_cls = inner.__class__
+    if not hasattr(pool_cls, "cell_size"):
+        return 0, 0
+    kv_bytes_per_page = int(pool_cls.cell_size() * page_size)
+    mamba_bytes_per_slot = 0
+    if mamba_pool is not None:
+        conv = mamba_pool.conv_state
+        ssm = mamba_pool.ssm_state
+        slots = int(conv.shape[1])
+        if slots > 0:
+            conv_per_slot = conv.numel() // slots * conv.element_size()
+            ssm_per_slot = ssm.numel() // slots * ssm.element_size()
+            mamba_bytes_per_slot = int(conv_per_slot + ssm_per_slot)
+    return kv_bytes_per_page, mamba_bytes_per_slot
+
+
 def make_config(
     num_device_pages: int,
     max_scheduled_tokens: int,
@@ -72,6 +95,20 @@ def make_config(
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
     enable_mixed_prefill_decode: bool = False,
     prefix_cache_adjunct: "PrefixCacheAdjunctSpec | None" = None,
+    eviction_policy: str = "lru",
+    lpb_window_s: float = 60.0,
+    lpb_hit_deque_maxlen: int = 4096,
+    c_kv_alpha: float = 1.02e-7,
+    c_kv_beta: float = 0.0246,
+    c_kv_gamma: float = 5.97,
+    c_m: float = 0.0,
+    kv_bytes_per_page: int = 0,
+    mamba_bytes_per_slot: int = 0,
+    enable_budgeter: bool = False,
+    enable_admitter: bool = False,
+    enable_xpool_dynamic_capacity: bool = False,
+    budgeter_tick_s: float = 1.0,
+    budgeter_pages_per_fire: int = 64,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
@@ -106,6 +143,20 @@ def make_config(
     # Opt-in; unset means paged-cache groups are transport-only.
     if prefix_cache_adjunct is not None:
         cfg.prefix_cache_adjunct = prefix_cache_adjunct
+    cfg.eviction_policy = eviction_policy
+    cfg.lpb_window_s = lpb_window_s
+    cfg.lpb_hit_deque_maxlen = lpb_hit_deque_maxlen
+    cfg.c_kv_alpha = c_kv_alpha
+    cfg.c_kv_beta = c_kv_beta
+    cfg.c_kv_gamma = c_kv_gamma
+    cfg.c_m = c_m
+    cfg.kv_bytes_per_page = kv_bytes_per_page
+    cfg.mamba_bytes_per_slot = mamba_bytes_per_slot
+    cfg.enable_budgeter = enable_budgeter
+    cfg.enable_admitter = enable_admitter
+    cfg.enable_xpool_dynamic_capacity = enable_xpool_dynamic_capacity
+    cfg.budgeter_tick_s = budgeter_tick_s
+    cfg.budgeter_pages_per_fire = budgeter_pages_per_fire
     return cfg
 
 

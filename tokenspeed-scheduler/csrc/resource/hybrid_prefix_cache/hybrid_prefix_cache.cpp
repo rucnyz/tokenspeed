@@ -41,11 +41,12 @@
 namespace tokenspeed {
 
 HybridPrefixCache::HybridPrefixCache(KVPrefixCache& kv_prefix_cache, MambaChunkAllocator* mamba_allocator,
-                                     std::int32_t mamba_cache_chunk_size, MambaHostAllocator* mamba_host_allocator)
+                                     std::int32_t mamba_cache_chunk_size, MambaHostAllocator* mamba_host_allocator,
+                                     EvictionConfig eviction_config)
     : kv_prefix_cache_{kv_prefix_cache},
       mamba_allocator_{mamba_allocator},
       mamba_host_allocator_{mamba_host_allocator},
-      mamba_eviction_manager_{mamba_allocator},
+      mamba_eviction_manager_{mamba_allocator, std::move(eviction_config)},
       mamba_cache_chunk_size_{mamba_cache_chunk_size} {}
 
 MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids, MatchIntent intent) {

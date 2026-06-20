@@ -66,3 +66,20 @@ class PriorityStrategy(EvictionStrategy):
     def get_priority(self, node: "TreeNode") -> tuple[int, float]:
         # Lower priority values are evicted first; ties fall back to LRU.
         return (node.priority, node.last_access_time)
+
+
+class LPBStrategy(EvictionStrategy):
+    """Loss-per-byte eviction with LRU tiebreaking."""
+
+    def __init__(self, *, bytes_per_unit: float, cost_alpha: float, cost_beta: float, cost_gamma: float) -> None:
+        self.bytes_per_unit = max(bytes_per_unit, 1.0)
+        self.cost_alpha = cost_alpha
+        self.cost_beta = cost_beta
+        self.cost_gamma = cost_gamma
+
+    def get_priority(self, node: "TreeNode") -> tuple[float, float]:
+        seq_len = float(getattr(node, "depth_in_tokens", 0) or 0)
+        hits = float(getattr(node, "hit_count", 0) or 0)
+        cost = self.cost_alpha * seq_len * seq_len + self.cost_beta * seq_len + self.cost_gamma
+        loss_per_byte = (hits * cost) / self.bytes_per_unit
+        return (loss_per_byte, node.last_access_time)

@@ -20,40 +20,48 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
-#include <queue>
-#include <unordered_set>
+#include <optional>
+#include <string>
 #include <vector>
 
-#include "resource/radix_tree/tree_node.h"
-#include "resource/eviction_config.h"
+#include "budgeter/admitter.h"
+#include "budgeter/cost_model.h"
+#include "scheduler/types.h"
+#include "resource/types.h"
 
 namespace tokenspeed {
 
-class MambaChunkAllocator;
+class Scheduler;
 
-class MambaEvictionManager {
+struct XPoolFirePlan {
+    std::string direction;
+    std::vector<std::int32_t> page_ids;
+    cache_op_id op_id{0};
+};
+
+class BudgetAgent {
 public:
-    explicit MambaEvictionManager(MambaChunkAllocator* allocator, EvictionConfig eviction_config = {});
+    explicit BudgetAgent(const SchedulerConfig& config);
 
-    void SetEvictionConfig(EvictionConfig config) { eviction_config_ = std::move(config); }
+    void OnRequestArrival(std::int32_t prompt_tokens, const PoolSnapshot& snapshot);
+    std::optional<XPoolFirePlan> Tick(const PoolSnapshot& snapshot);
+    std::optional<XPoolFirePlan> PendingFire() const { return pending_fire_; }
+    void ClearPendingFire() { pending_fire_.reset(); }
 
-    void TrackNode(TreeNode* node);
-    void UntrackNode(TreeNode* node);
-    void UpdateLeaf(TreeNode* node);
-
-    std::int32_t Evict(std::int32_t num_slots, TreeNode* protected_node = nullptr);
-    bool EnsureCapacity(std::int32_t required_slots, TreeNode* protected_node = nullptr);
-
-    std::int32_t EvictableSlots() const;
+    const Admitter& GetAdmitter() const { return admitter_; }
 
 private:
-    bool isMambaLeaf(const TreeNode* node) const;
-    bool hasChildWithMamba(const TreeNode* node) const;
+    double ewma_pressure_kv_{0.0};
+    double ewma_pressure_mamba_{0.0};
+    std::chrono::steady_clock::time_point last_tick_{std::chrono::steady_clock::now()};
 
-    MambaChunkAllocator* allocator_;
-    EvictionConfig eviction_config_{};
-    std::unordered_set<TreeNode*> mamba_leaves_;
+    SchedulerConfig config_;
+    CostModel cost_model_;
+    Admitter admitter_;
+    std::optional<XPoolFirePlan> pending_fire_{};
+    cache_op_id next_op_id_{1};
 };
 
 }  // namespace tokenspeed
