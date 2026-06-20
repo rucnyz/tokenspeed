@@ -21,39 +21,51 @@
 #pragma once
 
 #include <cstdint>
-#include <queue>
-#include <unordered_set>
-#include <vector>
+#include <optional>
+#include <string>
 
-#include "resource/radix_tree/tree_node.h"
-#include "resource/eviction_config.h"
+#include "budgeter/cost_model.h"
 
 namespace tokenspeed {
 
-class MambaChunkAllocator;
+enum class AdmitAction {
+    kOwnFree,
+    kOwnEvict,
+    kOwnMigrate,
+    kCrossFree,
+    kCrossEvict,
+    kCrossMigrate,
+    kDefer,
+};
 
-class MambaEvictionManager {
+struct AdmitDecision {
+    AdmitAction action{AdmitAction::kDefer};
+    double cost_us{0.0};
+    std::string direction;  // "kv_to_mamba" | "mamba_to_kv" | ""
+    std::int32_t pages_needed{0};
+};
+
+struct PoolSnapshot {
+    std::int32_t kv_free_pages{0};
+    std::int32_t kv_evictable_pages{0};
+    std::int32_t mamba_free_slots{0};
+    std::int32_t mamba_evictable_slots{0};
+    std::int32_t queue_len{0};
+};
+
+class Admitter {
 public:
-    explicit MambaEvictionManager(MambaChunkAllocator* allocator, EvictionConfig eviction_config = {});
+    explicit Admitter(CostModel cost_model);
 
-    void SetEvictionConfig(EvictionConfig config) { eviction_config_ = std::move(config); }
-
-    void TrackNode(TreeNode* node);
-    void UntrackNode(TreeNode* node);
-    void UpdateLeaf(TreeNode* node);
-
-    std::int32_t Evict(std::int32_t num_slots, TreeNode* protected_node = nullptr);
-    bool EnsureCapacity(std::int32_t required_slots, TreeNode* protected_node = nullptr);
-
-    std::int32_t EvictableSlots() const;
+    AdmitDecision DecideForRequest(std::int32_t prompt_tokens, const PoolSnapshot& snapshot,
+                                   std::int32_t mamba_need_slots = 2) const;
 
 private:
-    bool isMambaLeaf(const TreeNode* node) const;
-    bool hasChildWithMamba(const TreeNode* node) const;
+    AdmitDecision decide(std::int32_t x_tokens, std::int32_t x_eff, const PoolSnapshot& snapshot,
+                         bool cross, const std::string& direction) const;
 
-    MambaChunkAllocator* allocator_;
-    EvictionConfig eviction_config_{};
-    std::unordered_set<TreeNode*> mamba_leaves_;
+    CostModel cost_model_;
+    std::int32_t pages_per_fire_{64};
 };
 
 }  // namespace tokenspeed

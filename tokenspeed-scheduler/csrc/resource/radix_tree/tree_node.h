@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -32,6 +33,7 @@
 #include <utility>
 #include <vector>
 
+#include "resource/eviction_config.h"
 #include "resource/radix_tree/mamba_slot.h"
 #include "resource/radix_tree/paged_cache_snapshot.h"
 #include "resource/radix_tree/tree_resource.h"
@@ -127,6 +129,11 @@ public:
 
     void SetPersisted(bool persisted = true);
     void Touch(timestamp_t now = std::chrono::steady_clock::now());
+    void RecordHit(timestamp_t now = std::chrono::steady_clock::now(), std::int32_t maxlen = 4096,
+                   double window_s = 60.0);
+    std::int32_t HitCountInWindow(timestamp_t now, double window_s) const;
+    double EvictionPriority(const EvictionConfig& config, std::int32_t seq_len_tokens, std::int64_t bytes,
+                            bool is_mamba) const;
     void SetPageHashes(std::vector<std::string> page_hashes);
     void SetBlockHashes(std::vector<std::uint64_t> block_hashes);
     void AddChild(const token_vec_t& key, std::unique_ptr<TreeNode>&& child);
@@ -150,6 +157,7 @@ private:
     std::vector<std::string> page_hashes_{};
     std::vector<std::uint64_t> block_hashes_{};
     timestamp_t last_access_time_{std::chrono::steady_clock::now()};
+    std::deque<timestamp_t> hit_times_{};
     seq_id_t seq_id_{};
     bool storage_persisted_{false};
     std::unique_ptr<DeviceResource> device_resource_{};

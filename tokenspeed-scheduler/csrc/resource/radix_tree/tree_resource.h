@@ -32,6 +32,7 @@
 #include "utils.h"
 #include "resource/allocator/owned_pages.h"
 #include "resource/allocator/page_allocator.h"
+#include "resource/eviction_config.h"
 #include "resource/types.h"
 
 namespace tokenspeed {
@@ -102,7 +103,11 @@ public:
     using EvictionCallback = std::function<void(TreeNode*)>;
     using timestamp_t = std::chrono::steady_clock::time_point;
 
-    explicit ResourceManager(PageAllocator* allocator) : allocator_(allocator) {}
+    explicit ResourceManager(PageAllocator* allocator, EvictionConfig eviction_config = {})
+        : allocator_(allocator), eviction_config_(std::move(eviction_config)) {}
+
+    void SetEvictionConfig(EvictionConfig config) { eviction_config_ = std::move(config); }
+    const EvictionConfig& GetEvictionConfig() const { return eviction_config_; }
 
     void SetEvictionCallback(EvictionCallback cb) { eviction_callback_ = std::move(cb); }
 
@@ -117,10 +122,13 @@ public:
     OwnedPages Allocate(std::int32_t num_pages) { return allocator_->Allocate(num_pages); }
     std::int32_t AvailablePages() const { return allocator_->AvailablePages(); }
 
-    // O(N) scan — locked leaves are in lru_leaves_ but not evictable.
+    // O(N) scan — locked leaves are in eviction_leaves_ but not evictable.
     std::int32_t EvictablePagesNum() const {
         std::int32_t total = 0;
-        for (const auto& [ts, sid, node] : lru_leaves_) {
+        for (const auto& [priority, ts, sid, node] : eviction_leaves_) {
+            (void)priority;
+            (void)ts;
+            (void)sid;
             const auto& res = GetResource<RType>(node);
             if (res.IsEvictable()) {
                 total += res.NumPages();
@@ -132,18 +140,21 @@ public:
 private:
     void removeLeaf(TreeNode* node);
     void updateLeaf(TreeNode* node);
+    double computePriority(TreeNode* node) const;
 
     PageAllocator* allocator_;
-    // Leaf nodes sorted by last-access time (oldest first = LRU eviction order).
-    // node_time_ holds each node's sort key for O(1) keyed removal.
-    // Tuple key: (Time, SeqId, TreeNode*). SeqId is the deterministic
-    // tiebreaker — pointer values would diverge across TP ranks (per-process
-    // ASLR), causing different ranks to evict different leaves on Time ties
-    // and eventually wedging the next NCCL collective. Stored as std::int64_t
-    // (not TreeNode::seq_id_t) to keep the include cycle broken — tree_node.h
-    // pulls in this header for NodeResource.
-    std::set<std::tuple<timestamp_t, std::int64_t, TreeNode*>> lru_leaves_;
-    std::unordered_map<TreeNode*, timestamp_t> node_time_;
+    EvictionConfig eviction_config_{};
+    // Leaf nodes sorted for eviction (lowest priority first). Tuple key:
+    // (priority, Time, SeqId, TreeNode*). LRU mode uses constant priority 0 so
+    // Time remains the effective primary key. node_keys_ stores each node's sort
+    // key for O(1) keyed removal.
+    std::set<std::tuple<double, timestamp_t, std::int64_t, TreeNode*>> eviction_leaves_;
+    struct EvictionSortKey {
+        double priority;
+        timestamp_t time;
+        std::int64_t seq_id;
+    };
+    std::unordered_map<TreeNode*, EvictionSortKey> node_keys_;
     EvictionCallback eviction_callback_{};
 };
 

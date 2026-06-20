@@ -117,13 +117,16 @@ std::vector<KvBlockStoredEvent> BuildBlockEventsForNode(TreeNode* target, std::i
 
 }  // namespace
 
-KVPrefixCache::KVPrefixCache(PageAllocator* device_allocator, PageAllocator* host_allocator, bool enable_l3_storage,
-                             bool disable_prefix_cache)
+KVPrefixCache::KVPrefixCache(PageAllocator* device_allocator, PageAllocator* host_allocator,
+                             EvictionConfig eviction_config, bool enable_l3_storage, bool disable_prefix_cache)
     : tree_(device_allocator->PageSize()),
-      device_(device_allocator),
-      host_(host_allocator),
+      device_(device_allocator, eviction_config),
+      host_(host_allocator, eviction_config),
       enable_l3_storage_(enable_l3_storage),
-      disable_prefix_cache_(disable_prefix_cache) {}
+      disable_prefix_cache_(disable_prefix_cache),
+      eviction_config_(std::move(eviction_config)) {
+    tree_.SetEvictionConfig(&eviction_config_);
+}
 
 void KVPrefixCache::SetKvEventSink(KvEventSink sink) {
     kv_event_sink_ = std::move(sink);

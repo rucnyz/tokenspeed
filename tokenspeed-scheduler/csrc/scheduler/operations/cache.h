@@ -196,6 +196,13 @@ struct FlatLoadBackOperation {
     }
 };
 
-using CacheOperation = std::variant<PrefetchOperation, FlatLoadBackOperation, BackUpOperation, FlatWriteBackOperation>;
+struct XPoolFireOperation {
+    cache_op_id op_id{0};
+    std::string direction;  // "kv_to_mamba" | "mamba_to_kv"
+    std::vector<std::int32_t> page_ids;
+};
+
+using CacheOperation = std::variant<PrefetchOperation, FlatLoadBackOperation, BackUpOperation, FlatWriteBackOperation,
+                                    XPoolFireOperation>;
 
 }  // namespace tokenspeed

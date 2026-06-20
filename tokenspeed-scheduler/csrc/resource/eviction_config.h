@@ -21,39 +21,32 @@
 #pragma once
 
 #include <cstdint>
-#include <queue>
-#include <unordered_set>
-#include <vector>
-
-#include "resource/radix_tree/tree_node.h"
-#include "resource/eviction_config.h"
+#include <string>
 
 namespace tokenspeed {
 
-class MambaChunkAllocator;
+enum class EvictionPolicy {
+    kLru,
+    kLpb,
+};
 
-class MambaEvictionManager {
-public:
-    explicit MambaEvictionManager(MambaChunkAllocator* allocator, EvictionConfig eviction_config = {});
+struct EvictionConfig {
+    EvictionPolicy policy{EvictionPolicy::kLru};
+    double lpb_window_s{60.0};
+    std::int32_t lpb_hit_deque_maxlen{4096};
+    // Quadratic re-prefill cost c_KV(L) = alpha*L^2 + beta*L + gamma (microseconds).
+    double c_kv_alpha{1.02e-7};
+    double c_kv_beta{0.0246};
+    double c_kv_gamma{5.97};
+    // Single-curve design: hybrid miss folds into c_KV; c_M defaults to 0.
+    double c_m{0.0};
+    std::int64_t kv_bytes_per_page{0};
+    std::int64_t mamba_bytes_per_slot{0};
+    std::int32_t mamba_cache_chunk_size{64};
 
-    void SetEvictionConfig(EvictionConfig config) { eviction_config_ = std::move(config); }
+    static EvictionPolicy ParsePolicy(const std::string& name);
 
-    void TrackNode(TreeNode* node);
-    void UntrackNode(TreeNode* node);
-    void UpdateLeaf(TreeNode* node);
-
-    std::int32_t Evict(std::int32_t num_slots, TreeNode* protected_node = nullptr);
-    bool EnsureCapacity(std::int32_t required_slots, TreeNode* protected_node = nullptr);
-
-    std::int32_t EvictableSlots() const;
-
-private:
-    bool isMambaLeaf(const TreeNode* node) const;
-    bool hasChildWithMamba(const TreeNode* node) const;
-
-    MambaChunkAllocator* allocator_;
-    EvictionConfig eviction_config_{};
-    std::unordered_set<TreeNode*> mamba_leaves_;
+    double RecomputeCostUs(double seq_len_tokens, bool is_mamba) const;
 };
 
 }  // namespace tokenspeed

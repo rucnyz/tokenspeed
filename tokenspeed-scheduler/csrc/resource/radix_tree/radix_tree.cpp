@@ -182,6 +182,9 @@ WalkResult RadixTree::WalkDownUtilMismatch(token_slice aligned_tokens, TreeNode:
         }
 
         child->Touch(access_time);
+        if (eviction_config_ != nullptr && eviction_config_->policy == EvictionPolicy::kLpb) {
+            child->RecordHit(access_time, eviction_config_->lpb_hit_deque_maxlen, eviction_config_->lpb_window_s);
+        }
 
         update_tier(device_alive, result.match.device, child, child->OnDevice());
         update_tier(host_alive, result.match.host, child, child->OnHost());

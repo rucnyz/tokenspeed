@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "resource/types.h"
+#include "resource/eviction_config.h"
 #include "resource/radix_tree/tree_node.h"
 
 namespace tokenspeed {
@@ -66,6 +67,8 @@ public:
     WalkResult WalkDownUtilMismatch(token_slice aligned_tokens, TreeNode::timestamp_t access_time,
                                     TreeNode* start_node = nullptr);
 
+    void SetEvictionConfig(const EvictionConfig* config) { eviction_config_ = config; }
+
     TreeNode* PruneEmptyByNode(TreeNode* node);
 
     // Find or create the node at depth_in_tokens on descendant's root path.
@@ -80,6 +83,7 @@ private:
     std::int32_t page_size_;
     std::unique_ptr<TreeNode> root_;
     NodeDestroyCallback node_destroy_callback_{};
+    const EvictionConfig* eviction_config_{nullptr};
 };
 
 }  // namespace tokenspeed

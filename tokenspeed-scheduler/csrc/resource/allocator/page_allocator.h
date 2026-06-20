@@ -21,7 +21,10 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <vector>
+
+#include "resource/allocator/capped_free_list.h"
 
 namespace tokenspeed {
 
@@ -29,7 +32,7 @@ class OwnedPages;
 
 class PageAllocator {
 public:
-    PageAllocator(std::int32_t page_size, std::int32_t total_pages);
+    PageAllocator(std::int32_t page_size, std::int32_t total_pages, bool enable_dynamic_capacity = false);
 
     PageAllocator(const PageAllocator&) = delete;
     PageAllocator& operator=(const PageAllocator&) = delete;
@@ -42,12 +45,22 @@ public:
 
     std::int32_t PageSize() const { return page_size_; };
     std::int32_t TotalPages() const { return total_pages_; }
-    std::int32_t AvailablePages() const { return static_cast<std::int32_t>(free_pages_.size()); }
+    std::int32_t MappedPages() const { return mapped_pages_; }
+    std::int32_t AvailablePages() const;
+    bool DynamicCapacityEnabled() const { return enable_dynamic_capacity_; }
+
+    std::vector<std::int32_t> Grow(std::int32_t num_pages);
+    bool Shrink(std::int32_t num_pages);
+    void CapPages(const std::vector<std::int32_t>& page_ids);
+    void UncapPages(const std::vector<std::int32_t>& page_ids);
 
 private:
     std::int32_t page_size_{};
     std::int32_t total_pages_{};
+    std::int32_t mapped_pages_{0};
+    bool enable_dynamic_capacity_{false};
     std::vector<std::int32_t> free_pages_;
+    CappedFreeList capped_free_list_{};
 };
 
 }  // namespace tokenspeed

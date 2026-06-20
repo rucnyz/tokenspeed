@@ -18,42 +18,27 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#pragma once
+#include <gtest/gtest.h>
 
-#include <cstdint>
-#include <queue>
-#include <unordered_set>
-#include <vector>
+#include "budgeter/admitter.h"
+#include "budgeter/cost_model.h"
 
-#include "resource/radix_tree/tree_node.h"
-#include "resource/eviction_config.h"
+namespace tokenspeed::test {
 
-namespace tokenspeed {
+TEST(AdmitterSevenTest, OwnFreeWhenBothPoolsHaveCapacity) {
+    CostModel model;
+    Admitter admitter(model);
+    PoolSnapshot snap{.kv_free_pages = 128, .mamba_free_slots = 8, .queue_len = 0};
+    auto decision = admitter.DecideForRequest(32, snap);
+    EXPECT_EQ(decision.action, AdmitAction::kOwnFree);
+}
 
-class MambaChunkAllocator;
+TEST(AdmitterSevenTest, DeferWhenBothPoolsStarved) {
+    CostModel model;
+    Admitter admitter(model);
+    PoolSnapshot snap{.kv_free_pages = 0, .mamba_free_slots = 0, .queue_len = 3};
+    auto decision = admitter.DecideForRequest(128, snap);
+    EXPECT_EQ(decision.action, AdmitAction::kDefer);
+}
 
-class MambaEvictionManager {
-public:
-    explicit MambaEvictionManager(MambaChunkAllocator* allocator, EvictionConfig eviction_config = {});
-
-    void SetEvictionConfig(EvictionConfig config) { eviction_config_ = std::move(config); }
-
-    void TrackNode(TreeNode* node);
-    void UntrackNode(TreeNode* node);
-    void UpdateLeaf(TreeNode* node);
-
-    std::int32_t Evict(std::int32_t num_slots, TreeNode* protected_node = nullptr);
-    bool EnsureCapacity(std::int32_t required_slots, TreeNode* protected_node = nullptr);
-
-    std::int32_t EvictableSlots() const;
-
-private:
-    bool isMambaLeaf(const TreeNode* node) const;
-    bool hasChildWithMamba(const TreeNode* node) const;
-
-    MambaChunkAllocator* allocator_;
-    EvictionConfig eviction_config_{};
-    std::unordered_set<TreeNode*> mamba_leaves_;
-};
-
-}  // namespace tokenspeed
+}  // namespace tokenspeed::test

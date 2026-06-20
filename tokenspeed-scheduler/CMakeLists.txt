@@ -39,9 +39,11 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/core/token_container.cpp
 
     csrc/resource/types.cpp
+    csrc/resource/eviction_config.cpp
     csrc/resource/allocator/kv_allocator.cpp
     csrc/resource/allocator/owned_pages.cpp
     csrc/resource/allocator/page_allocator.cpp
+    csrc/resource/allocator/capped_free_list.cpp
     csrc/resource/allocator/paged_cache_group.cpp
     csrc/resource/allocator/req_pool_allocator.cpp
     csrc/resource/page_container.cpp
@@ -69,6 +71,9 @@ add_library(tokenspeed_scheduler_core STATIC
 
     csrc/cache/kv_cache_coordinator.cpp
     csrc/cache/forward_cache_ops.cpp
+    csrc/budgeter/cost_model.cpp
+    csrc/budgeter/admitter.cpp
+    csrc/budgeter/budget_agent.cpp
 )
 
 target_include_directories(tokenspeed_scheduler_core
@@ -160,6 +165,9 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_mamba_integration.cpp
         tests/cpp/test_kv_cache_events.cpp
         tests/cpp/test_eviction_lru.cpp
+        tests/cpp/test_eviction_lpb.cpp
+        tests/cpp/test_capped_free_list.cpp
+        tests/cpp/test_admitter_seven.cpp
         tests/cpp/test_host_node_ref_lifetime.cpp
         tests/cpp/test_hybrid_takefirst_overflow.cpp
     )

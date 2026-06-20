@@ -86,6 +86,8 @@ void TreeNode::SplitSelfInto(TreeNode& prefix, std::size_t prefix_pages, std::in
 
     prefix.storage_persisted_ = storage_persisted_;
     prefix.last_access_time_ = last_access_time_;
+    prefix.hit_times_ = std::move(hit_times_);
+    hit_times_.clear();
 
     if (device_resource_ != nullptr) {
         std::int32_t ref_count = device_resource_->RefCount();
@@ -118,6 +120,54 @@ void TreeNode::SetPersisted(bool persisted) {
 
 void TreeNode::Touch(timestamp_t now) {
     last_access_time_ = now;
+}
+
+void TreeNode::RecordHit(timestamp_t now, std::int32_t maxlen, double window_s) {
+    hit_times_.push_back(now);
+    if (maxlen > 0) {
+        while (static_cast<std::int32_t>(hit_times_.size()) > maxlen) {
+            hit_times_.pop_front();
+        }
+    }
+    if (window_s > 0.0) {
+        const auto window = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(window_s));
+        const auto cutoff = now - window;
+        while (!hit_times_.empty() && hit_times_.front() < cutoff) {
+            hit_times_.pop_front();
+        }
+    }
+}
+
+std::int32_t TreeNode::HitCountInWindow(timestamp_t now, double window_s) const {
+    if (hit_times_.empty() || window_s <= 0.0) {
+        return 0;
+    }
+    const auto window = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(window_s));
+    const auto cutoff = now - window;
+    std::int32_t count = 0;
+    for (auto it = hit_times_.rbegin(); it != hit_times_.rend(); ++it) {
+        if (*it < cutoff) {
+            break;
+        }
+        ++count;
+    }
+    return count;
+}
+
+double TreeNode::EvictionPriority(const EvictionConfig& config, std::int32_t seq_len_tokens, std::int64_t bytes,
+                                  bool is_mamba) const {
+    if (config.policy == EvictionPolicy::kLru) {
+        return 0.0;
+    }
+    if (bytes <= 0) {
+        return 0.0;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double n_b = static_cast<double>(HitCountInWindow(now, config.lpb_window_s));
+    const double c_s = config.RecomputeCostUs(static_cast<double>(seq_len_tokens), is_mamba);
+    return (n_b * c_s) / static_cast<double>(bytes);
 }
 
 void TreeNode::SetPageHashes(std::vector<std::string> page_hashes) {

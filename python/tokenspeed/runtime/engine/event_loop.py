@@ -58,6 +58,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_to_payload,
     cache_sync_debug_enabled,
     make_config,
+    compute_lpb_byte_sizes,
     pool_to_paged_cache_groups,
     pool_to_prefix_cache_adjunct_spec,
     pop_common_cache_event_payloads,
@@ -379,6 +380,11 @@ class EventLoop:
         required_groups = token_to_kv_pool.prefix_cache_required_group_ids
         if required_groups is not None and server_args.enable_prefix_caching:
             prefix_cache_adjunct = pool_to_prefix_cache_adjunct_spec(required_groups)
+        kv_bytes_per_page, mamba_bytes_per_slot = compute_lpb_byte_sizes(
+            token_to_kv_pool,
+            server_args.block_size,
+            mamba_pool=mamba_pool,
+        )
         scheduler_cfg = make_config(
             num_device_pages=self.max_total_num_tokens // server_args.block_size,
             max_scheduled_tokens=server_args.chunked_prefill_size,
@@ -401,6 +407,20 @@ class EventLoop:
             paged_cache_groups=paged_cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
             prefix_cache_adjunct=prefix_cache_adjunct,
+            eviction_policy=server_args.radix_eviction_policy,
+            lpb_window_s=server_args.lpb_window_s,
+            lpb_hit_deque_maxlen=server_args.lpb_hit_deque_maxlen,
+            c_kv_alpha=server_args.csigma_kv_alpha,
+            c_kv_beta=server_args.csigma_kv_beta,
+            c_kv_gamma=server_args.csigma_kv_gamma,
+            c_m=server_args.csigma_m,
+            kv_bytes_per_page=kv_bytes_per_page,
+            mamba_bytes_per_slot=mamba_bytes_per_slot,
+            enable_budgeter=server_args.enable_budgeter,
+            enable_admitter=server_args.enable_admitter,
+            enable_xpool_dynamic_capacity=server_args.enable_xpool_dynamic_capacity,
+            budgeter_tick_s=server_args.budgeter_tick_s,
+            budgeter_pages_per_fire=server_args.budgeter_pages_per_fire,
         )
         logger.info(
             "Scheduler config: block_size=%s num_device_pages=%s "
@@ -424,6 +444,8 @@ class EventLoop:
             [group.group_id for group in paged_cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)
+        self._budgeter_tick_s = float(server_args.budgeter_tick_s)
+        self._last_budget_tick = 0.0
         token_to_kv_pool.bind_paged_cache_scheduler(self.scheduler)
         if attn_tp_rank == 0:
             self.kv_event_publisher = EventPublisherFactory.create(
@@ -1117,6 +1139,18 @@ class EventLoop:
             return False
         return True
 
+    def _maybe_budget_tick(self) -> None:
+        if self._budgeter_tick_s <= 0:
+            return
+        now = time.monotonic()
+        if self._last_budget_tick == 0.0:
+            self._last_budget_tick = now
+            return
+        if now - self._last_budget_tick < self._budgeter_tick_s:
+            return
+        self.scheduler.budget_tick()
+        self._last_budget_tick = now
+
     def _process_new_requests(self):
         recv_reqs = self.request_handler.recv_reqs()
         # Snapshot the pause state before dispatch: process_requests may flip it
@@ -1580,6 +1614,7 @@ class EventLoop:
             # _process_new_requests so the drain's TP collective ordering is
             # rank-identical every cycle.
             self._drain_ready_epd_embeddings()
+            self._maybe_budget_tick()
             self._commit_cache_results()
             if self._pause.forward_blocked:
                 self._paused_idle_step()
@@ -1728,6 +1763,7 @@ class EventLoop:
                 self.model_executor.execution_stream
             )
             self._process_new_requests()
+            self._maybe_budget_tick()
             self._commit_cache_results()
             if self._pause.forward_blocked:
                 # Freeze: commit any in-flight (overlapped) step — a forward

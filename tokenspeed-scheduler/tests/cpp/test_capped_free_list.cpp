@@ -18,42 +18,29 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#pragma once
+#include <gtest/gtest.h>
 
-#include <cstdint>
-#include <queue>
-#include <unordered_set>
-#include <vector>
+#include "resource/allocator/capped_free_list.h"
+#include "resource/allocator/page_allocator.h"
 
-#include "resource/radix_tree/tree_node.h"
-#include "resource/eviction_config.h"
+namespace tokenspeed::test {
 
-namespace tokenspeed {
+TEST(CappedFreeListTest, CappedPagesNeverReenterFreeList) {
+    CappedFreeList list;
+    list.Reset(8, {1, 2, 3, 4, 5, 6, 7});
+    list.MarkCapped(3);
+    auto page = list.Allocate();
+    ASSERT_TRUE(page.has_value());
+    EXPECT_NE(*page, 3);
+    EXPECT_THROW(list.Deallocate(3), std::runtime_error);
+}
 
-class MambaChunkAllocator;
+TEST(CappedFreeListTest, GrowMakesPagesAllocatable) {
+    PageAllocator alloc(4, 16, /*dynamic=*/true);
+    auto grown = alloc.Grow(2);
+    ASSERT_EQ(grown.size(), 2u);
+    auto pages = alloc.Allocate(1);
+    EXPECT_FALSE(pages.Empty());
+}
 
-class MambaEvictionManager {
-public:
-    explicit MambaEvictionManager(MambaChunkAllocator* allocator, EvictionConfig eviction_config = {});
-
-    void SetEvictionConfig(EvictionConfig config) { eviction_config_ = std::move(config); }
-
-    void TrackNode(TreeNode* node);
-    void UntrackNode(TreeNode* node);
-    void UpdateLeaf(TreeNode* node);
-
-    std::int32_t Evict(std::int32_t num_slots, TreeNode* protected_node = nullptr);
-    bool EnsureCapacity(std::int32_t required_slots, TreeNode* protected_node = nullptr);
-
-    std::int32_t EvictableSlots() const;
-
-private:
-    bool isMambaLeaf(const TreeNode* node) const;
-    bool hasChildWithMamba(const TreeNode* node) const;
-
-    MambaChunkAllocator* allocator_;
-    EvictionConfig eviction_config_{};
-    std::unordered_set<TreeNode*> mamba_leaves_;
-};
-
-}  // namespace tokenspeed
+}  // namespace tokenspeed::test
