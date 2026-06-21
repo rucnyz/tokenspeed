@@ -82,8 +82,8 @@ Scheduler::Scheduler(SchedulerConfig config)
                         config_.enable_xpool_dynamic_capacity},
       host_allocator_{config_.page_size, config_.host_allocator.total_pages},
       mamba_allocator_{},
-      kv_prefix_cache_{&device_allocator_, &host_allocator_, MakeEvictionConfig(config_),
-                       config_.enable_l3_storage, config_.disable_prefix_cache},
+      kv_prefix_cache_{&device_allocator_, &host_allocator_,
+                       config_.enable_l3_storage, config_.disable_prefix_cache, MakeEvictionConfig(config_)},
       req_pool_allocator_{config_.max_batch_size} {
     if (auto* env = std::getenv("SPDLOG_LEVEL")) {
         std::string level_str{env};

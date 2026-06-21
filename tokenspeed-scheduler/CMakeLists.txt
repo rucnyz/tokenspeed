@@ -18,13 +18,16 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(spdlog)
 
-find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
-execute_process(
-    COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
-    OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE nanobind_ROOT
-)
-find_package(nanobind CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
+
+if(TOKENSPEED_SCHEDULER_BUILD_PYTHON)
+    find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+    execute_process(
+        COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+        OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE nanobind_ROOT
+    )
+    find_package(nanobind CONFIG REQUIRED)
+endif()
 
 add_library(tokenspeed_scheduler_core STATIC
     csrc/core/token_container.cpp

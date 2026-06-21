@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include "resource/allocator/capped_free_list.h"
+#include "resource/allocator/owned_pages.h"
 #include "resource/allocator/page_allocator.h"
 
 namespace tokenspeed::test {

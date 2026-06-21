@@ -34,15 +34,16 @@ namespace tokenspeed {
 PageAllocator::PageAllocator(std::int32_t page_size, std::int32_t total_pages, bool enable_dynamic_capacity)
     : page_size_(page_size),
       total_pages_(total_pages),
-      mapped_pages_(total_pages > 0 ? total_pages - 1 : 0),
+      mapped_pages_(enable_dynamic_capacity ? 0 : (total_pages > 0 ? total_pages - 1 : 0)),
       enable_dynamic_capacity_(enable_dynamic_capacity) {
-    free_pages_.reserve(static_cast<std::size_t>(total_pages_));
-    for (std::int32_t i = 1; i < total_pages_; ++i) {
-        free_pages_.push_back(i);
-    }
     if (enable_dynamic_capacity_) {
-        capped_free_list_.Reset(total_pages_, free_pages_);
-        free_pages_.clear();
+        // Dynamic mode: start with no pages available; caller uses Grow() to expand.
+        capped_free_list_.Reset(total_pages_, {});
+    } else {
+        free_pages_.reserve(static_cast<std::size_t>(total_pages_));
+        for (std::int32_t i = 1; i < total_pages_; ++i) {
+            free_pages_.push_back(i);
+        }
     }
 }
 
@@ -109,7 +110,7 @@ std::vector<std::int32_t> PageAllocator::Grow(std::int32_t num_pages) {
     if (!enable_dynamic_capacity_ || num_pages <= 0) {
         return {};
     }
-    if (mapped_pages_ + num_pages >= total_pages_) {
+    if (mapped_pages_ + num_pages > total_pages_ - 1) {
         throw std::runtime_error("PageAllocator::Grow: exceeds reserved capacity");
     }
     const std::int32_t old_mapped = mapped_pages_;

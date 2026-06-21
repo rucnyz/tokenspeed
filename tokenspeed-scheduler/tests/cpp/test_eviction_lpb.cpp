@@ -50,7 +50,9 @@ protected:
 
     void SetUp() override {
         device_alloc_ = std::make_unique<PageAllocator>(kPageSize, kTotalPages);
-        cache_ = std::make_unique<KVPrefixCache>(device_alloc_.get(), /*host=*/nullptr, MakeLPBConfig());
+        cache_ = std::make_unique<KVPrefixCache>(device_alloc_.get(), /*host=*/nullptr,
+                                                   /*enable_l3_storage=*/false,
+                                                   /*disable_prefix_cache=*/false, MakeLPBConfig());
     }
 
     InsertResult Insert(int32_t num_pages, token_t start = 1, TreeNode* from = nullptr) {
@@ -89,7 +91,8 @@ TEST_F(EvictionLPBTest, LRUModeEquivalentToBaseline) {
     EvictionConfig lru_cfg;
     lru_cfg.policy = EvictionPolicy::kLru;
     lru_cfg.kv_bytes_per_page = kBytesPerPage;
-    KVPrefixCache lru_cache(device_alloc_.get(), nullptr, lru_cfg);
+    KVPrefixCache lru_cache(device_alloc_.get(), nullptr,
+                            /*enable_l3_storage=*/false, /*disable_prefix_cache=*/false, lru_cfg);
 
     auto tokens_a = MakeAlignedTokens(1, kPageSize, 1);
     auto tokens_b = MakeAlignedTokens(1, kPageSize, 5);
