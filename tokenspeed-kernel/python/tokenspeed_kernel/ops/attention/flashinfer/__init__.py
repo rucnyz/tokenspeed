@@ -125,7 +125,10 @@ def _topk_lens_or_count(
     return (topk_slots >= 0).sum(dim=-1, dtype=torch.int32).contiguous()
 
 
-if platform.is_nvidia and platform.is_hopper_plus:
+if platform.is_nvidia and platform.is_hpc_blackwell:
+    # TRT-LLM FMHA runner only supports HPC Blackwell (sm_100 / sm_103).
+    # Consumer Blackwell (sm_120+, major >= 12) is NOT supported here;
+    # use the Triton portable kernel instead on those platforms.
 
     @register_kernel(
         "attention",
@@ -134,6 +137,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         solution="flashinfer",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 99),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(
@@ -213,6 +217,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         solution="flashinfer",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 99),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(

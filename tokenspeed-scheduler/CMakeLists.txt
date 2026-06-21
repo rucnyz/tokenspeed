@@ -177,6 +177,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_eviction_lpb.cpp
         tests/cpp/test_capped_free_list.cpp
         tests/cpp/test_admitter_seven.cpp
+        tests/cpp/test_budgeter.cpp
         tests/cpp/test_host_node_ref_lifetime.cpp
         tests/cpp/test_hybrid_takefirst_overflow.cpp
     )
