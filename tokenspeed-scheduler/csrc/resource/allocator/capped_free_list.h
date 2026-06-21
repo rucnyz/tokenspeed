@@ -49,6 +49,10 @@ public:
     std::int32_t NumCapped() const { return n_capped_; }
     std::int32_t Size() const { return size_; }
 
+    // Returns the number of capped pages that are still allocated (in-flight).
+    // Zero means all capped pages have been freed and it is safe to unmap.
+    std::int32_t InFlightCappedCount() const;
+
 private:
     bool inTail(std::int32_t page_id) const;
 
@@ -57,6 +61,9 @@ private:
     std::int32_t tail_lo_{kNoTail};
     std::vector<std::int32_t> free_ids_{};
     std::unordered_set<std::int32_t> marks_{};
+    // Tracks capped pages that have been returned via Deallocate (drained).
+    // InFlightCappedCount = n_capped_ - capped_drained_.size().
+    std::unordered_set<std::int32_t> capped_drained_{};
 };
 
 }  // namespace tokenspeed

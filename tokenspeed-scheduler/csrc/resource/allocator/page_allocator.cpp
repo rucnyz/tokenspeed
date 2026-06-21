@@ -115,6 +115,13 @@ std::vector<std::int32_t> PageAllocator::Grow(std::int32_t num_pages) {
     }
     const std::int32_t old_mapped = mapped_pages_;
     mapped_pages_ += num_pages;
+    // The newly mapped pages may currently sit inside a tail-cap region left by
+    // a prior Shrink (pages lent to the peer pool). Raise the cap barrier above
+    // them first so they are no longer considered capped, then return them to
+    // the free list. Always re-asserting the barrier at mapped_pages_ + 1 keeps
+    // Grow correct for both the initial baseline restore (no prior tail) and
+    // reclaiming previously lent-out pages.
+    capped_free_list_.SetCap(mapped_pages_ + 1);
     std::vector<std::int32_t> grown;
     grown.reserve(static_cast<std::size_t>(num_pages));
     for (std::int32_t page_id = old_mapped + 1; page_id <= mapped_pages_; ++page_id) {
@@ -152,6 +159,13 @@ void PageAllocator::UncapPages(const std::vector<std::int32_t>& page_ids) {
     for (std::int32_t page_id : page_ids) {
         capped_free_list_.UnmarkCapped(page_id);
     }
+}
+
+std::int32_t PageAllocator::CappedInflightPages() const {
+    if (!enable_dynamic_capacity_) {
+        return 0;
+    }
+    return capped_free_list_.InFlightCappedCount();
 }
 
 }  // namespace tokenspeed

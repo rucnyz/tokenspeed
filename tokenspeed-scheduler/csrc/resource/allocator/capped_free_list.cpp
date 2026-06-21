@@ -30,6 +30,7 @@ void CappedFreeList::Reset(std::int32_t size, std::vector<std::int32_t> initial_
     n_capped_ = 0;
     tail_lo_ = kNoTail;
     marks_.clear();
+    capped_drained_.clear();
     free_ids_ = std::move(initial_free);
     std::sort(free_ids_.begin(), free_ids_.end());
 }
@@ -58,7 +59,9 @@ void CappedFreeList::MarkCapped(std::int32_t page_id) {
     }
     auto it = std::find(free_ids_.begin(), free_ids_.end(), page_id);
     if (it != free_ids_.end()) {
+        // Page was free; removing it makes it immediately drained.
         free_ids_.erase(it);
+        capped_drained_.insert(page_id);
     }
     marks_.insert(page_id);
     ++n_capped_;
@@ -73,6 +76,8 @@ void CappedFreeList::UnmarkCapped(std::int32_t page_id) {
     }
     marks_.erase(page_id);
     --n_capped_;
+    // Remove from drained set; the page is live again.
+    capped_drained_.erase(page_id);
     free_ids_.push_back(page_id);
     std::sort(free_ids_.begin(), free_ids_.end());
 }
@@ -80,6 +85,10 @@ void CappedFreeList::UnmarkCapped(std::int32_t page_id) {
 void CappedFreeList::SetCap(std::int32_t tail_lo) {
     if (tail_lo == kNoTail) {
         if (tail_lo_ != kNoTail) {
+            // Entire tail cap lifted: remove those pages from the drain set.
+            for (std::int32_t id = tail_lo_; id < size_; ++id) {
+                capped_drained_.erase(id);
+            }
             n_capped_ -= (size_ - tail_lo_);
             tail_lo_ = kNoTail;
         }
@@ -89,13 +98,32 @@ void CappedFreeList::SetCap(std::int32_t tail_lo) {
         throw std::invalid_argument("CappedFreeList::SetCap: tail_lo out of range");
     }
     if (tail_lo_ != kNoTail) {
+        if (tail_lo > tail_lo_) {
+            // Cap raised (Grow): pages in [old_tail_lo, tail_lo) become live again.
+            for (std::int32_t id = tail_lo_; id < tail_lo; ++id) {
+                capped_drained_.erase(id);
+            }
+        }
         n_capped_ -= (size_ - tail_lo_);
     }
     tail_lo_ = tail_lo;
     n_capped_ += (size_ - tail_lo_);
-    free_ids_.erase(std::remove_if(free_ids_.begin(), free_ids_.end(),
-                                   [this](std::int32_t id) { return inTail(id) || IsCapped(id); }),
-                    free_ids_.end());
+    // Remove newly capped free pages from free_ids_ and mark them drained.
+    free_ids_.erase(
+        std::remove_if(free_ids_.begin(), free_ids_.end(),
+                       [this](std::int32_t id) {
+                           if (inTail(id) || IsCapped(id)) {
+                               capped_drained_.insert(id);
+                               return true;
+                           }
+                           return false;
+                       }),
+        free_ids_.end());
+}
+
+std::int32_t CappedFreeList::InFlightCappedCount() const {
+    // In-flight = capped but not yet freed via Deallocate.
+    return n_capped_ - static_cast<std::int32_t>(capped_drained_.size());
 }
 
 std::optional<std::int32_t> CappedFreeList::Allocate() {
@@ -117,7 +145,11 @@ void CappedFreeList::Deallocate(std::int32_t page_id) {
         throw std::out_of_range("CappedFreeList::Deallocate: page_id out of range");
     }
     if (IsCapped(page_id)) {
-        throw std::runtime_error("CappedFreeList::Deallocate: capped page cannot re-enter free list");
+        // Page is capped (lent to peer pool via Shrink).  Mark it drained so
+        // InFlightCappedCount() eventually reaches zero, enabling safe unmap.
+        // Do NOT return it to the free list; it will be reclaimed by Grow.
+        capped_drained_.insert(page_id);
+        return;
     }
     free_ids_.push_back(page_id);
     std::sort(free_ids_.begin(), free_ids_.end());

@@ -22,7 +22,8 @@
 
 These tests exercise the control/execution plane with fake arenas and need no
 GPU: they verify that a fire plan is dispatched to the correct pools in the
-correct order, and that the EventLoop de-dups latched plans by op_id.
+correct order, that the EventLoop de-dups latched plans by op_id, and that
+``scheduler.apply_xpool_fire`` is called after VMM ops complete.
 """
 
 from __future__ import annotations
@@ -45,6 +46,16 @@ class _FakeArena:
 
     def transfer_in(self, chunk_ids: list[int]) -> None:
         self.calls.append(("in", list(chunk_ids)))
+
+
+class _FakeScheduler:
+    """Records apply_xpool_fire calls."""
+
+    def __init__(self) -> None:
+        self.applied: list[object] = []
+
+    def apply_xpool_fire(self, plan: object) -> None:
+        self.applied.append(plan)
 
 
 def test_mamba_to_kv_unmaps_source_then_maps_dest() -> None:
@@ -73,6 +84,38 @@ def test_unknown_direction_raises() -> None:
 
     with pytest.raises(ValueError, match="unknown fire direction"):
         actuator._execute_locked(FirePlan(direction="sideways", page_ids=[1]))
+
+
+def test_scheduler_apply_called_after_vmm_ops() -> None:
+    """apply_xpool_fire must be called AFTER the VMM transfer completes."""
+    kv, mamba = _FakeArena(), _FakeArena()
+    sched = _FakeScheduler()
+    actuator = XPoolActuator(kv_arena=kv, mamba_arena=mamba, scheduler=sched)
+
+    cpp_plan = SimpleNamespace(op_id=7, direction="mamba_to_kv", page_ids=[1])
+    plan = FirePlan(direction="mamba_to_kv", page_ids=[1], op_id=7, cpp_plan=cpp_plan)
+    actuator._execute_locked(plan)
+
+    # VMM ops happened.
+    assert mamba.calls == [("out", [1])]
+    assert kv.calls == [("in", [1])]
+    # Scheduler was notified.
+    assert sched.applied == [cpp_plan]
+
+
+def test_scheduler_not_called_when_none() -> None:
+    """No error when scheduler is not provided (control-only mode)."""
+    kv, mamba = _FakeArena(), _FakeArena()
+    actuator = XPoolActuator(kv_arena=kv, mamba_arena=mamba, scheduler=None)
+
+    plan = FirePlan(
+        direction="mamba_to_kv",
+        page_ids=[1],
+        op_id=1,
+        cpp_plan=SimpleNamespace(),
+    )
+    actuator._execute_locked(plan)  # must not raise
+    assert kv.calls == [("in", [1])]
 
 
 def _actuator_with_recorder():
