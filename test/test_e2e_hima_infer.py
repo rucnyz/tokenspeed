@@ -144,7 +144,7 @@ def test_lpb_vs_lru_cache_hits():
     print("  ✓ LPB >= LRU")
 
 
-def test_xpool_actuator_init_and_fire():
+def manual_test_xpool_actuator_init_and_fire():
     """Verify HiMA Phase 2 end-to-end: actuator starts, budgeter ticks fire."""
     import logging
 
@@ -205,5 +205,5 @@ if __name__ == "__main__":
     test_lpb_prefix_cache_hits()
     test_budgeter_does_not_crash()
     test_lpb_vs_lru_cache_hits()
-    test_xpool_actuator_init_and_fire()
+    manual_test_xpool_actuator_init_and_fire()
     print("\n===== All HiMA e2e inference tests PASSED =====")
