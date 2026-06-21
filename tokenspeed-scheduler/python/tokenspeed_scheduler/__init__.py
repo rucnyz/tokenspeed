@@ -35,6 +35,7 @@ from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution p
     Scheduler,
     SchedulerConfig,
     SchedulerStats,
+    XPoolFirePlan,
 )
 
 PD = _ext.PD
@@ -85,6 +86,7 @@ __all__ = [
     "FLAT_KVCACHE",
     # Execution plan & operations
     "ExecutionPlan",
+    "XPoolFirePlan",
     "Forward",
     "PD",
     "Cache",

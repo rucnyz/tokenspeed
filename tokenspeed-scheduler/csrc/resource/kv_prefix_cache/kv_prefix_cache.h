@@ -45,8 +45,8 @@ using KvEventSink = std::function<void(KvCacheEvent)>;
 class KVPrefixCache {
 public:
     KVPrefixCache(PageAllocator* device_allocator, PageAllocator* host_allocator,
-                  EvictionConfig eviction_config = {}, bool enable_l3_storage = false,
-                  bool disable_prefix_cache = false);
+                  bool enable_l3_storage = false, bool disable_prefix_cache = false,
+                  EvictionConfig eviction_config = {});
 
     const EvictionConfig& GetEvictionConfig() const { return eviction_config_; }
 
@@ -85,6 +85,7 @@ public:
 
     std::int32_t PageSize() const { return tree_.PageSize(); }
     DeviceManager& GetDeviceManager() { return device_; }
+    const DeviceManager& GetDeviceManager() const { return device_; }
     HostManager& GetHostManager() { return host_; }
 
     // Adjunct managers may need to materialize boundary nodes via SplitAt.
