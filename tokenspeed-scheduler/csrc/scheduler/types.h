@@ -130,6 +130,13 @@ struct SchedulerConfig {
     std::int32_t xpool_mamba_floor_slots{32};
     double xpool_xfer_us_per_page{70.0};
     double xpool_queue_wait_us{1000.0};
+
+    // Initial live capacity for dynamic mode. The VA window (total_pages /
+    // mamba_pool_total_chunks) should be larger than these values to leave room
+    // for inter-pool transfers in both directions.  0 means "fill to maximum"
+    // (= total_pages - 1 for KV, = mamba_pool_total_chunks for mamba).
+    std::int32_t xpool_initial_kv_pages{0};
+    std::int32_t xpool_initial_mamba_slots{0};
 };
 
 }  // namespace tokenspeed

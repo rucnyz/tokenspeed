@@ -47,8 +47,10 @@ struct AdmitDecision {
 
 struct PoolSnapshot {
     std::int32_t kv_free_pages{0};
+    std::int32_t kv_total_pages{0};
     std::int32_t kv_evictable_pages{0};
     std::int32_t mamba_free_slots{0};
+    std::int32_t mamba_total_slots{0};
     std::int32_t mamba_evictable_slots{0};
     std::int32_t queue_len{0};
 };

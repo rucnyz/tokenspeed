@@ -79,14 +79,12 @@ std::optional<XPoolFirePlan> BudgetAgent::Tick(const PoolSnapshot& snapshot) {
         return std::nullopt;
     }
 
-    const double kv_util = snapshot.kv_free_pages > 0
-                               ? 1.0 - static_cast<double>(snapshot.kv_free_pages) /
-                                           static_cast<double>(std::max(snapshot.kv_free_pages, 1))
-                               : 1.0;
-    const double mamba_util = snapshot.mamba_free_slots > 0
-                                  ? 1.0 - static_cast<double>(snapshot.mamba_free_slots) /
-                                              static_cast<double>(std::max(snapshot.mamba_free_slots, 1))
-                                  : 1.0;
+    // Utilisation = 1 - free / total.  Guard against zero total (pool not yet
+    // initialised) by clamping the denominator to at least 1.
+    const double kv_util = 1.0 - static_cast<double>(snapshot.kv_free_pages) /
+                                     static_cast<double>(std::max(snapshot.kv_total_pages, 1));
+    const double mamba_util = 1.0 - static_cast<double>(snapshot.mamba_free_slots) /
+                                        static_cast<double>(std::max(snapshot.mamba_total_slots, 1));
     const double eta = config_.xpool_ewma_tau_s > 0.0 ? std::min(1.0, dt / config_.xpool_ewma_tau_s) : 0.1;
     ewma_pressure_kv_ = (1.0 - eta) * ewma_pressure_kv_ + eta * kv_util;
     ewma_pressure_mamba_ = (1.0 - eta) * ewma_pressure_mamba_ + eta * mamba_util;

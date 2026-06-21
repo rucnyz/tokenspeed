@@ -81,6 +81,29 @@ public:
     void BudgetTick();
     std::optional<XPoolFirePlan> PendingXPoolFire() const;
 
+    // Apply the capacity changes described by a fire plan after the Python
+    // actuator has completed the corresponding cuMemMap / cuMemUnmap ops.
+    // Calls Grow/Shrink on both KV and mamba allocators and clears the
+    // pending fire latch so the budgeter can issue new plans.
+    void ApplyXPoolFire(const XPoolFirePlan& plan);
+
+    // Shrink-and-drain helpers for kv_to_mamba direction.
+    //
+    // PrepareKvToMambaFire() caps the tail KV pages BEFORE physical unmap so
+    // no new allocations land on pages that are about to be unmapped.  Must be
+    // called from the Python actuator before cuMemUnmap; ApplyXPoolFire() will
+    // skip the Shrink if it was already done here.
+    void PrepareKvToMambaFire(std::int32_t n_kv_pages);
+
+    // True while any capped KV page is still held by an in-flight request.
+    // The Python actuator polls this until it returns false before unmapping.
+    bool HasCappedKvInflight() const;
+
+    // Capacity observability helpers (for Python-side monitoring).
+    std::int32_t MappedKvPages() const;
+    std::int32_t AvailableMambaSlots() const;
+    std::int32_t MappedMambaSlots() const;
+
 private:
     // Second element is LoadBackOperation list (normal path) or WriteBackOperation list (retract triggered).
     std::tuple<std::vector<ForwardOperation>,
@@ -135,6 +158,9 @@ private:
 
 private:
     SchedulerConfig config_;
+    // Tracks how many KV pages have been pre-shrunk via PrepareKvToMambaFire
+    // so that ApplyXPoolFire does not double-shrink.
+    std::int32_t kv_pre_shrunk_pages_{0};
 
 private:
     PageAllocator device_allocator_;

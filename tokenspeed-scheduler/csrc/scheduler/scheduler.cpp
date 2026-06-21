@@ -96,7 +96,8 @@ Scheduler::Scheduler(SchedulerConfig config)
     }
     const bool has_mamba_pool = config_.enable_mamba && config_.mamba_pool_total_chunks > 0;
     if (has_mamba_pool) {
-        mamba_allocator_.emplace(config_.mamba_pool_total_chunks);
+        mamba_allocator_.emplace(config_.mamba_pool_total_chunks,
+                                  config_.enable_xpool_dynamic_capacity);
     }
     const bool has_mamba_l2_pool = has_mamba_pool && config_.enable_mamba_l2 && config_.mamba_l2_host_slots > 0;
     if (has_mamba_l2_pool) {
@@ -163,6 +164,39 @@ Scheduler::Scheduler(SchedulerConfig config)
     }
     if (config_.enable_budgeter || config_.enable_admitter) {
         budget_agent_.emplace(config_);
+    }
+
+    // Dynamic-capacity mode: KV PageAllocator starts with zero mapped pages.
+    // Grow to the profiled initial capacity so the engine serves requests right
+    // away. When xpool_initial_kv_pages == 0 fall back to filling the full VA
+    // window (total_pages - 1), which reproduces the static-mode baseline.
+    //
+    // The total_pages VA window should be larger than xpool_initial_kv_pages to
+    // leave headroom for mamba→KV transfers. Setting
+    //   total_pages = initial_kv + max_transfer_pages
+    // (done on the Python side) is the recommended configuration.
+    if (config_.enable_xpool_dynamic_capacity) {
+        const std::int32_t max_pages = device_allocator_.TotalPages() - 1;
+        const std::int32_t initial_kv =
+            (config_.xpool_initial_kv_pages > 0 && config_.xpool_initial_kv_pages <= max_pages)
+                ? config_.xpool_initial_kv_pages
+                : max_pages;
+        if (initial_kv > 0) {
+            device_allocator_.Grow(initial_kv);
+        }
+
+        // Mamba allocator: also needs an initial Grow to its profiled baseline.
+        if (mamba_allocator_) {
+            const std::int32_t max_slots = config_.mamba_pool_total_chunks;
+            const std::int32_t initial_mamba =
+                (config_.xpool_initial_mamba_slots > 0 &&
+                 config_.xpool_initial_mamba_slots <= max_slots)
+                    ? config_.xpool_initial_mamba_slots
+                    : max_slots;
+            if (initial_mamba > 0) {
+                mamba_allocator_->Grow(initial_mamba);
+            }
+        }
     }
 }
 
@@ -463,9 +497,11 @@ void Scheduler::Advance(const ExecutionEvent& event) {
 PoolSnapshot Scheduler::MakePoolSnapshot() const {
     PoolSnapshot snapshot;
     snapshot.kv_free_pages = device_allocator_.AvailablePages();
+    snapshot.kv_total_pages = device_allocator_.TotalPages();
     snapshot.kv_evictable_pages = kv_prefix_cache_.GetDeviceManager().EvictablePagesNum();
     if (mamba_allocator_) {
         snapshot.mamba_free_slots = mamba_allocator_->AvailableSlots();
+        snapshot.mamba_total_slots = mamba_allocator_->TotalSlots();
     }
     snapshot.queue_len = static_cast<std::int32_t>(WaitingSize());
     return snapshot;
@@ -483,6 +519,84 @@ std::optional<XPoolFirePlan> Scheduler::PendingXPoolFire() const {
         return std::nullopt;
     }
     return budget_agent_->PendingFire();
+}
+
+void Scheduler::PrepareKvToMambaFire(std::int32_t n_kv_pages) {
+    if (!config_.enable_xpool_dynamic_capacity || n_kv_pages <= 0) {
+        return;
+    }
+    // Cap the tail KV pages before physical unmap so no new allocations land
+    // on pages that are about to be transferred to the mamba pool.
+    device_allocator_.Shrink(n_kv_pages);
+    kv_pre_shrunk_pages_ += n_kv_pages;
+}
+
+bool Scheduler::HasCappedKvInflight() const {
+    return device_allocator_.CappedInflightPages() > 0;
+}
+
+void Scheduler::ApplyXPoolFire(const XPoolFirePlan& plan) {
+    if (!config_.enable_xpool_dynamic_capacity) {
+        return;
+    }
+    const std::int32_t n_kv_pages = static_cast<std::int32_t>(plan.page_ids.size());
+    if (n_kv_pages <= 0) {
+        return;
+    }
+
+    // Compute how many mamba slots correspond to n_kv_pages worth of KV memory.
+    // Both byte-per-unit values are stored in the scheduler config and come from
+    // the Python profiling step.
+    std::int32_t n_mamba_slots = 0;
+    if (config_.mamba_bytes_per_slot > 0 && config_.kv_bytes_per_page > 0) {
+        n_mamba_slots = static_cast<std::int32_t>(
+            static_cast<std::int64_t>(n_kv_pages) *
+            static_cast<std::int64_t>(config_.kv_bytes_per_page) /
+            static_cast<std::int64_t>(config_.mamba_bytes_per_slot));
+    }
+
+    if (plan.direction == "mamba_to_kv") {
+        // Physical memory moved from mamba arena → KV arena (done by actuator).
+        // C++: grow KV, shrink mamba.
+        device_allocator_.Grow(n_kv_pages);
+        if (mamba_allocator_ && n_mamba_slots > 0) {
+            mamba_allocator_->Shrink(n_mamba_slots);
+        }
+    } else if (plan.direction == "kv_to_mamba") {
+        // KV Shrink may already have been done by PrepareKvToMambaFire.
+        // Only shrink the remaining pages (if any) to avoid double-shrink.
+        const std::int32_t remaining = n_kv_pages - kv_pre_shrunk_pages_;
+        if (remaining > 0) {
+            device_allocator_.Shrink(remaining);
+        }
+        kv_pre_shrunk_pages_ = 0;
+        if (mamba_allocator_ && n_mamba_slots > 0) {
+            mamba_allocator_->Grow(n_mamba_slots);
+        }
+    }
+
+    // Clear the pending latch so the budgeter can emit new plans.
+    if (budget_agent_) {
+        budget_agent_->ClearPendingFire();
+    }
+}
+
+std::int32_t Scheduler::MappedKvPages() const {
+    return device_allocator_.MappedPages();
+}
+
+std::int32_t Scheduler::AvailableMambaSlots() const {
+    if (mamba_allocator_) {
+        return mamba_allocator_->AvailableSlots();
+    }
+    return 0;
+}
+
+std::int32_t Scheduler::MappedMambaSlots() const {
+    if (mamba_allocator_) {
+        return mamba_allocator_->MappedSlots();
+    }
+    return 0;
 }
 
 }  // namespace tokenspeed

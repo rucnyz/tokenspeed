@@ -260,7 +260,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("xpool_nb_margin", &tokenspeed::SchedulerConfig::xpool_nb_margin)
         .def_rw("xpool_mamba_floor_slots", &tokenspeed::SchedulerConfig::xpool_mamba_floor_slots)
         .def_rw("xpool_xfer_us_per_page", &tokenspeed::SchedulerConfig::xpool_xfer_us_per_page)
-        .def_rw("xpool_queue_wait_us", &tokenspeed::SchedulerConfig::xpool_queue_wait_us);
+        .def_rw("xpool_queue_wait_us", &tokenspeed::SchedulerConfig::xpool_queue_wait_us)
+        .def_rw("xpool_initial_kv_pages", &tokenspeed::SchedulerConfig::xpool_initial_kv_pages)
+        .def_rw("xpool_initial_mamba_slots", &tokenspeed::SchedulerConfig::xpool_initial_mamba_slots);
 
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
@@ -478,5 +480,24 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                     return nb::none();
                 }
                 return nb::cast(*plan);
-            });
+            })
+        .def("apply_xpool_fire", &tokenspeed::Scheduler::ApplyXPoolFire,
+             nb::arg("plan"),
+             "Notify C++ of completed cuMemMap/Unmap ops: update KV and mamba "
+             "allocator capacities and clear the pending fire latch.")
+        .def("prepare_kv_to_mamba_fire",
+             &tokenspeed::Scheduler::PrepareKvToMambaFire,
+             nb::arg("n_kv_pages"),
+             "Cap tail KV pages before physical unmap (shrink-and-drain step 1). "
+             "Must be called before cuMemUnmap for kv_to_mamba direction.")
+        .def("has_capped_kv_inflight",
+             &tokenspeed::Scheduler::HasCappedKvInflight,
+             "True while any capped KV page is held by an in-flight request. "
+             "Poll until False before unmapping (shrink-and-drain step 2).")
+        .def("mapped_kv_pages", &tokenspeed::Scheduler::MappedKvPages,
+             "Number of KV pages currently mapped in the VMM arena.")
+        .def("available_mamba_slots", &tokenspeed::Scheduler::AvailableMambaSlots,
+             "Number of free mamba slots available for new allocations.")
+        .def("mapped_mamba_slots", &tokenspeed::Scheduler::MappedMambaSlots,
+             "Number of mamba slots currently backed by physical memory.");
 }

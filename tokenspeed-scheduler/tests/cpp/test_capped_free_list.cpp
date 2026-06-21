@@ -26,14 +26,53 @@
 
 namespace tokenspeed::test {
 
-TEST(CappedFreeListTest, CappedPagesNeverReenterFreeList) {
+// Capped pages are drained (not re-added to the free list) when Deallocate is
+// called.  This allows in-flight requests to "return" capped pages safely and
+// lets InFlightCappedCount() reach zero once all holders have finished.
+TEST(CappedFreeListTest, CappedPagesDrainedOnDeallocate) {
     CappedFreeList list;
     list.Reset(8, {1, 2, 3, 4, 5, 6, 7});
     list.MarkCapped(3);
+    // Capped page must not be returned by Allocate.
     auto page = list.Allocate();
     ASSERT_TRUE(page.has_value());
     EXPECT_NE(*page, 3);
-    EXPECT_THROW(list.Deallocate(3), std::runtime_error);
+
+    // Simulate an in-flight request that was already holding page 3 calling
+    // Deallocate after the page was capped.  Should NOT throw.
+    EXPECT_NO_THROW(list.Deallocate(3));
+
+    // After drain, InFlightCappedCount should be 0 (page 3 was in marks_; it
+    // was free when capped so it already counted as drained via MarkCapped,
+    // but calling Deallocate again is idempotent).
+    EXPECT_EQ(list.InFlightCappedCount(), 0);
+
+    // Page 3 must still not appear in the free list.
+    bool got_three = false;
+    for (int i = 0; i < 6; ++i) {
+        auto p = list.Allocate();
+        if (p.has_value() && *p == 3) got_three = true;
+    }
+    EXPECT_FALSE(got_three);
+}
+
+TEST(CappedFreeListTest, InFlightCappedCountDecreasesAsInflightPagesReturn) {
+    CappedFreeList list;
+    // 5 pages; none initially free (simulate all are in-flight).
+    list.Reset(5, {});
+    // Simulate: page 2 and 3 are in-flight (allocated externally), then capped.
+    list.MarkCapped(2);
+    list.MarkCapped(3);
+    // Both were not in free_ids_ so they are truly in-flight (not drained yet).
+    EXPECT_EQ(list.InFlightCappedCount(), 2);
+
+    // One request finishes and returns page 2.
+    EXPECT_NO_THROW(list.Deallocate(2));
+    EXPECT_EQ(list.InFlightCappedCount(), 1);
+
+    // Second request finishes and returns page 3.
+    EXPECT_NO_THROW(list.Deallocate(3));
+    EXPECT_EQ(list.InFlightCappedCount(), 0);
 }
 
 TEST(CappedFreeListTest, GrowMakesPagesAllocatable) {

@@ -54,6 +54,10 @@ public:
     void CapPages(const std::vector<std::int32_t>& page_ids);
     void UncapPages(const std::vector<std::int32_t>& page_ids);
 
+    // Number of capped pages still held by in-flight requests (not yet freed).
+    // Returns 0 when it is safe to physically unmap the capped tail.
+    std::int32_t CappedInflightPages() const;
+
 private:
     std::int32_t page_size_{};
     std::int32_t total_pages_{};

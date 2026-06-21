@@ -139,6 +139,9 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_capped_free_list.cpp
         tests/cpp/test_admitter_seven.cpp
         tests/cpp/test_budgeter.cpp
+        tests/cpp/test_xpool_capacity.cpp
+        tests/cpp/test_mamba_dynamic_capacity.cpp
+        tests/cpp/test_apply_xpool_fire.cpp
         tests/cpp/test_host_node_ref_lifetime.cpp
     )
 

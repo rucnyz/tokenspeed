@@ -17,6 +17,7 @@ Usage:
 import time
 
 import torch
+
 from tokenspeed.runtime.entrypoints.engine import Engine
 
 MODEL = "/home/songyang/models/Qwen3.5-35B-A3B"
@@ -138,9 +139,9 @@ def test_lpb_vs_lru_cache_hits():
         finally:
             _teardown(engine)
 
-    assert results["lpb"] >= results["lru"], (
-        f"LPB ({results['lpb']}) should be >= LRU ({results['lru']})"
-    )
+    assert (
+        results["lpb"] >= results["lru"]
+    ), f"LPB ({results['lpb']}) should be >= LRU ({results['lru']})"
     print("  ✓ LPB >= LRU")
 
 
@@ -186,7 +187,8 @@ def manual_test_xpool_actuator_init_and_fire():
         xpool_msgs = [
             r.getMessage()
             for r in log_records
-            if "xpool" in r.getMessage().lower() or "dynamic capacity" in r.getMessage().lower()
+            if "xpool" in r.getMessage().lower()
+            or "dynamic capacity" in r.getMessage().lower()
         ]
         if xpool_msgs:
             print(f"  XPool log messages: {xpool_msgs}")
