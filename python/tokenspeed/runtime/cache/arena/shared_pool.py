@@ -26,16 +26,51 @@ CHUNK_SIZE_BYTES = 2 * 1024 * 1024
 
 
 class SharedHandlePool:
-    """Logical pool of cuMemCreate handles keyed by chunk index."""
+    """Pool of physical allocation handles keyed by chunk index.
 
-    def __init__(self, num_chunks: int) -> None:
+    Two modes:
+
+    * ``device is None`` (default) -- logical stub mode.  ``get_handle`` returns
+      a deterministic placeholder integer.  Used by CPU-only unit tests and any
+      environment without a GPU; no real device memory is allocated.
+    * ``device`` set to a CUDA device ordinal -- real mode.  Each chunk lazily
+      allocates ``chunk_size`` bytes via ``cuMemCreate`` and the returned
+      ``CUmemGenericAllocationHandle`` is cached and reused.  Call
+      :meth:`release_all` to free the physical pages.
+    """
+
+    def __init__(
+        self,
+        num_chunks: int,
+        *,
+        device: int | None = None,
+        chunk_size: int = CHUNK_SIZE_BYTES,
+    ) -> None:
         if num_chunks <= 0:
             raise ValueError("num_chunks must be positive")
         self.num_chunks = num_chunks
-        self.chunk_size = CHUNK_SIZE_BYTES
+        self.device = device
+        self.chunk_size = chunk_size
         self._handles: dict[int, int] = {}
 
     def get_handle(self, chunk_id: int) -> int:
+        if chunk_id < 0 or chunk_id >= self.num_chunks:
+            raise IndexError(f"chunk_id {chunk_id} out of range [0, {self.num_chunks})")
         if chunk_id not in self._handles:
-            self._handles[chunk_id] = chunk_id + 1
+            if self.device is None:
+                # Logical stub handle (deterministic, never zero).
+                self._handles[chunk_id] = chunk_id + 1
+            else:
+                from tokenspeed.runtime.cache.arena._cuda_vmm import cu_mem_create
+
+                self._handles[chunk_id] = cu_mem_create(self.chunk_size, self.device)
         return self._handles[chunk_id]
+
+    def release_all(self) -> None:
+        """Free every physical allocation held by this pool."""
+        if self.device is not None:
+            from tokenspeed.runtime.cache.arena._cuda_vmm import cu_mem_release
+
+            for handle in self._handles.values():
+                cu_mem_release(handle)
+        self._handles.clear()

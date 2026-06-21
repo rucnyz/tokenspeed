@@ -50,6 +50,11 @@ BASE_VERSION = "0.1.0"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
+# FP4 (NVFP4/E2M1) instructions are only available on Blackwell HPC GPUs
+# (sm_100a / sm_103a).  Consumer Blackwell (sm_120) does not support them.
+# Kernels that use cvt.e2m1x2 or nvfp4 quantisation must always be compiled
+# with these HPC architectures regardless of TOKENSPEED_CUDA_ARCH.
+HPC_BLACKWELL_ARCHS = ("100a", "103a")
 
 # CUDA kernels source and output directories
 CUDA_CSRC_DIR = THIRDPARTY_DIR / "cuda" / "csrc"
@@ -393,6 +398,8 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "silu_and_mul_fuse_nvfp4_quant.cu",
         ],
         [],
+        [],
+        HPC_BLACKWELL_ARCHS,  # cvt.e2m1x2.f32 is HPC-Blackwell-only
     ),
     (
         "moe_finalize_fuse_shared",
@@ -400,6 +407,8 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "moe_finalize_fuse_shared.cu",
         ],
         [],
+        [],
+        HPC_BLACKWELL_ARCHS,  # uses nvfp4 quantisation path
     ),
     (
         "kvcacheio",
@@ -421,12 +430,20 @@ KERNEL_GROUPS = [
         "trtllm_comm",
         [
             CUDA_CSRC_DIR / "trtllm_allreduce.cu",
-            CUDA_CSRC_DIR / "trtllm_allreduce_fusion.cu",
-            CUDA_CSRC_DIR / "trtllm_reducescatter_fusion.cu",
-            CUDA_CSRC_DIR / "trtllm_allgather_fusion.cu",
             CUDA_CSRC_DIR / "minimax_reduce_rms.cu",
         ],
         [],
+    ),
+    (
+        "trtllm_comm_fusion",
+        [
+            CUDA_CSRC_DIR / "trtllm_allreduce_fusion.cu",
+            CUDA_CSRC_DIR / "trtllm_reducescatter_fusion.cu",
+            CUDA_CSRC_DIR / "trtllm_allgather_fusion.cu",
+        ],
+        [],
+        [],
+        HPC_BLACKWELL_ARCHS,  # fusion kernels use cvt.e2m1x2 (FP4), HPC-only
     ),
 ]
 
@@ -449,7 +466,11 @@ class CudaKernelBuilder:
         else:
             major = int(arch_clean[:-1])
             minor = int(arch_clean[-1])
-        suffix = "a" if has_suffix or major >= 9 else ""
+        # The "a" suffix is specific to Blackwell HPC/data-center GPUs (sm_100a,
+        # sm_103a).  Consumer/workstation Blackwell (sm_120, RTX 50xx / RTX PRO
+        # 6000) is major==12 and does NOT have an "a" variant in NVCC.
+        is_consumer_blackwell = major >= 12
+        suffix = "a" if (has_suffix or (major >= 9 and not is_consumer_blackwell)) else ""
         return f"{major}{minor}{suffix}"
 
     def _detect_cuda_archs(self):
@@ -676,6 +697,9 @@ class CudaKernelBuilder:
         for entry in self.kernel_groups:
             name, sources, extra_ldflags = entry[0], entry[1], entry[2]
             extra_cflags = entry[3] if len(entry) > 3 else []
+            # Optional 5th element: arch override for this specific group.
+            # If provided, these archs are used instead of the globally detected ones.
+            group_arch_override = entry[4] if len(entry) > 4 else None
             out_dir = CUDA_OBJS_DIR / name
             out_dir.mkdir(parents=True, exist_ok=True)
             so_path = out_dir / f"{name}.so"
@@ -684,9 +708,9 @@ class CudaKernelBuilder:
             ):
                 skipped_groups += 1
                 continue
-            stale_groups.append((name, sources, extra_ldflags, extra_cflags, so_path))
+            stale_groups.append((name, sources, extra_ldflags, extra_cflags, so_path, group_arch_override))
 
-        stale_sources = sum(len(srcs) for _, srcs, _, _, _ in stale_groups)
+        stale_sources = sum(len(srcs) for _, srcs, _, _, _, _ in stale_groups)
         print(
             f"Building {len(stale_groups)}/{len(self.kernel_groups)} kernel group(s) "
             f"({stale_sources}/{total_sources} files, {max_jobs} parallel jobs)..."
@@ -700,7 +724,18 @@ class CudaKernelBuilder:
         with ThreadPoolExecutor(max_workers=max_jobs) as executor:
             group_meta = []
             futures = []
-            for name, sources, extra_ldflags, extra_cflags, so_path in stale_groups:
+            for name, sources, extra_ldflags, extra_cflags, so_path, group_arch_override in stale_groups:
+                if group_arch_override is not None:
+                    group_gencode = [
+                        f"-gencode=arch=compute_{a},code=sm_{a}"
+                        for a in sorted(group_arch_override)
+                    ]
+                    group_nvcc_flags = [
+                        f for f in nvcc_flags
+                        if not f.startswith("-gencode=")
+                    ] + group_gencode
+                else:
+                    group_nvcc_flags = nvcc_flags
                 out_dir = so_path.parent
                 objects = []
                 for src in sources:
@@ -711,7 +746,7 @@ class CudaKernelBuilder:
                             self._compile_one,
                             str(src),
                             str(obj),
-                            nvcc_flags,
+                            group_nvcc_flags,
                             include_dirs,
                             extra_cflags,
                         )

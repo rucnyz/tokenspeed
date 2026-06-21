@@ -58,10 +58,9 @@ def compute_lpb_byte_sizes(
 ) -> tuple[int, int]:
     """Return (kv_bytes_per_page, mamba_bytes_per_slot) for LPB eviction."""
     inner = getattr(token_to_kv_pool, "inner", token_to_kv_pool)
-    pool_cls = inner.__class__
-    if not hasattr(pool_cls, "cell_size"):
+    if not hasattr(inner, "cell_size"):
         return 0, 0
-    kv_bytes_per_page = int(pool_cls.cell_size() * page_size)
+    kv_bytes_per_page = int(inner.cell_size() * page_size)
     mamba_bytes_per_slot = 0
     if mamba_pool is not None:
         conv = mamba_pool.conv_state

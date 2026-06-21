@@ -349,7 +349,17 @@ def prefill_attention_fwd(
         num_warps = 4
 
     else:
-        if platform.is_hopper_plus:
+        if platform.is_consumer_blackwell:
+            # Consumer Blackwell (sm_120, major >= 12) has ~99 KB shared memory
+            # per CTA, the same constraint as sm86/sm89.  Use the same reduced
+            # block sizes to avoid OutOfResources at launch time.
+            if Lq <= 128:
+                BLOCK_M, BLOCK_N = (64, 128)
+            elif Lq <= 256:
+                BLOCK_M, BLOCK_N = (64, 64)
+            else:
+                BLOCK_M, BLOCK_N = (32, 32)
+        elif platform.is_hopper_plus:
             if Lq <= 256:
                 BLOCK_M, BLOCK_N = (128, 64)
             else:

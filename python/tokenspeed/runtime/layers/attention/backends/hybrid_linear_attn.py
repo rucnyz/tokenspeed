@@ -75,6 +75,11 @@ class MambaForwardMetadata:
     track_conv_indices: Optional[torch.Tensor] = None
     track_ssm_final_src: Optional[torch.Tensor] = None
     track_ssm_final_dst: Optional[torch.Tensor] = None
+    # Triton fallback fields: batch sequence index and local token step for
+    # each tracked request.  Used by fused_sigmoid_gating_delta_rule_update
+    # via output_state_indices on platforms without sm100/sm103 (e.g. sm120).
+    track_ssm_h_batch_indices: Optional[torch.Tensor] = None
+    track_ssm_h_local_steps: Optional[torch.Tensor] = None
 
 
 class LayerMappedKVPool:
@@ -430,6 +435,7 @@ class MambaAttnBackend(AttentionBackend):
         )
         self.pool: SimpleMambaPool = None
         self._gdn_fastpath_checked = False
+        self._gdn_fastpath_avail = False
 
     def set_pool(self, pool: SimpleMambaPool):
         self.pool = pool
@@ -534,6 +540,8 @@ class MambaAttnBackend(AttentionBackend):
         track_conv_indices = None
         track_ssm_final_src = None
         track_ssm_final_dst = None
+        track_ssm_h_batch_indices = None
+        track_ssm_h_local_steps = None
         if (
             forward_mode.is_extend_or_mixed() or is_draft_extend
         ) and not is_target_verify:
@@ -576,6 +584,8 @@ class MambaAttnBackend(AttentionBackend):
                     (
                         track_ssm_h_src,
                         track_ssm_h_dst,
+                        track_ssm_h_batch_indices,
+                        track_ssm_h_local_steps,
                     ) = self._compute_track_ssm_indices(
                         track_lens,
                         track_mask,
@@ -600,6 +610,8 @@ class MambaAttnBackend(AttentionBackend):
             track_conv_indices=track_conv_indices,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
+            track_ssm_h_batch_indices=track_ssm_h_batch_indices,
+            track_ssm_h_local_steps=track_ssm_h_local_steps,
         )
 
     def _compute_track_conv_indices(
@@ -629,6 +641,13 @@ class MambaAttnBackend(AttentionBackend):
         """Compute src/dst indices for extracting intermediate SSM states.
 
         Matching conv windows are gathered separately from packed pre-conv inputs.
+
+        Returns:
+            track_ssm_h_src: global flashinfer checkpoint indices (fast-path).
+            track_ssm_h_dst: destination slots in ssm_states.
+            batch_indices: per-tracked-seq batch index (Triton fallback).
+            local_steps: per-tracked-seq local step at chunk boundary
+                         (0-based within that sequence, Triton fallback).
         """
         # flashinfer ckpts[k] = state after processing chunk k = FLA h[k+1]
         num_fi_ckpts = extend_seq_lens // FLA_CHUNK_SIZE
@@ -644,9 +663,18 @@ class MambaAttnBackend(AttentionBackend):
         track_ssm_h_src = offset_m + (lens_m // FLA_CHUNK_SIZE - 1)
         track_ssm_h_dst = dst_m
 
+        # Triton fallback: batch index (sequence number within the batch) and
+        # local token step at the last complete chunk boundary (0-indexed).
+        # The Triton kernel processes each sequence from local step 0, so the
+        # state after chunk c is found at local step c*FLA_CHUNK_SIZE - 1.
+        batch_indices = torch.where(track_mask)[0]
+        local_steps = lens_m // FLA_CHUNK_SIZE * FLA_CHUNK_SIZE - 1
+
         return (
             track_ssm_h_src,
             track_ssm_h_dst,
+            batch_indices,
+            local_steps,
         )
 
     # ---- CUDA graph state ----
@@ -1103,25 +1131,40 @@ class MambaAttnBackend(AttentionBackend):
                 and self.forward_metadata.track_ssm_final_src.numel() > 0
             )
             if not self._gdn_fastpath_checked:
-                if not (
+                self._gdn_fastpath_avail = (
                     gdn_flashinfer.is_supported(
                         head_k_dim, query.dtype, num_heads, num_value_heads
                     )
                     and head_v_dim == head_k_dim
-                ):
-                    raise RuntimeError(
-                        "GDN prefill requires the flashinfer Blackwell fast-path "
-                        "(sm100/sm103 + CUDA 13 + bf16 + head_dim=128 + "
-                        "head_v == head_k + num_v >= num_q). Got "
-                        f"dtype={query.dtype}, head_k={head_k_dim}, "
-                        f"head_v={head_v_dim}, num_q={num_heads}, "
-                        f"num_v={num_value_heads}, "
-                        f"sm100_available={gdn_flashinfer.is_available()}."
+                )
+                if not self._gdn_fastpath_avail:
+                    import logging as _logging
+                    _logging.getLogger(__name__).warning(
+                        "GDN prefill: flashinfer sm100/sm103 fast-path unavailable "
+                        "(dtype=%s, head_k=%d, head_v=%d, num_q=%d, num_v=%d, "
+                        "sm100_available=%s). Falling back to Triton recurrent path "
+                        "(correct but slower; requires sm100/sm103 for full speed).",
+                        query.dtype, head_k_dim, head_v_dim, num_heads,
+                        num_value_heads, gdn_flashinfer.is_available(),
                     )
                 self._gdn_fastpath_checked = True
-            if need_h_track:
-                core_attn_out, last_recurrent_state, fi_h_checkpoints, _ = (
-                    gdn_flashinfer.gdn_chunk_prefill(
+            if self._gdn_fastpath_avail:
+                if need_h_track:
+                    core_attn_out, last_recurrent_state, fi_h_checkpoints, _ = (
+                        gdn_flashinfer.gdn_chunk_prefill(
+                            l2norm_fwd(query),
+                            l2norm_fwd(key),
+                            value,
+                            g,
+                            beta,
+                            scale=head_k_dim**-0.5,
+                            initial_state=recurrent_state,
+                            cu_seqlens=query_start_loc,
+                            output_h=True,
+                        )
+                    )
+                else:
+                    core_attn_out, last_recurrent_state = gdn_flashinfer.gdn_chunk_prefill(
                         l2norm_fwd(query),
                         l2norm_fwd(key),
                         value,
@@ -1130,24 +1173,62 @@ class MambaAttnBackend(AttentionBackend):
                         scale=head_k_dim**-0.5,
                         initial_state=recurrent_state,
                         cu_seqlens=query_start_loc,
-                        output_h=True,
                     )
+                last_recurrent_state = last_recurrent_state.to(
+                    ssm_states.dtype, copy=False
                 )
+                ssm_states[cache_indices] = last_recurrent_state
             else:
-                core_attn_out, last_recurrent_state = gdn_flashinfer.gdn_chunk_prefill(
-                    l2norm_fwd(query),
-                    l2norm_fwd(key),
-                    value,
-                    g,
-                    beta,
-                    scale=head_k_dim**-0.5,
-                    initial_state=recurrent_state,
-                    cu_seqlens=query_start_loc,
-                )
-            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-            ssm_states[cache_indices] = last_recurrent_state
+                # Triton recurrent fallback for platforms without sm100/sm103
+                # (e.g. consumer Blackwell sm120).  Numerically equivalent to
+                # the flashinfer fast-path but processes tokens sequentially.
+                #
+                # h-tracking (mamba prefix-cache state checkpointing) is
+                # implemented here via output_state_indices: the Triton kernel
+                # writes intermediate hidden states directly into ssm_states at
+                # the specified destination slots, matching what the flashinfer
+                # fi_h_checkpoints mechanism achieves on the fast path.
+                out_state_indices = None
+                if need_h_track:
+                    # query is [1, total_T, H, K] (VARLEN packed format).
+                    # output_state_indices shape: (N_seqs, total_T), indexed as
+                    # [batch_idx * total_T + local_step] inside the kernel.
+                    total_T = query.shape[1]
+                    num_seqs = query_start_loc.shape[0] - 1
+                    out_state_indices = torch.full(
+                        (num_seqs, total_T),
+                        -1,
+                        dtype=torch.int32,
+                        device=query.device,
+                    )
+                    b_idx = self.forward_metadata.track_ssm_h_batch_indices
+                    l_step = self.forward_metadata.track_ssm_h_local_steps
+                    dst_slots = self.forward_metadata.track_ssm_h_dst
+                    out_state_indices[b_idx, l_step] = dst_slots.to(torch.int32)
 
-            if need_h_track:
+                core_attn_out = fused_sigmoid_gating_delta_rule_update(
+                    A_log=A_log,
+                    a=a,
+                    dt_bias=dt_bias,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    q=query,
+                    k=key,
+                    v=value,
+                    b=b,
+                    initial_state_source=ssm_states,
+                    initial_state_indices=cache_indices,
+                    scale=head_k_dim**-0.5,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=query_start_loc,
+                    output_state_indices=out_state_indices,
+                )
+                # Final states written in-place; intermediate h-checkpoints
+                # (if any) written via output_state_indices above.
+
+            if need_h_track and self._gdn_fastpath_avail:
+                # Fast path: copy flashinfer's fi_h_checkpoints to ssm_states.
+                # Triton fallback handles this internally via output_state_indices.
                 ssm_states[self.forward_metadata.track_ssm_h_dst] = fi_h_checkpoints[
                     self.forward_metadata.track_ssm_h_src
                 ].to(ssm_states.dtype, copy=False)

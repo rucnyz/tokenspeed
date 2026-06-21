@@ -142,7 +142,30 @@ class PlatformInfo:
 
     @property
     def is_blackwell(self) -> bool:
+        """True for HPC Blackwell (sm_100 / sm_103, major == 10)."""
         return self.is_nvidia and self.arch_version.major == 10
+
+    @property
+    def is_consumer_blackwell(self) -> bool:
+        """True for consumer Blackwell (sm_120+, major >= 12).
+
+        Consumer Blackwell GPUs (e.g. RTX PRO 6000 Blackwell, RTX 5090) have
+        major version 12.  They lack several HPC-only features:
+          * FP4 / cvt.e2m1x2 CUDA instructions (sm_100a / sm_103a only)
+          * TRT-LLM FMHA runner
+          * flashinfer GDN sm100/sm103 fast-path
+        Use Triton-based fallbacks on this architecture.
+        """
+        return self.is_nvidia and self.arch_version.major >= 12
+
+    @property
+    def is_hpc_blackwell(self) -> bool:
+        """True only for HPC Blackwell (sm_100 / sm_103).
+
+        HPC Blackwell supports FP4 CUDA instructions and the TRT-LLM FMHA
+        runner.  Consumer Blackwell (sm_120) is excluded.
+        """
+        return self.is_blackwell  # major == 10
 
     @property
     def is_ampere(self) -> bool:

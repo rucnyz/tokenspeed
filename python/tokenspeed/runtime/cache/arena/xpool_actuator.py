@@ -45,9 +45,38 @@ class XPoolActuator:
         self.mamba_arena = mamba_arena
         self._lock = threading.Lock()
         self._inflight = False
+        # The C++ budgeter latches its pending plan (op_id starts at 1), so we
+        # de-dup here by the last actuated op_id; 0 means "nothing yet".
+        self._last_op_id = 0
+
+    def maybe_execute(self, plan: object) -> bool:
+        """Actuate a budgeter plan unless it was already actuated.
+
+        Args:
+            plan: any object exposing ``op_id`` (int), ``direction`` (str) and
+                ``page_ids`` (iterable of int) -- e.g. the C++ ``XPoolFirePlan``.
+
+        Returns:
+            True if a new transfer was launched, False if the plan was a
+            duplicate of the previously actuated one.
+        """
+        op_id = int(plan.op_id)
+        if op_id == self._last_op_id:
+            return False
+        self._last_op_id = op_id
+        self.execute_async(
+            FirePlan(
+                direction=str(plan.direction),
+                page_ids=list(plan.page_ids),
+                op_id=op_id,
+            )
+        )
+        return True
 
     def execute_async(self, plan: FirePlan) -> None:
-        worker = threading.Thread(target=self._execute_locked, args=(plan,), daemon=True)
+        worker = threading.Thread(
+            target=self._execute_locked, args=(plan,), daemon=True
+        )
         worker.start()
 
     def _execute_locked(self, plan: FirePlan) -> None:

@@ -75,9 +75,18 @@ class BaseTokenToKVPool:
             rank,
         )
 
-    @classmethod
     def cell_size(self) -> int:
-        raise NotImplementedError()
+        """Return bytes consumed by one token slot across all layers.
+
+        Used by LPB eviction to compute loss-per-byte scores.
+        Subclasses should override; the default falls back to page_size_bytes
+        when that attribute is available (set by _get_page_size_bytes()), and
+        returns 0 for pool types that do not participate in LPB eviction.
+        """
+        psb = getattr(self, "page_size_bytes", None)
+        if psb is not None and self.page_size > 0:
+            return int(psb // self.page_size)
+        return 0
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter

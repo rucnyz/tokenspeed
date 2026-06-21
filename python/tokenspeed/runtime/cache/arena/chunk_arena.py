@@ -24,15 +24,23 @@ from __future__ import annotations
 
 from tokenspeed.runtime.cache.arena._cuda_vmm import (
     CHUNK_SIZE_BYTES,
+    cu_mem_address_free,
     cu_mem_address_reserve,
     cu_mem_map,
+    cu_mem_set_access,
     cu_mem_unmap,
 )
 from tokenspeed.runtime.cache.arena.shared_pool import SharedHandlePool
 
 
 class ChunkArena:
-    """Reserve a VA window and map physical handles on demand."""
+    """Reserve a VA window and map physical handles on demand.
+
+    When ``shared_pool`` is backed by a real CUDA device (``device`` set), each
+    mapped chunk additionally receives read/write access via ``cuMemSetAccess``
+    so device kernels can touch the memory.  In stub mode (no device) the access
+    grant is skipped.
+    """
 
     def __init__(
         self,
@@ -48,7 +56,8 @@ class ChunkArena:
         self.max_chunks = max_chunks
         self.mapped_chunks = mapped_chunks
         self.name = name
-        self.chunk_size = CHUNK_SIZE_BYTES
+        self.chunk_size = shared_pool.chunk_size
+        self._device = shared_pool.device
         self._base_ptr = cu_mem_address_reserve(max_chunks * self.chunk_size)
         self._mapped: set[int] = set()
         for chunk_id in range(mapped_chunks):
@@ -65,7 +74,10 @@ class ChunkArena:
         if chunk_id in self._mapped:
             return chunk_id
         handle = self.shared_pool.get_handle(chunk_id)
-        cu_mem_map(self._slot_ptr(chunk_id), self.chunk_size, handle)
+        ptr = self._slot_ptr(chunk_id)
+        cu_mem_map(ptr, self.chunk_size, handle)
+        if self._device is not None:
+            cu_mem_set_access(ptr, self.chunk_size, self._device)
         self._mapped.add(chunk_id)
         return chunk_id
 
@@ -101,3 +113,12 @@ class ChunkArena:
     def transfer_in(self, chunk_ids: list[int]) -> None:
         for chunk_id in chunk_ids:
             self._map_chunk(chunk_id)
+
+    def close(self) -> None:
+        """Unmap every chunk and free the reserved virtual address window."""
+        for chunk_id in list(self._mapped):
+            cu_mem_unmap(self._slot_ptr(chunk_id), self.chunk_size)
+        self._mapped.clear()
+        if self._base_ptr:
+            cu_mem_address_free(self._base_ptr, self.max_chunks * self.chunk_size)
+            self._base_ptr = 0

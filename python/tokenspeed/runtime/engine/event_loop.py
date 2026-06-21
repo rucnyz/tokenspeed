@@ -50,8 +50,8 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_key,
     cache_event_to_payload,
     cache_sync_debug_enabled,
-    make_config,
     compute_lpb_byte_sizes,
+    make_config,
     pool_to_paged_cache_groups,
     pool_to_prefix_cache_adjunct_spec,
     pop_common_cache_event_payloads,
@@ -397,6 +397,7 @@ class EventLoop:
         self.scheduler = Scheduler(scheduler_cfg)
         self._budgeter_tick_s = float(server_args.budgeter_tick_s)
         self._last_budget_tick = 0.0
+        self._init_xpool_actuator(server_args, has_mamba)
         token_to_kv_pool.bind_paged_cache_scheduler(self.scheduler)
         if attn_tp_rank == 0:
             self.kv_event_publisher = EventPublisherFactory.create(
@@ -919,6 +920,72 @@ class EventLoop:
             return False
         return True
 
+    def _init_xpool_actuator(self, server_args, has_mamba: bool) -> None:
+        """Set up the inter-pool capacity-transfer actuator (HiMA Phase 2).
+
+        Only created when ``--enable-xpool-dynamic-capacity`` is set, on the
+        attention TP leader, for hybrid (mamba) models.  The actuator reserves
+        two CUDA-VMM arenas (KV / mamba) and executes ``cuMemMap``/``cuMemUnmap``
+        transfers off the decode critical path whenever the C++ budgeter emits
+        an ``XPoolFirePlan``.
+
+        Note: this wires the *control/execution* plane.  Binding pool tensors to
+        the arena VA windows (so transfers change live pool capacity) is a
+        separate data-plane migration tracked in the HiMA docs.
+        """
+        self._xpool_actuator = None
+        if not getattr(server_args, "enable_xpool_dynamic_capacity", False):
+            return
+        if self.attn_tp_rank != 0 or not has_mamba:
+            return
+        try:
+            from tokenspeed.runtime.cache.arena.chunk_arena import ChunkArena
+            from tokenspeed.runtime.cache.arena.shared_pool import SharedHandlePool
+            from tokenspeed.runtime.cache.arena.xpool_actuator import XPoolActuator
+
+            pages = max(1, int(server_args.budgeter_pages_per_fire))
+            # Reserve VA headroom for several fires worth of chunks per pool.
+            max_chunks = pages * 4
+            kv_handles = SharedHandlePool(max_chunks, device=self.gpu_id)
+            mamba_handles = SharedHandlePool(max_chunks, device=self.gpu_id)
+            kv_arena = ChunkArena(
+                shared_pool=kv_handles,
+                max_chunks=max_chunks,
+                mapped_chunks=0,
+                name="xpool_kv",
+            )
+            mamba_arena = ChunkArena(
+                shared_pool=mamba_handles,
+                max_chunks=max_chunks,
+                mapped_chunks=0,
+                name="xpool_mamba",
+            )
+            self._xpool_actuator = XPoolActuator(
+                kv_arena=kv_arena, mamba_arena=mamba_arena
+            )
+            logger.info(
+                "XPool dynamic capacity enabled: pages_per_fire=%s max_chunks=%s",
+                pages,
+                max_chunks,
+            )
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully
+            logger.warning(
+                "XPool actuator init failed (%s); dynamic capacity disabled", exc
+            )
+            self._xpool_actuator = None
+
+    def _maybe_fire_xpool(self) -> None:
+        """Drain the budgeter's pending fire plan and actuate it asynchronously.
+
+        The actuator de-dups latched plans by op_id, so calling this on every
+        budget tick is safe even though the C++ side keeps the plan latched.
+        """
+        if self._xpool_actuator is None:
+            return
+        plan = self.scheduler.pending_xpool_fire()
+        if plan is not None:
+            self._xpool_actuator.maybe_execute(plan)
+
     def _maybe_budget_tick(self) -> None:
         if self._budgeter_tick_s <= 0:
             return
@@ -930,6 +997,7 @@ class EventLoop:
             return
         self.scheduler.budget_tick()
         self._last_budget_tick = now
+        self._maybe_fire_xpool()
 
     def _process_new_requests(self):
         recv_reqs = self.request_handler.recv_reqs()
