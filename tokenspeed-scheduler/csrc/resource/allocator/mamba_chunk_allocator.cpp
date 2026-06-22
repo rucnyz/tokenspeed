@@ -130,6 +130,13 @@ MambaSlot::~MambaSlot() {
     release();
 }
 
+std::int32_t MambaChunkAllocator::CappedInflightSlots() const {
+    if (!enable_dynamic_capacity_) {
+        return 0;
+    }
+    return capped_free_list_.InFlightCappedCount();
+}
+
 void MambaSlot::release() {
     if (index_ >= 0 && releaser_) {
         releaser_(index_);
