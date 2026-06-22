@@ -227,6 +227,7 @@ def _create_hybrid_linear_attn(
     enable_memory_saver: bool = False,
     full_attn_backend_name: str = None,
     mamba_pool_total_chunks: int = 0,
+    pre_arenas_factory: "callable | None" = None,
 ) -> tuple[AttentionBackend, BaseTokenToKVPool, object]:
     """Create a hybrid backend + pool for GDN hybrid models (Qwen3.5, Qwen3Next)."""
     from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
@@ -295,6 +296,78 @@ def _create_hybrid_linear_attn(
         mamba_layer_ids,
     ) = text_config.mamba2_cache_params
 
+    # Create KV cache pool (only for full attention layers)
+    num_full_attn_layers = len(full_attn_layers)
+
+    # ----------------------------------------------------------------
+    # Mamba pool size — computed before tensor allocation so that the
+    # pre-arenas factory can size both KV and mamba arenas at once.
+    # ----------------------------------------------------------------
+    dp_size = max(
+        server_args.data_parallel_size or server_args.mapping.attn.dp_size, 1
+    )
+    _spec_draft_tokens = (
+        server_args.speculative_num_draft_tokens
+        if server_args.speculative_algorithm is not None
+        else 0
+    )
+    _max_req_pool_size = server_args.max_num_seqs // dp_size
+    # Mamba radix cache uses C++ chunk indices. Without radix cache, the
+    # backend uses 1-based req_pool_indices directly, so keep slot 0 as padding.
+    mamba_pool_size = (
+        mamba_pool_total_chunks + 1
+        if mamba_pool_total_chunks > 0
+        else (_max_req_pool_size + 1)
+    )
+    # total_size mirrors SimpleMambaPool.__init__ so the factory sizes the arena correctly.
+    _current_input_size = _max_req_pool_size + 1 if _max_req_pool_size > 0 else mamba_pool_size
+    _draft_slots_per_req = max(0, _spec_draft_tokens - 1)
+    _mamba_total_size = mamba_pool_size + _current_input_size * _draft_slots_per_req
+
+    # ----------------------------------------------------------------
+    # Pre-construction arena path (HiMA Phase 2).
+    #
+    # When a factory is provided by EventLoop we ask it to create VMM
+    # arenas *before* any tensor is allocated.  The pools then directly
+    # construct their tensors on the arena VA, so CUDA graphs capture
+    # stable VMM pointers instead of regular torch.zeros addresses.
+    # If the factory raises (e.g. VMM not available), we fall back to
+    # the normal torch.zeros path transparently.
+    # ----------------------------------------------------------------
+    kv_arena_group = None
+    mamba_arena = None
+    if pre_arenas_factory is not None and len(mamba_layer_ids) > 0:
+        import torch
+        try:
+            kv_arena_group, mamba_arena = pre_arenas_factory(
+                kv_num_layers=num_full_attn_layers,
+                kv_max_tokens=max_num_tokens,
+                kv_page_size=config.page_size,
+                kv_head_num=max(config.num_kv_heads // config.attn_tp_size, 1),
+                kv_head_dim=config.head_dim,
+                kv_dtype_itemsize=torch._utils._element_size(config.kv_cache_dtype),
+                mamba_total_size=_mamba_total_size,
+                mamba_num_layers=len(mamba_layer_ids),
+                mamba_conv_shape=conv_state_shape,
+                mamba_ssm_shape=temporal_state_shape,
+                mamba_conv_dtype=conv_dtype,
+                mamba_ssm_dtype=ssm_dtype,
+            )
+        except Exception as _factory_exc:  # noqa: BLE001
+            logger.warning(
+                "XPool pre-arenas factory failed (%s); falling back to torch.zeros",
+                _factory_exc,
+            )
+            kv_arena_group = None
+            mamba_arena = None
+
+    inner_pool = config.create_pool(
+        num_full_attn_layers, max_num_tokens, rank, enable_memory_saver,
+        kv_arena_group=kv_arena_group,
+    )
+    # Wrap with layer ID mapping (global layer IDs -> pool indices)
+    pool = LayerMappedKVPool(inner_pool, full_attn_layers)
+
     if len(mamba_layer_ids) == 0:
         logger.info(
             "Created hybrid_linear_attn backend: %d full attn layers, 0 linear "
@@ -343,6 +416,7 @@ def _create_hybrid_linear_attn(
             # 1-based req_pool_idx; the row after that range is the CUDA graph
             # padding sentinel.
             max_req_pool_size=req_pool_padding_index,
+            mamba_arena=mamba_arena,
         )
         linear_attn_backend.set_pool(mamba_pool)
     # Flat state paging (dual-index) keys off the KV pool's state slabs +
@@ -376,6 +450,7 @@ def create_attn_components(
     draft_model_config: ModelConfig | None = None,
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
+    _xpool_arena_factory: "callable | None" = None,
 ) -> tuple[
     AttentionBackend,
     BaseTokenToKVPool,
@@ -735,6 +810,7 @@ def create_attn_components(
                 else None
             ),
             mamba_pool_total_chunks=mamba_pool_total_chunks,
+            pre_arenas_factory=_xpool_arena_factory,
         )
     else:
         backend = _create_attn_backend(arch, config)

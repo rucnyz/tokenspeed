@@ -143,6 +143,7 @@ class MHAConfig(BaseAttnConfig):
         max_total_num_tokens: int,
         rank: int,
         enable_memory_saver: bool,
+        kv_arena_group: "object | None" = None,
     ) -> BaseTokenToKVPool:
         from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 
@@ -166,4 +167,5 @@ class MHAConfig(BaseAttnConfig):
             temporal_state_shape=self.temporal_state_shape,
             conv_dtype=self.conv_dtype,
             ssm_dtype=self.ssm_dtype,
+            kv_arena_group=kv_arena_group,
         )

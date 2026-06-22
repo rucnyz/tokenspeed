@@ -32,6 +32,8 @@ import ctypes
 import torch
 
 # Mapping from torch dtype to the NumPy-style typestring used by CAI.
+# bfloat16 is absent here because it has no NumPy equivalent;
+# it is handled separately via an int16 view trick in from_blob().
 _TORCH_DTYPE_TO_TYPESTR: dict[torch.dtype, str] = {
     torch.uint8: "|u1",
     torch.int8: "|i1",
@@ -41,8 +43,6 @@ _TORCH_DTYPE_TO_TYPESTR: dict[torch.dtype, str] = {
     torch.float16: "<f2",
     torch.float32: "<f4",
     torch.float64: "<f8",
-    # bfloat16 is not a NumPy type; represent as a 2-byte void.
-    torch.bfloat16: "|V2",
 }
 
 
@@ -96,6 +96,12 @@ def from_blob(
     """
     dev = torch.device(device) if not isinstance(device, torch.device) else device
     if dev.type == "cuda":
+        if dtype == torch.bfloat16:
+            # bfloat16 has no NumPy equivalent so it cannot be expressed as a
+            # standard CAI typestr.  Instead we alias the memory as int16
+            # (same 2-byte width) and reinterpret with .view(torch.bfloat16).
+            wrapper = _CUDAArrayWrapper(ptr, shape, torch.int16)
+            return torch.as_tensor(wrapper, device=dev).view(torch.bfloat16)
         wrapper = _CUDAArrayWrapper(ptr, shape, dtype)
         return torch.as_tensor(wrapper, device=dev)
 

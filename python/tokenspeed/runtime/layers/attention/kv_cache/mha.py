@@ -22,6 +22,10 @@ from __future__ import annotations
 
 from collections import Counter
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import store_kv_cache
@@ -33,6 +37,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.flat_state_slabs import (
     FlatStateSlabs,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.cache.arena.kv_arena import KvLayerArenaGroup
 from tokenspeed.runtime.layers.attention.kv_cache.utils import (
     copy_all_layer_kv_cache_tiled,
     move_kv_cache_native,
@@ -71,6 +78,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         temporal_state_shape: tuple[int, ...] | None = None,
         conv_dtype: torch.dtype | None = None,
         ssm_dtype: torch.dtype | None = None,
+        kv_arena_group: "object | None" = None,
     ):
         super().__init__(
             size, dtype, device, max_batch_size, max_context_len, page_size, rank
@@ -106,6 +114,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             size=self.size,
             kv_bytes_per_slot=2 * head_num * head_dim * self.store_dtype.itemsize,
         )
+        self.page_size_bytes = self._get_page_size_bytes()
+        # Store arena reference before _create_buffers so the VMM path can use it.
+        self._pre_built_kv_arena = kv_arena_group
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
@@ -182,6 +193,10 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             )
 
     def _create_buffers(self):
+        if getattr(self, "_pre_built_kv_arena", None) is not None:
+            self._create_buffers_vmm(self._pre_built_kv_arena)
+            return
+
         # Tag as "kv_cache", no CPU backup: KV is discarded on sleep and rebuilt
         # after wake (paging overwrites; clear_kv_buffers zeros the remapped pages).
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
@@ -283,6 +298,174 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             # policy. FlatStateSlabs.allocate is a no-op (leaving
             # state_slabs == []) unless the flat-GDN gate is on.
             self._state.allocate(self.device)
+
+    def _create_buffers_vmm(self, kv_arena_group: "object") -> None:
+        """Pre-construction path: allocate k/v buffers directly on VMM arena VA.
+
+        Unlike the default ``_create_buffers`` which calls ``torch.zeros``, this
+        method creates tensors as zero-copy views over the arena VA windows.
+        No existing tensors are replaced — the tensors are *born* on VMM-backed
+        memory, so there is no temporary 2× memory spike.
+
+        The arena must already be mapped for ``initial_live_rows`` rows when this
+        is called; the tail VA (headroom for future XPool growth) is reserved but
+        not yet physically backed and must not be accessed until the C++ allocator
+        has grown capacity and the arena has been grown to match.
+
+        After this call ``_kv_arena`` is set, marking the pool as VMM-bound so
+        that :meth:`bind_arena` knows not to re-create the arenas.
+        """
+        from tokenspeed.runtime.cache.arena.from_blob import from_blob
+
+        shape = (self.size + self.page_size, self.head_num, self.head_dim)
+        live = kv_arena_group.initial_live_rows
+
+        logger.info(
+            "_create_buffers_vmm: %d layers, shape=%s, live_rows=%d",
+            self.layer_num,
+            shape,
+            live,
+        )
+        self.k_buffer = []
+        self.v_buffer = []
+        for i in range(self.layer_num):
+            k = from_blob(
+                kv_arena_group.k_base_ptr(i),
+                shape,
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            v = from_blob(
+                kv_arena_group.v_base_ptr(i),
+                shape,
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            # Zero only the mapped (live) rows; tail VA is unmapped headroom.
+            if live > 0:
+                k[:live].zero_()
+                v[:live].zero_()
+            self.k_buffer.append(k)
+            self.v_buffer.append(v)
+
+        torch.cuda.synchronize()
+
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_buffer + self.v_buffer
+            ],
+            device=self.device,
+        )
+        self._kv_arena = kv_arena_group
+        logger.info(
+            "KV pool pre-constructed on VMM arena VA: %d layers, shape=%s, live=%d",
+            self.layer_num,
+            shape,
+            live,
+        )
+
+    def bind_arena(self, kv_arena_group: "KvLayerArenaGroup") -> None:
+        """Rebind every per-layer k/v buffer to VMM-backed arena VA windows.
+
+        Replaces tensors one layer at a time so that peak GPU memory stays
+        close to the normal pool size (no transient 2× spike).  Only
+        ``kv_arena_group.initial_live_rows`` rows of each buffer are
+        zero-initialised; the tail VA is still unmapped (headroom pages) and
+        must not be accessed until the C++ allocator has grown the capacity and
+        the arena has been grown to match.
+
+        After the call ``k_data_ptrs``, ``v_data_ptrs``, ``data_ptrs`` and
+        ``data_strides`` are rebuilt to reflect the new VA addresses.
+
+        Args:
+            kv_arena_group: A :class:`KvLayerArenaGroup` whose per-layer
+                arenas are already partially mapped (``initial_live_rows`` rows
+                physically backed).
+        """
+        from tokenspeed.runtime.cache.arena.from_blob import from_blob
+
+        shape = (self.size + self.page_size, self.head_num, self.head_dim)
+        live = kv_arena_group.initial_live_rows
+
+        for i in range(self.layer_num):
+            # Drop the old tensor before creating the new one so physical
+            # memory is reclaimed immediately (avoids 2× peak per layer).
+            self.k_buffer[i] = None
+            self.v_buffer[i] = None
+
+            new_k = from_blob(
+                kv_arena_group.k_base_ptr(i),
+                shape,
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            new_v = from_blob(
+                kv_arena_group.v_base_ptr(i),
+                shape,
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            # Zero only the mapped (live) rows; tail VA is unmapped.
+            if live > 0:
+                new_k[:live].zero_()
+                new_v[:live].zero_()
+
+            self.k_buffer[i] = new_k
+            self.v_buffer[i] = new_v
+
+        torch.cuda.synchronize()
+
+        # Rebuild data-pointer tensors used by attention kernels.
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_buffer + self.v_buffer
+            ],
+            device=self.device,
+        )
+        self._kv_arena = kv_arena_group
+        logger.info(
+            "KV pool bound to VMM per-layer arenas: %d layers, "
+            "shape=%s, live_rows=%d",
+            self.layer_num,
+            shape,
+            live,
+        )
+
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
+        if hasattr(self, "k_data_ptrs"):
+            del self.k_data_ptrs
+        if hasattr(self, "v_data_ptrs"):
+            del self.v_data_ptrs
+        if hasattr(self, "data_ptrs"):
+            del self.data_ptrs
+        if hasattr(self, "data_strides"):
+            del self.data_strides
 
     def _init_kv_copy_and_warmup(self):
         _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192

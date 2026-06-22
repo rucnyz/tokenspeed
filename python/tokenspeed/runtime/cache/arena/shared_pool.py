@@ -66,6 +66,41 @@ class SharedHandlePool:
                 self._handles[chunk_id] = cu_mem_create(self.chunk_size, self.device)
         return self._handles[chunk_id]
 
+    def extract_handle(self, chunk_id: int) -> int:
+        """Remove and return the raw ``CUmemGenericAllocationHandle`` for
+        *chunk_id* **without** calling ``cuMemRelease``.
+
+        The caller takes ownership of the physical allocation.  Use this for
+        cross-pool handle donation: the handle can be injected into another
+        pool via :meth:`inject_handle` so the physical pages are reused
+        rather than freed and re-allocated.
+
+        Raises ``KeyError`` if *chunk_id* has no cached handle (i.e. the
+        chunk was never physically allocated in this pool).
+        """
+        return self._handles.pop(chunk_id)
+
+    def inject_handle(self, chunk_id: int, handle: int) -> None:
+        """Pre-load a raw ``CUmemGenericAllocationHandle`` at *chunk_id*.
+
+        The physical allocation was obtained externally (e.g. from
+        :meth:`extract_handle` on another pool) and is being donated to
+        this pool.  No ``cuMemCreate`` is called.
+
+        If *chunk_id* is beyond the current ``num_chunks`` watermark the
+        watermark is extended so :meth:`get_handle` considers the slot valid.
+
+        Raises ``RuntimeError`` if *chunk_id* already holds a cached handle.
+        """
+        if chunk_id in self._handles:
+            raise RuntimeError(
+                f"SharedHandlePool.inject_handle: chunk_id {chunk_id} already "
+                f"has a handle (value={self._handles[chunk_id]})"
+            )
+        self._handles[chunk_id] = handle
+        if chunk_id >= self.num_chunks:
+            self.num_chunks = chunk_id + 1
+
     def release_all(self) -> None:
         """Free every physical allocation held by this pool."""
         if self.device is not None:
