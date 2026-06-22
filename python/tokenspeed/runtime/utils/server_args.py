@@ -242,6 +242,8 @@ class ServerArgs:
     enable_xpool_dynamic_capacity: bool = False
     budgeter_tick_s: float = 1.0
     budgeter_pages_per_fire: int = 64
+    xpool_nb_margin: float = 0.05
+    xpool_ewma_tau_s: float = 1.0
     disable_kvstore: bool = False
     enforce_eager: bool = False
     disable_cuda_graph_padding: bool = False

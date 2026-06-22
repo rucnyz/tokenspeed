@@ -494,6 +494,15 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              &tokenspeed::Scheduler::HasCappedKvInflight,
              "True while any capped KV page is held by an in-flight request. "
              "Poll until False before unmapping (shrink-and-drain step 2).")
+        .def("prepare_mamba_to_kv_fire",
+             &tokenspeed::Scheduler::PrepareMambaToKvFire,
+             nb::arg("n_mamba_slots"),
+             "Cap tail mamba slots before physical unmap (shrink-and-drain step 1 "
+             "for mamba_to_kv direction).  Must be called before cuMemUnmap.")
+        .def("has_capped_mamba_inflight",
+             &tokenspeed::Scheduler::HasCappedMambaInflight,
+             "True while any capped mamba slot is held by an in-flight request. "
+             "Poll until False before unmapping (shrink-and-drain step 2).")
         .def("cancel_xpool_fire", &tokenspeed::Scheduler::CancelXPoolFire,
              "Clear the pending fire latch without updating allocator capacities. "
              "Call when the Python actuator skips the physical VMM step (e.g. arena "

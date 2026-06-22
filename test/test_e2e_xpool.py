@@ -30,6 +30,7 @@ def main():
         enable_xpool_dynamic_capacity=True,
         budgeter_pages_per_fire=32,
         budgeter_tick_s=0.5,
+        xpool_nb_margin=0.001,
     )
 
     # 触发推理，产生负载让 budgeter 可能触发

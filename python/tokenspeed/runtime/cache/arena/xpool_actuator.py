@@ -193,20 +193,27 @@ class XPoolActuator:
             1, math.ceil(n_kv_pages * self._kv_bytes_per_page / CHUNK_SIZE_BYTES)
         )
 
-    def _wait_drain(self) -> None:
-        """Poll until no capped KV pages remain in-flight (or timeout)."""
+    def _wait_drain(self, drain_fn_name: str = "has_capped_kv_inflight") -> None:
+        """Poll until no capped pages/slots remain in-flight (or timeout).
+
+        Args:
+            drain_fn_name: Name of the C++ scheduler method to poll.  Defaults
+                to ``has_capped_kv_inflight`` for kv_to_mamba direction.  Pass
+                ``has_capped_mamba_inflight`` for mamba_to_kv direction.
+        """
         if self._scheduler is None:
             return
-        drain_fn = getattr(self._scheduler, "has_capped_kv_inflight", None)
+        drain_fn = getattr(self._scheduler, drain_fn_name, None)
         if drain_fn is None:
             return
         deadline = time.monotonic() + self.DRAIN_TIMEOUT_S
         while drain_fn():
             if time.monotonic() > deadline:
                 logger.warning(
-                    "XPool drain timeout after %.1f s; proceeding with unmap "
-                    "(some in-flight pages may still be in use)",
+                    "XPool drain timeout after %.1f s (fn=%s); proceeding with "
+                    "unmap (some in-flight pages may still be in use)",
                     self.DRAIN_TIMEOUT_S,
+                    drain_fn_name,
                 )
                 break
             time.sleep(self.DRAIN_POLL_S)
@@ -287,19 +294,42 @@ class XPoolActuator:
         use_transfer = self._kv_supports_handle_transfer()
 
         if plan.direction == "mamba_to_kv":
-            kv_available = getattr(self.kv_arena, "max_chunks", 0) - getattr(
-                self.kv_arena, "mapped_chunks", 0
-            )
+            # KvLayerArenaGroup exposes headroom_pages (in KV-page units) which
+            # already accounts for per-layer chunk → page conversion.  Fall back
+            # to the raw max_chunks/mapped_chunks difference for a plain
+            # ChunkArena (where 1 chunk ≈ 1 page in the caller's mapping).
+            if hasattr(self.kv_arena, "headroom_pages"):
+                kv_available = self.kv_arena.headroom_pages
+            else:
+                kv_available = getattr(self.kv_arena, "max_chunks", 0) - getattr(
+                    self.kv_arena, "mapped_chunks", 0
+                )
             if kv_available < n_kv_pages:
                 logger.warning(
                     "mamba_to_kv fire skipped (op_id=%d): kv arena headroom "
-                    "exhausted (%d/%d mapped, need %d more chunks)",
+                    "exhausted (headroom=%d pages, need %d pages)",
                     plan.op_id,
-                    getattr(self.kv_arena, "mapped_chunks", "?"),
-                    getattr(self.kv_arena, "max_chunks", "?"),
+                    kv_available,
                     n_kv_pages,
                 )
                 return False
+
+            # Shrink-and-drain: cap the tail mamba slots in C++ BEFORE unmap so
+            # no new allocations land on slots that are about to be transferred.
+            if self._scheduler is not None:
+                prepare_fn = getattr(
+                    self._scheduler, "prepare_mamba_to_kv_fire", None
+                )
+                if prepare_fn is not None:
+                    try:
+                        prepare_fn(n_mamba_chunks)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "prepare_mamba_to_kv_fire failed (n=%d): %s",
+                            n_mamba_chunks, exc,
+                        )
+                        return False
+            self._wait_drain("has_capped_mamba_inflight")
 
             if use_transfer:
                 # True handle transfer: shrink mamba → donate handles → grow KV.

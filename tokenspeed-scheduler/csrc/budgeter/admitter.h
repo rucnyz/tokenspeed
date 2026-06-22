@@ -53,6 +53,12 @@ struct PoolSnapshot {
     std::int32_t mamba_total_slots{0};
     std::int32_t mamba_evictable_slots{0};
     std::int32_t queue_len{0};
+
+    // Physical arena headroom: slots/pages that have reserved VMM VA but are
+    // not yet mapped.  The budgeter checks these before issuing a fire so it
+    // does not generate plans that the Python actuator would immediately cancel.
+    std::int32_t kv_headroom_pages{0};
+    std::int32_t mamba_headroom_slots{0};
 };
 
 class Admitter {

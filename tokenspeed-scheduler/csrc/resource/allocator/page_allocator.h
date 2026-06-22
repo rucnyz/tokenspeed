@@ -58,6 +58,15 @@ public:
     // Returns 0 when it is safe to physically unmap the capped tail.
     std::int32_t CappedInflightPages() const;
 
+    // Number of KV pages in the VMM VA window that are not yet physically
+    // mapped.  Non-zero only in dynamic-capacity mode; represents the maximum
+    // number of pages the arena can still Grow() into (mamba→KV headroom).
+    std::int32_t HeadroomPages() const {
+        if (!enable_dynamic_capacity_) return 0;
+        // total_pages_ includes a sentinel, so max usable = total_pages_ - 1.
+        return std::max(0, total_pages_ - 1 - mapped_pages_);
+    }
+
 private:
     std::int32_t page_size_{};
     std::int32_t total_pages_{};

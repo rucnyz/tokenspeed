@@ -99,6 +99,14 @@ public:
     // The Python actuator polls this until it returns false before unmapping.
     bool HasCappedKvInflight() const;
 
+    // Symmetric shrink-and-drain helpers for mamba_to_kv direction.
+    //
+    // PrepareMambaToKvFire() caps the tail mamba slots BEFORE physical unmap so
+    // no new allocations land on slots that are about to be transferred to KV.
+    // HasCappedMambaInflight() polls until all capped slots are freed.
+    void PrepareMambaToKvFire(std::int32_t n_mamba_slots);
+    bool HasCappedMambaInflight() const;
+
     // Clears the pending fire latch WITHOUT updating allocator capacities.
     // Call this when the Python actuator decides to skip the physical VMM step
     // (e.g. arena headroom is exhausted) so the budgeter can emit new plans.
@@ -163,9 +171,10 @@ private:
 
 private:
     SchedulerConfig config_;
-    // Tracks how many KV pages have been pre-shrunk via PrepareKvToMambaFire
-    // so that ApplyXPoolFire does not double-shrink.
+    // Tracks how many KV/mamba pages have been pre-shrunk via the Prepare*
+    // helpers so that ApplyXPoolFire does not double-shrink.
     std::int32_t kv_pre_shrunk_pages_{0};
+    std::int32_t mamba_pre_shrunk_slots_{0};
 
 private:
     PageAllocator device_allocator_;

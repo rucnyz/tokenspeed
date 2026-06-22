@@ -432,6 +432,8 @@ class EventLoop:
             enable_xpool_dynamic_capacity=server_args.enable_xpool_dynamic_capacity,
             budgeter_tick_s=server_args.budgeter_tick_s,
             budgeter_pages_per_fire=server_args.budgeter_pages_per_fire,
+            xpool_nb_margin=server_args.xpool_nb_margin,
+            xpool_ewma_tau_s=server_args.xpool_ewma_tau_s,
             # Initial capacities: profiled baselines (strictly less than VA window).
             xpool_initial_kv_pages=profiled_kv_pages if xpool_pages_headroom > 0 else 0,
             xpool_initial_mamba_slots=(

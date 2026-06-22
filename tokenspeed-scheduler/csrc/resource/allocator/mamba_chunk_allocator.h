@@ -68,6 +68,14 @@ public:
     void CapSlots(const std::vector<std::int32_t>& slot_ids);
     void UncapSlots(const std::vector<std::int32_t>& slot_ids);
 
+    // Returns the number of capped slots still held by in-flight requests.
+    // Zero means it is safe to physically unmap the shrunk region.
+    std::int32_t CappedInflightSlots() const;
+
+    // Number of slots that have been physically mapped but not yet Grow()-ed
+    // into allocatable range.  Used by the budgeter headroom check.
+    std::int32_t HeadroomSlots() const { return total_slots_ - mapped_slots_; }
+
 private:
     std::int32_t total_slots_;
     std::int32_t mapped_slots_{0};

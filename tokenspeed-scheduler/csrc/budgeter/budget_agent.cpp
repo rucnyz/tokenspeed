@@ -22,10 +22,52 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <memory>
+
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/sinks/basic_file_sink.h>
 
 namespace tokenspeed {
 
 namespace {
+
+// Budgeter diagnostics are routed to a dedicated file (default
+// /tmp/tokenspeed_budget_tick.log, overridable via TOKENSPEED_BUDGET_LOG) so
+// they survive the engine subprocess environment:
+//   * Third-party code linked into the same process — notably flashinfer's
+//     logging.h — calls spdlog::set_default_logger() to install its own
+//     stdout sink, hijacking the global default logger.
+//   * The scheduler runs in a spawned subprocess whose stdout (fd 1) AND
+//     stderr (fd 2) are redirected away from the captured stream during
+//     torch/CUDA init (Python logging survives only because it holds a dup of
+//     the original stream).  Neither stdout nor stderr sinks reliably reach
+//     the captured output.
+// A file sink is immune to both issues.  Setting TOKENSPEED_BUDGET_LOG=""
+// (empty string) disables diagnostics entirely for production.
+bool BudgetLogEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("TOKENSPEED_BUDGET_LOG");
+        return env == nullptr || env[0] != '\0';
+    }();
+    return enabled;
+}
+
+spdlog::logger& BudgetLogger() {
+    static std::shared_ptr<spdlog::logger> logger = [] {
+        const char* env = std::getenv("TOKENSPEED_BUDGET_LOG");
+        const std::string path = (env != nullptr && env[0] != '\0')
+                                     ? std::string{env}
+                                     : std::string{"/tmp/tokenspeed_budget_tick.log"};
+        auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(path, /*truncate=*/true);
+        auto lg = std::make_shared<spdlog::logger>("budgeter", sink);
+        lg->set_level(spdlog::level::info);
+        lg->flush_on(spdlog::level::info);
+        return lg;
+    }();
+    return *logger;
+}
 
 EvictionConfig MakeEvictionConfig(const SchedulerConfig& config) {
     EvictionConfig out;
@@ -83,32 +125,69 @@ std::optional<XPoolFirePlan> BudgetAgent::Tick(const PoolSnapshot& snapshot) {
     // initialised) by clamping the denominator to at least 1.
     const double kv_util = 1.0 - static_cast<double>(snapshot.kv_free_pages) /
                                      static_cast<double>(std::max(snapshot.kv_total_pages, 1));
-    const double mamba_util = 1.0 - static_cast<double>(snapshot.mamba_free_slots) /
-                                        static_cast<double>(std::max(snapshot.mamba_total_slots, 1));
+    // Effective mamba utilisation: subtract evictable prefix-cache slots so
+    // that cached-but-evictable mamba states do not inflate pressure and block
+    // mamba_to_kv fires when KV demand exceeds genuine mamba demand.
+    const std::int32_t mamba_used =
+        std::max(0, snapshot.mamba_total_slots - snapshot.mamba_free_slots
+                    - snapshot.mamba_evictable_slots);
+    const double mamba_util = static_cast<double>(mamba_used) /
+                              static_cast<double>(std::max(snapshot.mamba_total_slots, 1));
     const double eta = config_.xpool_ewma_tau_s > 0.0 ? std::min(1.0, dt / config_.xpool_ewma_tau_s) : 0.1;
     ewma_pressure_kv_ = (1.0 - eta) * ewma_pressure_kv_ + eta * kv_util;
     ewma_pressure_mamba_ = (1.0 - eta) * ewma_pressure_mamba_ + eta * mamba_util;
 
+    const std::int32_t n_kv = config_.budgeter_pages_per_fire;
+    // Compute how many mamba slots correspond to one fire worth of KV pages.
+    std::int32_t n_mamba = 0;
+    if (config_.mamba_bytes_per_slot > 0 && config_.kv_bytes_per_page > 0) {
+        n_mamba = static_cast<std::int32_t>(
+            static_cast<std::int64_t>(n_kv) *
+            static_cast<std::int64_t>(config_.kv_bytes_per_page) /
+            static_cast<std::int64_t>(config_.mamba_bytes_per_slot));
+    }
+
+    if (BudgetLogEnabled()) {
+        BudgetLogger().info(
+            "BudgetTick: kv_util={:.4f} mamba_util={:.4f}(eff) ewma_kv={:.4f} ewma_mamba={:.4f} "
+            "kv_free={} kv_total={} mamba_free={} mamba_used={} mamba_evict={} mamba_total={} kv_headroom={}",
+            kv_util, mamba_util, ewma_pressure_kv_, ewma_pressure_mamba_,
+            snapshot.kv_free_pages, snapshot.kv_total_pages,
+            snapshot.mamba_free_slots, mamba_used,
+            snapshot.mamba_evictable_slots, snapshot.mamba_total_slots,
+            snapshot.kv_headroom_pages);
+    }
+
     if (ewma_pressure_kv_ > ewma_pressure_mamba_ + config_.xpool_nb_margin &&
         snapshot.mamba_free_slots > config_.xpool_mamba_floor_slots) {
+        // Guard: only fire if KV has physical VMM headroom to receive handles.
+        if (n_kv > 0 && snapshot.kv_headroom_pages < n_kv) {
+            if (BudgetLogEnabled()) {
+                BudgetLogger().info("BudgetTick: mamba_to_kv blocked by kv_headroom ({} < {})",
+                                    snapshot.kv_headroom_pages, n_kv);
+            }
+            return std::nullopt;
+        }
         XPoolFirePlan plan;
         plan.direction = "mamba_to_kv";
         plan.op_id = next_op_id_++;
-        const std::int32_t n = config_.budgeter_pages_per_fire;
-        plan.page_ids.reserve(static_cast<std::size_t>(n));
-        for (std::int32_t i = 0; i < n; ++i) {
+        plan.page_ids.reserve(static_cast<std::size_t>(n_kv));
+        for (std::int32_t i = 0; i < n_kv; ++i) {
             plan.page_ids.push_back(i + 1);
         }
         pending_fire_ = plan;
         return plan;
     }
     if (ewma_pressure_mamba_ > ewma_pressure_kv_ + config_.xpool_nb_margin) {
+        // Guard: only fire if mamba has physical VMM headroom to receive handles.
+        if (n_mamba > 0 && snapshot.mamba_headroom_slots < n_mamba) {
+            return std::nullopt;
+        }
         XPoolFirePlan plan;
         plan.direction = "kv_to_mamba";
         plan.op_id = next_op_id_++;
-        const std::int32_t n = config_.budgeter_pages_per_fire;
-        plan.page_ids.reserve(static_cast<std::size_t>(n));
-        for (std::int32_t i = 0; i < n; ++i) {
+        plan.page_ids.reserve(static_cast<std::size_t>(n_kv));
+        for (std::int32_t i = 0; i < n_kv; ++i) {
             plan.page_ids.push_back(i + 1);
         }
         pending_fire_ = plan;

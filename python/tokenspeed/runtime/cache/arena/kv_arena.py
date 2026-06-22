@@ -237,6 +237,50 @@ class KvLayerArenaGroup:
             len(raw_handles), n_kv_pages, n_arenas,
         )
 
+    # ------------------------------------------------------------------
+    # Headroom helpers (used by XPoolActuator for mamba_to_kv checks)
+    # ------------------------------------------------------------------
+
+    @property
+    def max_chunks(self) -> int:
+        """Per-layer maximum VMM chunks (baseline + mamba_to_kv headroom).
+
+        Exposed so :class:`~tokenspeed.runtime.cache.arena.xpool_actuator.XPoolActuator`
+        can check available KV headroom using the same attribute name as
+        :class:`~tokenspeed.runtime.cache.arena.chunk_arena.ChunkArena`.
+        Returns the value from the first K-arena (all layers share the same
+        window size).
+        """
+        return self._k_arenas[0].max_chunks if self._k_arenas else 0
+
+    @property
+    def mapped_chunks(self) -> int:
+        """Per-layer currently mapped VMM chunks.
+
+        See :attr:`max_chunks` for usage context.
+        """
+        return self._k_arenas[0].mapped_chunks if self._k_arenas else 0
+
+    @property
+    def headroom_pages(self) -> int:
+        """Number of additional KV *pages* this group can grow by.
+
+        Converts the per-layer VMM chunk headroom
+        (``max_chunks - mapped_chunks``) back into KV page units so that
+        :class:`~tokenspeed.runtime.cache.arena.xpool_actuator.XPoolActuator`
+        can compare directly against ``n_kv_pages`` without needing to know
+        the per-layer chunk conversion factor.
+
+        Returns 0 when the arenas are not initialised or the per-layer byte
+        sizes are unknown.
+        """
+        if not self._k_arenas or self._bytes_per_page_per_layer <= 0:
+            return 0
+        headroom_chunks = self._k_arenas[0].max_chunks - self._k_arenas[0].mapped_chunks
+        if headroom_chunks <= 0:
+            return 0
+        return int(headroom_chunks * CHUNK_SIZE_BYTES // self._bytes_per_page_per_layer)
+
     def close(self) -> None:
         """Release all per-layer arena VA windows."""
         for arena in self._k_arenas + self._v_arenas:

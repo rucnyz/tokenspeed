@@ -497,11 +497,23 @@ void Scheduler::Advance(const ExecutionEvent& event) {
 PoolSnapshot Scheduler::MakePoolSnapshot() const {
     PoolSnapshot snapshot;
     snapshot.kv_free_pages = device_allocator_.AvailablePages();
-    snapshot.kv_total_pages = device_allocator_.TotalPages();
+    // Use MappedPages() as the denominator so that utilisation reflects only
+    // physically-accessible capacity.  TotalPages() includes unmapped VMM
+    // headroom which would create phantom pressure and confuse the budgeter.
+    snapshot.kv_total_pages = device_allocator_.MappedPages();
     snapshot.kv_evictable_pages = kv_prefix_cache_.GetDeviceManager().EvictablePagesNum();
+    snapshot.kv_headroom_pages = device_allocator_.HeadroomPages();
     if (mamba_allocator_) {
         snapshot.mamba_free_slots = mamba_allocator_->AvailableSlots();
-        snapshot.mamba_total_slots = mamba_allocator_->TotalSlots();
+        // Same reasoning: use MappedSlots() to avoid phantom mamba utilisation.
+        snapshot.mamba_total_slots = mamba_allocator_->MappedSlots();
+        snapshot.mamba_headroom_slots = mamba_allocator_->HeadroomSlots();
+        // Evictable: prefix-cached mamba states that are not pinned by any
+        // active request.  Counted here so the budgeter can subtract them from
+        // mamba pressure — cached slots should not prevent mamba_to_kv fires.
+        if (hybrid_prefix_cache_) {
+            snapshot.mamba_evictable_slots = hybrid_prefix_cache_->MambaEvictableSlots();
+        }
     }
     snapshot.queue_len = static_cast<std::int32_t>(WaitingSize());
     return snapshot;
@@ -535,6 +547,52 @@ bool Scheduler::HasCappedKvInflight() const {
     return device_allocator_.CappedInflightPages() > 0;
 }
 
+void Scheduler::PrepareMambaToKvFire(std::int32_t n_mamba_chunks) {
+    if (!config_.enable_xpool_dynamic_capacity || n_mamba_chunks <= 0 ||
+        !mamba_allocator_) {
+        return;
+    }
+    // The Python side passes n_mamba_chunks in physical VMM-chunk units
+    // (e.g. 20 × 2 MB chunks).  The C++ mamba allocator tracks logical
+    // *sequence* slots whose byte cost is config_.mamba_bytes_per_slot.
+    // Convert: n_seq = n_vmm_chunks * CHUNK_SIZE / mamba_bytes_per_slot.
+    // When one fire moves less than one full sequence slot (n_seq == 0) no
+    // C++ cap/drain step is needed — the Python arena shrinks physically
+    // without displacing any sequence-level allocation.
+    std::int32_t n_seq_slots = n_mamba_chunks;  // fallback: treat 1 chunk == 1 slot
+    if (config_.mamba_bytes_per_slot > 0 && config_.kv_bytes_per_page > 0) {
+        // Re-derive the sequence-slot equivalent using the same formula as
+        // the budgeter: n_seq = n_kv * kv_bytes / mamba_bytes.
+        // n_mamba_chunks ≈ n_kv * kv_bytes / CHUNK_SIZE, so
+        //   n_seq ≈ n_mamba_chunks * CHUNK_SIZE / mamba_bytes_per_slot.
+        // We approximate CHUNK_SIZE from the ratio: if n_kv * kv_bpp produces
+        // n_mamba_chunks VMM chunks, then CHUNK_SIZE ≈ n_kv * kv_bpp / n_mamba_chunks.
+        // Simpler: use budgeter_pages_per_fire * kv_bpp / mamba_bps directly.
+        n_seq_slots = static_cast<std::int32_t>(
+            static_cast<std::int64_t>(config_.budgeter_pages_per_fire) *
+            static_cast<std::int64_t>(config_.kv_bytes_per_page) /
+            static_cast<std::int64_t>(config_.mamba_bytes_per_slot));
+    }
+    if (n_seq_slots <= 0) {
+        // Each fire moves less than one full mamba sequence slot in bytes.
+        // No C++ shrink/drain required — the physical unmap is safe because
+        // no sequence allocations will be displaced.
+        mamba_pre_shrunk_slots_ = 0;
+        return;
+    }
+    // Cap the tail mamba sequence slots before physical unmap so no new
+    // allocations land on slots that are about to be transferred to KV.
+    mamba_allocator_->Shrink(n_seq_slots);
+    mamba_pre_shrunk_slots_ += n_seq_slots;
+}
+
+bool Scheduler::HasCappedMambaInflight() const {
+    if (!mamba_allocator_) {
+        return false;
+    }
+    return mamba_allocator_->CappedInflightSlots() > 0;
+}
+
 void Scheduler::ApplyXPoolFire(const XPoolFirePlan& plan) {
     if (!config_.enable_xpool_dynamic_capacity) {
         return;
@@ -557,11 +615,16 @@ void Scheduler::ApplyXPoolFire(const XPoolFirePlan& plan) {
 
     if (plan.direction == "mamba_to_kv") {
         // Physical memory moved from mamba arena → KV arena (done by actuator).
-        // C++: grow KV, shrink mamba.
+        // C++: grow KV allocator; mamba Shrink may already have been done by
+        // PrepareMambaToKvFire — only shrink the remainder to avoid double-shrink.
         device_allocator_.Grow(n_kv_pages);
         if (mamba_allocator_ && n_mamba_slots > 0) {
-            mamba_allocator_->Shrink(n_mamba_slots);
+            const std::int32_t remaining = n_mamba_slots - mamba_pre_shrunk_slots_;
+            if (remaining > 0) {
+                mamba_allocator_->Shrink(remaining);
+            }
         }
+        mamba_pre_shrunk_slots_ = 0;
     } else if (plan.direction == "kv_to_mamba") {
         // KV Shrink may already have been done by PrepareKvToMambaFire.
         // Only shrink the remaining pages (if any) to avoid double-shrink.
@@ -583,10 +646,22 @@ void Scheduler::ApplyXPoolFire(const XPoolFirePlan& plan) {
 
 void Scheduler::CancelXPoolFire() {
     // Called when the Python actuator skips the physical VMM step (e.g. arena
-    // headroom exhausted).  Clears the pending latch so the budgeter is
-    // unblocked but does NOT update allocator capacities (no physical transfer
-    // happened).
-    kv_pre_shrunk_pages_ = 0;
+    // headroom exhausted).  We must UNDO any C++ Shrink that was performed in
+    // preparation, since no physical transfer happened.  Failing to restore
+    // mapped_pages_ causes kv_util to appear near-zero (the denominator shrinks
+    // with each cancelled fire) which prevents the budgeter from ever switching
+    // to the mamba_to_kv direction.
+    if (kv_pre_shrunk_pages_ > 0) {
+        // Undo PrepareKvToMambaFire's Shrink: raise mapped_pages_ back and
+        // return the tail pages to the free list so kv_util stays accurate.
+        device_allocator_.Grow(kv_pre_shrunk_pages_);
+        kv_pre_shrunk_pages_ = 0;
+    }
+    if (mamba_pre_shrunk_slots_ > 0 && mamba_allocator_) {
+        // Undo PrepareMambaToKvFire's Shrink: restore mamba slot capacity.
+        mamba_allocator_->Grow(mamba_pre_shrunk_slots_);
+        mamba_pre_shrunk_slots_ = 0;
+    }
     if (budget_agent_) {
         budget_agent_->ClearPendingFire();
     }

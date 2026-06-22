@@ -157,6 +157,13 @@ public:
     std::int32_t AvailableSlots() const;
     KVPrefixCache& GetKVPrefixCache() { return kv_prefix_cache_; }
 
+    // Number of mamba prefix-cache chunks that are evictable (not pinned by
+    // any active request).  Used by the budgeter to compute effective mamba
+    // utilisation: cached-but-evictable slots should not inflate pressure.
+    std::int32_t MambaEvictableSlots() const {
+        return mamba_eviction_manager_.EvictableSlots();
+    }
+
 private:
     friend class HybridPrefixCacheTestPeer;
 
