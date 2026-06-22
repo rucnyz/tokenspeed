@@ -33,23 +33,22 @@ namespace tokenspeed {
 
 namespace {
 
-// Budgeter diagnostics are routed to a dedicated file (default
-// /tmp/tokenspeed_budget_tick.log, overridable via TOKENSPEED_BUDGET_LOG) so
-// they survive the engine subprocess environment:
-//   * Third-party code linked into the same process — notably flashinfer's
-//     logging.h — calls spdlog::set_default_logger() to install its own
-//     stdout sink, hijacking the global default logger.
-//   * The scheduler runs in a spawned subprocess whose stdout (fd 1) AND
-//     stderr (fd 2) are redirected away from the captured stream during
-//     torch/CUDA init (Python logging survives only because it holds a dup of
-//     the original stream).  Neither stdout nor stderr sinks reliably reach
-//     the captured output.
-// A file sink is immune to both issues.  Setting TOKENSPEED_BUDGET_LOG=""
-// (empty string) disables diagnostics entirely for production.
+// Budgeter diagnostics are opt-in via the TOKENSPEED_BUDGET_LOG env var so
+// production deployments stay quiet by default.  When the env var is set to
+// a non-empty path, BudgetTick records are appended to that file.
+//
+// Implementation note: a file sink is required because:
+//   * The scheduler runs in a spawned subprocess whose stdout/stderr are
+//     redirected away from the captured stream during torch/CUDA init, so
+//     stdout/stderr spdlog sinks reach nothing the operator can see.
+//   * Third-party code (notably flashinfer's logging.h) hijacks the global
+//     spdlog default logger, so spdlog::info() routes to a stdout sink that
+//     is then lost in the redirection above.
+// A dedicated named logger bound to a file sink sidesteps both issues.
 bool BudgetLogEnabled() {
     static const bool enabled = [] {
         const char* env = std::getenv("TOKENSPEED_BUDGET_LOG");
-        return env == nullptr || env[0] != '\0';
+        return env != nullptr && env[0] != '\0';
     }();
     return enabled;
 }
