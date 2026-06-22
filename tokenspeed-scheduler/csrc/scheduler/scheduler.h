@@ -99,6 +99,11 @@ public:
     // The Python actuator polls this until it returns false before unmapping.
     bool HasCappedKvInflight() const;
 
+    // Clears the pending fire latch WITHOUT updating allocator capacities.
+    // Call this when the Python actuator decides to skip the physical VMM step
+    // (e.g. arena headroom is exhausted) so the budgeter can emit new plans.
+    void CancelXPoolFire();
+
     // Capacity observability helpers (for Python-side monitoring).
     std::int32_t MappedKvPages() const;
     std::int32_t AvailableMambaSlots() const;

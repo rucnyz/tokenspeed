@@ -494,6 +494,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              &tokenspeed::Scheduler::HasCappedKvInflight,
              "True while any capped KV page is held by an in-flight request. "
              "Poll until False before unmapping (shrink-and-drain step 2).")
+        .def("cancel_xpool_fire", &tokenspeed::Scheduler::CancelXPoolFire,
+             "Clear the pending fire latch without updating allocator capacities. "
+             "Call when the Python actuator skips the physical VMM step (e.g. arena "
+             "headroom exhausted) so the budgeter can emit new plans.")
         .def("mapped_kv_pages", &tokenspeed::Scheduler::MappedKvPages,
              "Number of KV pages currently mapped in the VMM arena.")
         .def("available_mamba_slots", &tokenspeed::Scheduler::AvailableMambaSlots,

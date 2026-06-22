@@ -115,6 +115,13 @@ std::vector<std::int32_t> PageAllocator::Grow(std::int32_t num_pages) {
     }
     const std::int32_t old_mapped = mapped_pages_;
     mapped_pages_ += num_pages;
+    // Record how many pages beyond this first Grow are "headroom" — they are
+    // tail-capped (by SetCap below) but have never been allocated to any request.
+    // CappedInflightPages() subtracts this constant so the drain gate works.
+    if (first_grow_) {
+        headroom_pages_ = (total_pages_ - 1) - mapped_pages_;
+        first_grow_ = false;
+    }
     // The newly mapped pages may currently sit inside a tail-cap region left by
     // a prior Shrink (pages lent to the peer pool). Raise the cap barrier above
     // them first so they are no longer considered capped, then return them to
@@ -165,7 +172,10 @@ std::int32_t PageAllocator::CappedInflightPages() const {
     if (!enable_dynamic_capacity_) {
         return 0;
     }
-    return capped_free_list_.InFlightCappedCount();
+    // headroom_pages_ are tail-capped after the initial Grow but were never
+    // allocated to any request.  They must not be counted as in-flight.
+    const std::int32_t raw = capped_free_list_.InFlightCappedCount();
+    return std::max(0, raw - headroom_pages_);
 }
 
 }  // namespace tokenspeed

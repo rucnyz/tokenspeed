@@ -63,6 +63,13 @@ private:
     std::int32_t total_pages_{};
     std::int32_t mapped_pages_{0};
     bool enable_dynamic_capacity_{false};
+    // Pages beyond the initial Grow baseline are "headroom" for future
+    // mamba→KV transfers.  They are included in the tail-cap after the first
+    // Grow, but have never been allocated to any request, so they must not be
+    // counted as in-flight by CappedInflightPages().
+    // Set on the first Grow call; 0 means no headroom (full-capacity baseline).
+    std::int32_t headroom_pages_{0};
+    bool first_grow_{true};
     std::vector<std::int32_t> free_pages_;
     CappedFreeList capped_free_list_{};
 };

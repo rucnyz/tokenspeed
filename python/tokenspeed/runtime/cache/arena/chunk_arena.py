@@ -92,6 +92,15 @@ class ChunkArena:
         return grown
 
     def shrink(self, n_chunks: int) -> list[int]:
+        """Unmap tail chunks and return their chunk IDs.
+
+        The underlying physical handles are **kept** in ``shared_pool`` and
+        are NOT freed.  Callers that want to discard the physical memory
+        should call ``shared_pool.extract_handle`` on the returned IDs and
+        then call ``cu_mem_release``; callers that want to transfer the
+        physical memory to another arena should call
+        :meth:`shrink_with_handles` instead.
+        """
         released: list[int] = []
         for _ in range(n_chunks):
             if self.mapped_chunks <= 0:
@@ -103,6 +112,51 @@ class ChunkArena:
             released.append(chunk_id)
             self.mapped_chunks -= 1
         return released
+
+    def shrink_with_handles(self, n_chunks: int) -> list[int]:
+        """Unmap tail chunks and return the raw ``CUmemGenericAllocationHandle``
+        values for each freed chunk.
+
+        Unlike :meth:`shrink`, the physical handles are *removed* from
+        ``shared_pool`` so the caller takes ownership.  Pass the returned
+        list to :meth:`grow_with_handles` on another arena to perform a
+        zero-allocation physical-memory transfer.
+        """
+        chunk_ids = self.shrink(n_chunks)
+        raw_handles: list[int] = []
+        for cid in chunk_ids:
+            try:
+                raw_handles.append(self.shared_pool.extract_handle(cid))
+            except KeyError:
+                pass  # chunk was never physically allocated (stub / already extracted)
+        return raw_handles
+
+    def grow_with_handles(self, raw_handles: list[int]) -> None:
+        """Map pre-existing physical handles to the tail of this arena's VA.
+
+        Each handle in *raw_handles* is injected into ``shared_pool`` at the
+        next available chunk slot (== current ``mapped_chunks``) and then
+        immediately mapped to the corresponding VA position.  No
+        ``cuMemCreate`` is called — the physical pages come from the caller.
+
+        Use together with :meth:`shrink_with_handles` on a source arena to
+        perform a zero-allocation inter-pool transfer (cuMemUnmap on source,
+        cuMemMap on destination, one ``cuMemCreate`` saved per chunk).
+
+        Raises ``RuntimeError`` if the injection would exceed ``max_chunks``.
+        """
+        for handle in raw_handles:
+            if self.mapped_chunks >= self.max_chunks:
+                raise RuntimeError(
+                    f"{self.name}: grow_with_handles exceeds reserved VA "
+                    f"(mapped={self.mapped_chunks}, max={self.max_chunks})"
+                )
+            cid = self.mapped_chunks
+            # Pre-load the donated handle at this slot so _map_chunk (and
+            # get_handle) will find it instead of calling cuMemCreate.
+            self.shared_pool.inject_handle(cid, handle)
+            self._map_chunk(cid)  # cu_mem_map + cu_mem_set_access
+            self.mapped_chunks += 1
 
     def transfer_out(self, chunk_ids: list[int]) -> None:
         for chunk_id in chunk_ids:

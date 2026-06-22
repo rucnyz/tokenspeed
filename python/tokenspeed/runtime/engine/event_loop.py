@@ -175,6 +175,45 @@ class EventLoop:
             server_args, self.model_config, draft_model_config, gpu_id, global_rank
         )
 
+        # ----------------------------------------------------------------
+        # HiMA Phase 2 — pre-construction arena factory.
+        #
+        # When XPool dynamic capacity is enabled the VMM arenas must be
+        # created *before* pool construction so that k/v and mamba tensors
+        # are born on stable VMM-backed VA.  CUDA graphs then capture those
+        # VA pointers; later XPool fires remap physical handles while the
+        # VA (and therefore the captured pointers) remain constant.
+        #
+        # The factory closure is passed into create_attn_components and
+        # called inside _create_hybrid_linear_attn right after profiling
+        # determines the pool sizes.  On success it stores the arenas in
+        # self._pre_built_xpool_arenas for _init_xpool_actuator to reuse.
+        # On any failure it returns (None, None) and pools fall back to the
+        # normal torch.zeros path.
+        # ----------------------------------------------------------------
+        self._pre_built_xpool_arenas: "tuple | None" = None
+
+        _enable_xpool = (
+            getattr(server_args, "enable_xpool_dynamic_capacity", False)
+            and attn_tp_rank == 0
+        )
+        # Detect hybrid (mamba) models before pool creation; mirrors the
+        # has_mamba logic computed after create_attn_components below.
+        _hf_cfg_pre = getattr(self.model_config, "hf_config", None)
+        _txt_cfg_pre = (
+            getattr(_hf_cfg_pre, "text_config", None) if _hf_cfg_pre else None
+        )
+        _pre_has_mamba = getattr(
+            self.model_config, "mambaish_config", None
+        ) is not None or (
+            _txt_cfg_pre is not None
+            and hasattr(_txt_cfg_pre, "mamba2_cache_params")
+        )
+
+        _xpool_arena_factory = None
+        if _enable_xpool and _pre_has_mamba:
+            _xpool_arena_factory = self._make_xpool_pre_arena_factory(server_args)
+
         (
             attn_backend,
             token_to_kv_pool,
@@ -191,6 +230,7 @@ class EventLoop:
             min_per_gpu_mem,
             server_args.enable_memory_saver,
             draft_model_config,
+            _xpool_arena_factory=_xpool_arena_factory,
         )
 
         num_total_pages = self.max_total_num_tokens // server_args.block_size
@@ -335,8 +375,26 @@ class EventLoop:
             server_args.block_size,
             mamba_pool=mamba_pool,
         )
+        # Profiled KV page count — this is the initial (baseline) KV capacity.
+        profiled_kv_pages = self.max_total_num_tokens // server_args.block_size
+
+        # When XPool dynamic capacity is active the VA window needs headroom
+        # above the profiled baseline so transfers in both directions have room.
+        # Reserve 4× budgeter_pages_per_fire extra pages in each direction.
+        xpool_pages_headroom = 0
+        xpool_mamba_headroom = 0
+        if getattr(server_args, "enable_xpool_dynamic_capacity", False):
+            pages_per_fire = int(getattr(server_args, "budgeter_pages_per_fire", 64))
+            xpool_pages_headroom = pages_per_fire * 4
+            if mamba_bytes_per_slot > 0 and kv_bytes_per_page > 0:
+                mamba_slots_per_fire = max(
+                    1,
+                    pages_per_fire * kv_bytes_per_page // mamba_bytes_per_slot,
+                )
+                xpool_mamba_headroom = mamba_slots_per_fire * 4
+
         scheduler_cfg = make_config(
-            num_device_pages=self.max_total_num_tokens // server_args.block_size,
+            num_device_pages=profiled_kv_pages + xpool_pages_headroom,
             max_scheduled_tokens=server_args.chunked_prefill_size,
             max_batch_size=per_rank_max_batch,
             page_size=server_args.block_size,
@@ -354,7 +412,7 @@ class EventLoop:
             disable_prefix_cache=not server_args.enable_prefix_caching,
             enable_mamba=has_mamba,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
-            mamba_pool_total_chunks=mamba_pool_total_chunks,
+            mamba_pool_total_chunks=mamba_pool_total_chunks + xpool_mamba_headroom,
             enable_mamba_l2=server_args.enable_mamba_l2,
             mamba_l2_host_slots=mamba_l2_host_slots,
             paged_cache_groups=paged_cache_groups,
@@ -374,6 +432,11 @@ class EventLoop:
             enable_xpool_dynamic_capacity=server_args.enable_xpool_dynamic_capacity,
             budgeter_tick_s=server_args.budgeter_tick_s,
             budgeter_pages_per_fire=server_args.budgeter_pages_per_fire,
+            # Initial capacities: profiled baselines (strictly less than VA window).
+            xpool_initial_kv_pages=profiled_kv_pages if xpool_pages_headroom > 0 else 0,
+            xpool_initial_mamba_slots=(
+                mamba_pool_total_chunks if xpool_mamba_headroom > 0 else 0
+            ),
         )
         logger.info(
             "Scheduler config: page_size=%s num_device_pages=%s "
@@ -397,7 +460,13 @@ class EventLoop:
         self.scheduler = Scheduler(scheduler_cfg)
         self._budgeter_tick_s = float(server_args.budgeter_tick_s)
         self._last_budget_tick = 0.0
-        self._init_xpool_actuator(server_args, has_mamba)
+        self._init_xpool_actuator(
+            server_args,
+            has_mamba,
+            token_to_kv_pool=token_to_kv_pool,
+            kv_bytes_per_page=kv_bytes_per_page,
+            profiled_kv_pages=profiled_kv_pages,
+        )
         token_to_kv_pool.bind_paged_cache_scheduler(self.scheduler)
         if attn_tp_rank == 0:
             self.kv_event_publisher = EventPublisherFactory.create(
@@ -920,18 +989,167 @@ class EventLoop:
             return False
         return True
 
-    def _init_xpool_actuator(self, server_args, has_mamba: bool) -> None:
+    def _make_xpool_pre_arena_factory(self, server_args) -> "callable":
+        """Return a factory closure for pre-construction VMM arenas (HiMA Phase 2).
+
+        The returned callable is passed to ``create_attn_components`` and
+        invoked inside ``_create_hybrid_linear_attn`` *after* profiling
+        determines pool sizes but *before* any tensor is allocated.  On
+        success it stores the arenas in ``self._pre_built_xpool_arenas`` and
+        returns them; on failure it raises so the caller falls back to the
+        normal ``torch.zeros`` path.
+        """
+        import math
+
+        import torch
+
+        from tokenspeed.runtime.cache.arena._cuda_vmm import CHUNK_SIZE_BYTES
+        from tokenspeed.runtime.cache.arena.chunk_arena import ChunkArena
+        from tokenspeed.runtime.cache.arena.kv_arena import KvLayerArenaGroup
+        from tokenspeed.runtime.cache.arena.shared_pool import SharedHandlePool
+
+        gpu_id = self.gpu_id
+        pages_per_fire = max(
+            1, int(getattr(server_args, "budgeter_pages_per_fire", 64))
+        )
+
+        def _factory(
+            *,
+            kv_num_layers: int,
+            kv_max_tokens: int,
+            kv_page_size: int,
+            kv_head_num: int,
+            kv_head_dim: int,
+            kv_dtype_itemsize: int,
+            mamba_total_size: int,
+            mamba_num_layers: int,
+            mamba_conv_shape: tuple,
+            mamba_ssm_shape: tuple,
+            mamba_conv_dtype: "torch.dtype",
+            mamba_ssm_dtype: "torch.dtype",
+        ) -> tuple:
+            # ----------------------------------------------------------
+            # Mamba arena: sized to hold conv_state + ssm_state for the
+            # full mamba pool plus headroom for incoming KV→Mamba fires.
+            # ----------------------------------------------------------
+            conv_bytes = (
+                math.prod((mamba_num_layers, mamba_total_size, *mamba_conv_shape))
+                * torch.empty(0, dtype=mamba_conv_dtype).element_size()
+            )
+            ssm_bytes = (
+                math.prod((mamba_num_layers, mamba_total_size, *mamba_ssm_shape))
+                * torch.empty(0, dtype=mamba_ssm_dtype).element_size()
+            )
+            mamba_pool_bytes = conv_bytes + ssm_bytes
+            mamba_current_chunks = max(
+                1, math.ceil(mamba_pool_bytes / CHUNK_SIZE_BYTES)
+            )
+            # Headroom for XPool transfers (≈ 4× budgeter_pages_per_fire
+            # worth of mamba slots, expressed in chunks).
+            mamba_max_chunks = mamba_current_chunks + max(pages_per_fire * 4, 4)
+
+            mamba_handles = SharedHandlePool(mamba_max_chunks, device=gpu_id)
+            mamba_arena = ChunkArena(
+                shared_pool=mamba_handles,
+                max_chunks=mamba_max_chunks,
+                mapped_chunks=mamba_current_chunks,
+                name="xpool_mamba",
+            )
+            logger.info(
+                "XPool pre-arenas factory: mamba arena created "
+                "(%d/%d chunks, %d bytes)",
+                mamba_current_chunks,
+                mamba_max_chunks,
+                mamba_pool_bytes,
+            )
+
+            # ----------------------------------------------------------
+            # KV per-layer arena group: one arena per layer k/v buffer.
+            # Pre-construction maps the *full* tensor (all rows) so there
+            # is no doubling — only the VMM physical handles are used from
+            # the start.  The tail of the VA window is still reserved for
+            # future mamba_to_kv growth.
+            # ----------------------------------------------------------
+            total_rows = kv_max_tokens + kv_page_size
+            single_layer_bytes = total_rows * kv_head_num * kv_head_dim * kv_dtype_itemsize
+            # All rows live: map the full capacity upfront.
+            max_chunks_per_layer = max(
+                1, math.ceil(single_layer_bytes / CHUNK_SIZE_BYTES)
+            )
+            # Reserve extra VA for mamba_to_kv headroom (up to 4× fire size).
+            kv_headroom_pages = pages_per_fire * 4
+            kv_headroom_bytes = kv_headroom_pages * kv_page_size * kv_head_num * kv_head_dim * kv_dtype_itemsize
+            kv_headroom_chunks = max(1, math.ceil(kv_headroom_bytes / CHUNK_SIZE_BYTES))
+            kv_max_chunks_with_headroom = max_chunks_per_layer + kv_headroom_chunks
+
+            k_arenas: list = []
+            v_arenas: list = []
+            for li in range(kv_num_layers):
+                k_pool = SharedHandlePool(max_chunks_per_layer, device=gpu_id)
+                v_pool = SharedHandlePool(max_chunks_per_layer, device=gpu_id)
+                k_arenas.append(
+                    ChunkArena(
+                        shared_pool=k_pool,
+                        max_chunks=kv_max_chunks_with_headroom,
+                        mapped_chunks=max_chunks_per_layer,
+                        name=f"xpool_kv_k{li}",
+                    )
+                )
+                v_arenas.append(
+                    ChunkArena(
+                        shared_pool=v_pool,
+                        max_chunks=kv_max_chunks_with_headroom,
+                        mapped_chunks=max_chunks_per_layer,
+                        name=f"xpool_kv_v{li}",
+                    )
+                )
+
+            kv_layer_group = KvLayerArenaGroup(
+                k_arenas=k_arenas,
+                v_arenas=v_arenas,
+                page_size=kv_page_size,
+                head_num=kv_head_num,
+                head_dim=kv_head_dim,
+                dtype_itemsize=kv_dtype_itemsize,
+                initial_live_rows=total_rows,  # all rows live for pre-construction
+            )
+            logger.info(
+                "XPool pre-arenas factory: KV layer group created "
+                "(%d layers, %d chunks/layer, total_rows=%d)",
+                kv_num_layers,
+                max_chunks_per_layer,
+                total_rows,
+            )
+
+            # Persist for _init_xpool_actuator to pick up after
+            # create_model_executor (CUDA graph capture) completes.
+            self._pre_built_xpool_arenas = (kv_layer_group, mamba_arena)
+            return kv_layer_group, mamba_arena
+
+        return _factory
+
+    def _init_xpool_actuator(
+        self,
+        server_args,
+        has_mamba: bool,
+        *,
+        token_to_kv_pool=None,
+        kv_bytes_per_page: int = 0,
+        profiled_kv_pages: int = 0,
+    ) -> None:
         """Set up the inter-pool capacity-transfer actuator (HiMA Phase 2).
 
         Only created when ``--enable-xpool-dynamic-capacity`` is set, on the
-        attention TP leader, for hybrid (mamba) models.  The actuator reserves
-        two CUDA-VMM arenas (KV / mamba) and executes ``cuMemMap``/``cuMemUnmap``
-        transfers off the decode critical path whenever the C++ budgeter emits
-        an ``XPoolFirePlan``.
+        attention TP leader, for hybrid (mamba) models.
 
-        Note: this wires the *control/execution* plane.  Binding pool tensors to
-        the arena VA windows (so transfers change live pool capacity) is a
-        separate data-plane migration tracked in the HiMA docs.
+        When ``self._pre_built_xpool_arenas`` is set (pre-construction path),
+        the arenas were already created before pool construction and CUDA graph
+        capture, so pool tensors are already on stable VMM VA.  This method
+        then just wires up the ``XPoolActuator`` without any rebinding.
+
+        Otherwise (legacy post-capture path), arenas are created here and
+        ``bind_arena`` is attempted for KV (skipped for Mamba due to CUDA
+        graph stale-pointer risk).
         """
         self._xpool_actuator = None
         if not getattr(server_args, "enable_xpool_dynamic_capacity", False):
@@ -939,34 +1157,252 @@ class EventLoop:
         if self.attn_tp_rank != 0 or not has_mamba:
             return
         try:
+            import math
+
+            import torch.cuda
+
+            from tokenspeed.runtime.cache.arena._cuda_vmm import CHUNK_SIZE_BYTES
             from tokenspeed.runtime.cache.arena.chunk_arena import ChunkArena
+            from tokenspeed.runtime.cache.arena.kv_arena import KvLayerArenaGroup
             from tokenspeed.runtime.cache.arena.shared_pool import SharedHandlePool
             from tokenspeed.runtime.cache.arena.xpool_actuator import XPoolActuator
 
-            pages = max(1, int(server_args.budgeter_pages_per_fire))
-            # Reserve VA headroom for several fires worth of chunks per pool.
-            max_chunks = pages * 4
-            kv_handles = SharedHandlePool(max_chunks, device=self.gpu_id)
-            mamba_handles = SharedHandlePool(max_chunks, device=self.gpu_id)
-            kv_arena = ChunkArena(
-                shared_pool=kv_handles,
-                max_chunks=max_chunks,
-                mapped_chunks=0,
-                name="xpool_kv",
+            pages_per_fire = max(
+                1, int(getattr(server_args, "budgeter_pages_per_fire", 64))
             )
+
+            # ----------------------------------------------------------------
+            # Fast path: pre-construction arenas were built by the factory
+            # before pool construction and CUDA graph capture.  Pool tensors
+            # are already on stable VMM VA — no rebinding needed.
+            # ----------------------------------------------------------------
+            if self._pre_built_xpool_arenas is not None:
+                kv_arena, mamba_arena = self._pre_built_xpool_arenas
+                mamba_current_chunks = getattr(mamba_arena, "mapped_chunks", 0)
+                mamba_max_chunks = getattr(mamba_arena, "max_chunks", 0)
+                self._xpool_actuator = XPoolActuator(
+                    kv_arena=kv_arena,
+                    mamba_arena=mamba_arena,
+                    scheduler=self.scheduler,
+                    kv_bytes_per_page=kv_bytes_per_page,
+                )
+                logger.info(
+                    "XPool dynamic capacity enabled (pre-construction path): "
+                    "pages_per_fire=%d mamba_chunks=%d/%d "
+                    "kv_bound=True (VMM VA, physical transfer enabled) "
+                    "kv_bytes_per_page=%d",
+                    pages_per_fire,
+                    mamba_current_chunks,
+                    mamba_max_chunks,
+                    kv_bytes_per_page,
+                )
+                return
+
+            # ----------------------------------------------------------------
+            # Legacy post-capture path: arenas were not pre-built (e.g. the
+            # model is not a hybrid GDN, XPool was enabled late, or the factory
+            # failed).  Create arenas now and attempt KV rebinding; skip Mamba
+            # rebinding to avoid CUDA-graph stale-pointer issues.
+            # ----------------------------------------------------------------
+            rs = getattr(self.model_executor, "runtime_states", None)
+            mamba_pool = getattr(rs, "mamba_pool", None) if rs is not None else None
+
+            mamba_pool_bytes = 0
+            if mamba_pool is not None:
+                conv = mamba_pool.conv_state
+                ssm = mamba_pool.ssm_state
+                mamba_pool_bytes = conv.nbytes + ssm.nbytes
+
+            mamba_current_chunks = (
+                max(1, math.ceil(mamba_pool_bytes / CHUNK_SIZE_BYTES))
+                if mamba_pool_bytes > 0
+                else pages_per_fire * 4
+            )
+
+            xpool_mamba_headroom = (
+                int(getattr(server_args, "budgeter_pages_per_fire", 64)) * 4
+            )
+            mamba_bytes_per_slot = getattr(server_args, "mamba_bytes_per_slot", 0)
+            if mamba_bytes_per_slot > 0 and kv_bytes_per_page > 0:
+                mamba_slots_per_fire = max(
+                    1, pages_per_fire * kv_bytes_per_page // mamba_bytes_per_slot
+                )
+                xpool_mamba_headroom = mamba_slots_per_fire * 4
+
+            mamba_headroom_chunks = (
+                max(
+                    1,
+                    math.ceil(
+                        xpool_mamba_headroom
+                        * (
+                            mamba_pool_bytes
+                            / max(1, mamba_current_chunks)
+                            / CHUNK_SIZE_BYTES
+                        )
+                    ),
+                )
+                if mamba_pool_bytes > 0
+                else pages_per_fire * 4
+            )
+
+            mamba_max_chunks = mamba_current_chunks + mamba_headroom_chunks
+
+            mamba_handles = SharedHandlePool(mamba_max_chunks, device=self.gpu_id)
             mamba_arena = ChunkArena(
                 shared_pool=mamba_handles,
-                max_chunks=max_chunks,
-                mapped_chunks=0,
+                max_chunks=mamba_max_chunks,
+                mapped_chunks=mamba_current_chunks,
                 name="xpool_mamba",
             )
+
+            # ----------------------------------------------------------------
+            # KV per-layer arena group (legacy path — post-capture rebind).
+            # ----------------------------------------------------------------
+            kv_arena: ChunkArena | KvLayerArenaGroup | None = None
+            kv_bound = False
+
+            from tokenspeed.runtime.layers.attention.kv_cache.mha import (
+                MHATokenToKVPool,
+            )
+
+            _kv_inner = getattr(token_to_kv_pool, "inner", token_to_kv_pool)
+
+            if (
+                token_to_kv_pool is not None
+                and isinstance(_kv_inner, MHATokenToKVPool)
+                and profiled_kv_pages > 0
+            ):
+                try:
+                    pool = _kv_inner
+                    page_size = pool.page_size
+                    head_num = pool.head_num
+                    head_dim = pool.head_dim
+                    layer_num = pool.layer_num
+                    dtype_itemsize = torch._utils._element_size(pool.store_dtype)
+
+                    total_rows = pool.size + page_size
+                    initial_live_rows = min(
+                        (profiled_kv_pages + 1) * page_size, total_rows
+                    )
+
+                    single_layer_bytes = (
+                        total_rows * head_num * head_dim * dtype_itemsize
+                    )
+                    max_chunks_per_layer = max(
+                        1, math.ceil(single_layer_bytes / CHUNK_SIZE_BYTES)
+                    )
+                    live_bytes_per_layer = (
+                        initial_live_rows * head_num * head_dim * dtype_itemsize
+                    )
+                    initial_chunks_per_layer = max(
+                        1, math.ceil(live_bytes_per_layer / CHUNK_SIZE_BYTES)
+                    )
+
+                    k_arenas: list[ChunkArena] = []
+                    v_arenas: list[ChunkArena] = []
+                    for li in range(layer_num):
+                        k_pool = SharedHandlePool(
+                            initial_chunks_per_layer, device=self.gpu_id
+                        )
+                        v_pool = SharedHandlePool(
+                            initial_chunks_per_layer, device=self.gpu_id
+                        )
+                        k_arenas.append(
+                            ChunkArena(
+                                shared_pool=k_pool,
+                                max_chunks=max_chunks_per_layer,
+                                mapped_chunks=initial_chunks_per_layer,
+                                name=f"xpool_kv_k{li}",
+                            )
+                        )
+                        v_arenas.append(
+                            ChunkArena(
+                                shared_pool=v_pool,
+                                max_chunks=max_chunks_per_layer,
+                                mapped_chunks=initial_chunks_per_layer,
+                                name=f"xpool_kv_v{li}",
+                            )
+                        )
+
+                    kv_layer_group = KvLayerArenaGroup(
+                        k_arenas=k_arenas,
+                        v_arenas=v_arenas,
+                        page_size=page_size,
+                        head_num=head_num,
+                        head_dim=head_dim,
+                        dtype_itemsize=dtype_itemsize,
+                        initial_live_rows=initial_live_rows,
+                    )
+
+                    torch.cuda.synchronize()
+                    pool.bind_arena(kv_layer_group)
+                    kv_arena = kv_layer_group
+                    kv_bound = True
+                    logger.info(
+                        "XPool: KV pool bound to VMM per-layer arenas "
+                        "(%d layers, %d chunks/layer, live_rows=%d)",
+                        layer_num,
+                        initial_chunks_per_layer,
+                        initial_live_rows,
+                    )
+                except Exception as kv_exc:  # noqa: BLE001
+                    logger.warning(
+                        "XPool: KV pool bind_arena failed (%s); "
+                        "falling back to small headroom arena",
+                        kv_exc,
+                    )
+                    import gc
+
+                    _partial_k: list = locals().get("k_arenas") or []
+                    _partial_v: list = locals().get("v_arenas") or []
+                    for _a in [*_partial_k, *_partial_v]:
+                        try:
+                            _a.close()
+                            _a.shared_pool.release_all()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    del _partial_k, _partial_v
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    kv_arena = None
+
+            if kv_arena is None:
+                kv_max_chunks = pages_per_fire * 4
+                kv_handles = SharedHandlePool(kv_max_chunks, device=self.gpu_id)
+                kv_arena = ChunkArena(
+                    shared_pool=kv_handles,
+                    max_chunks=kv_max_chunks,
+                    mapped_chunks=0,
+                    name="xpool_kv_fallback",
+                )
+
+            # Mamba rebind is skipped on the legacy path because CUDA graphs
+            # have already captured the old tensor pointers.  Logical capacity
+            # tracking still functions correctly; only physical memory transfer
+            # to/from the mamba pool is disabled on this path.
+            logger.info(
+                "XPool: mamba VMM arena ready (%d mapped/%d max chunks); "
+                "tensor rebind skipped (post-graph-capture path — "
+                "physical memory transfer disabled, logical tracking active)",
+                mamba_current_chunks,
+                mamba_max_chunks,
+            )
+
             self._xpool_actuator = XPoolActuator(
-                kv_arena=kv_arena, mamba_arena=mamba_arena
+                kv_arena=kv_arena,
+                mamba_arena=mamba_arena,
+                scheduler=self.scheduler,
+                kv_bytes_per_page=kv_bytes_per_page,
             )
             logger.info(
-                "XPool dynamic capacity enabled: pages_per_fire=%s max_chunks=%s",
-                pages,
-                max_chunks,
+                "XPool dynamic capacity enabled (legacy post-capture path): "
+                "pages_per_fire=%d mamba_chunks=%d/%d kv_bound=%s "
+                "kv_bytes_per_page=%d",
+                pages_per_fire,
+                mamba_current_chunks,
+                mamba_max_chunks,
+                kv_bound,
+                kv_bytes_per_page,
             )
         except Exception as exc:  # noqa: BLE001 - degrade gracefully
             logger.warning(
@@ -984,6 +1420,12 @@ class EventLoop:
             return
         plan = self.scheduler.pending_xpool_fire()
         if plan is not None:
+            logger.debug(
+                "XPool pending fire: op_id=%s direction=%s n_pages=%d",
+                getattr(plan, "op_id", "?"),
+                getattr(plan, "direction", "?"),
+                len(getattr(plan, "page_ids", [])),
+            )
             self._xpool_actuator.maybe_execute(plan)
 
     def _maybe_budget_tick(self) -> None:

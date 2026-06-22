@@ -581,6 +581,17 @@ void Scheduler::ApplyXPoolFire(const XPoolFirePlan& plan) {
     }
 }
 
+void Scheduler::CancelXPoolFire() {
+    // Called when the Python actuator skips the physical VMM step (e.g. arena
+    // headroom exhausted).  Clears the pending latch so the budgeter is
+    // unblocked but does NOT update allocator capacities (no physical transfer
+    // happened).
+    kv_pre_shrunk_pages_ = 0;
+    if (budget_agent_) {
+        budget_agent_->ClearPendingFire();
+    }
+}
+
 std::int32_t Scheduler::MappedKvPages() const {
     return device_allocator_.MappedPages();
 }

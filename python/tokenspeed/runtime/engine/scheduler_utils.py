@@ -108,6 +108,8 @@ def make_config(
     enable_xpool_dynamic_capacity: bool = False,
     budgeter_tick_s: float = 1.0,
     budgeter_pages_per_fire: int = 64,
+    xpool_initial_kv_pages: int = 0,
+    xpool_initial_mamba_slots: int = 0,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
@@ -156,6 +158,8 @@ def make_config(
     cfg.enable_xpool_dynamic_capacity = enable_xpool_dynamic_capacity
     cfg.budgeter_tick_s = budgeter_tick_s
     cfg.budgeter_pages_per_fire = budgeter_pages_per_fire
+    cfg.xpool_initial_kv_pages = xpool_initial_kv_pages
+    cfg.xpool_initial_mamba_slots = xpool_initial_mamba_slots
     return cfg
 
 
