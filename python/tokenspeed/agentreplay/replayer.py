@@ -37,9 +37,16 @@ import logging
 import time
 from dataclasses import dataclass
 
+# Engine is only needed at runtime; avoid importing at module level so that
+# lightweight unit tests (which don't need a GPU) can import replayer without
+# triggering the full CUDA initialisation chain.
+from typing import TYPE_CHECKING, Any
+
 from tokenspeed.agentreplay.metrics import PerRequestMetric
 from tokenspeed.agentreplay.reader import ReplayStep, sessions_in_order
-from tokenspeed.runtime.entrypoints.engine import Engine
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.entrypoints.engine import Engine
 
 logger = logging.getLogger(__name__)
 
@@ -78,15 +85,19 @@ class ReplayConfig:
     request_timeout_s: float = 600.0
     normalize_time: bool = True
     max_inter_session_gap_s: float | None = 5.0
+    # S3 replayer fix: skip steps whose prompt exceeds the model's context
+    # window so we don't get ValueError from the engine.  None = no limit.
+    max_prompt_tokens: int | None = None
 
 
 async def _run_one_step(
-    engine: Engine,
+    engine: "Any",
     step: ReplayStep,
     *,
     harness_start: float,
     metrics: list[PerRequestMetric],
     timeout_s: float,
+    max_prompt_tokens: int | None = None,
 ) -> None:
     """Issue one request to the engine and record its metrics.
 
@@ -101,6 +112,38 @@ async def _run_one_step(
     completion_tokens = 0
     finish_reason = ""
     error = ""
+
+    # S3 replayer fix: skip steps that exceed the configured context limit.
+    # Emitting to the engine would produce a ValueError that terminates the
+    # whole session task; instead we record a structured error and return so
+    # the session can continue with subsequent steps.
+    n_prompt = len(step.input_ids) if step.input_ids else step.prompt_tokens
+    if max_prompt_tokens is not None and n_prompt > max_prompt_tokens:
+        error = f"prompt_too_long_{n_prompt}"
+        logger.warning(
+            "replay rid=%s step=%d skipped: prompt_tokens=%d > max_prompt_tokens=%d",
+            step.program_id,
+            step.step,
+            n_prompt,
+            max_prompt_tokens,
+        )
+        metrics.append(
+            PerRequestMetric(
+                rid=f"{step.program_id}_step{step.step}",
+                program_id=step.program_id,
+                step=step.step,
+                parent_program_id=step.parent_program_id,
+                arrival_t=arrival_t,
+                first_token_t=-1.0,
+                finish_t=-1.0,
+                prompt_tokens=n_prompt,
+                output_tokens=0,
+                cached_tokens=0,
+                finish_reason="",
+                error=error,
+            )
+        )
+        return
 
     try:
         # Pin sampling temperature to 0 + ignore_eos so the engine reliably
@@ -163,7 +206,7 @@ async def _run_one_step(
 
 
 async def _replay_session(
-    engine: Engine,
+    engine: "Any",
     steps: list[ReplayStep],
     *,
     harness_start: float,
@@ -195,6 +238,7 @@ async def _replay_session(
             harness_start=harness_start,
             metrics=metrics,
             timeout_s=cfg.request_timeout_s,
+            max_prompt_tokens=cfg.max_prompt_tokens,
         )
         if i + 1 < len(steps):
             gap = step.tool_gap_after / cfg.time_scale
@@ -256,7 +300,9 @@ def _compute_session_dispatch_times(
     return out
 
 
-async def run_replay(engine: Engine, cfg: ReplayConfig) -> tuple[list[PerRequestMetric], float, float]:
+async def run_replay(
+    engine: "Any", cfg: ReplayConfig
+) -> tuple[list[PerRequestMetric], float, float]:
     """Drive a full replay against ``engine`` and collect per-request metrics.
 
     Returns ``(metrics, wall_start, wall_end)`` where the wall times

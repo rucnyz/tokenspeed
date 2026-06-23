@@ -41,7 +41,6 @@ import statistics
 import sys
 from collections.abc import Iterable
 
-
 _METRICS_ORDER: list[tuple[str, str, str]] = [
     # (key, display name, format)
     ("ttft_ms_p50", "TTFT p50 (ms)", "{:.1f}"),
@@ -78,7 +77,11 @@ def _find_summaries(path: str) -> list[str]:
 
 
 def _average(values: Iterable[float]) -> float:
-    vals = [v for v in values if v is not None and not (isinstance(v, float) and math.isnan(v))]
+    vals = [
+        v
+        for v in values
+        if v is not None and not (isinstance(v, float) and math.isnan(v))
+    ]
     if not vals:
         return float("nan")
     return statistics.mean(vals)
@@ -130,7 +133,11 @@ def _print_table(base_name: str, base: dict, sys_name: str, sys_: dict) -> None:
             or key.startswith("latency_ms")
             or key == "n_failed"
         )
-        sign = "" if (math.isnan(a) or math.isnan(b)) else _format_delta(a, b, lower_better=lower_better)
+        sign = (
+            ""
+            if (math.isnan(a) or math.isnan(b))
+            else _format_delta(a, b, lower_better=lower_better)
+        )
         a_str = "nan" if math.isnan(a) else fmt.format(a)
         b_str = "nan" if math.isnan(b) else fmt.format(b)
         print(f"{label:<22} {a_str:>{col_w}} {b_str:>{col_w}}   {sign}")
@@ -153,7 +160,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: no summary.json found under {args.sys}", file=sys.stderr)
         return 1
 
-    print(f"\nA/B comparison ({args.base_name} N={base_n}  vs  {args.sys_name} N={sys_n})")
+    print(
+        f"\nA/B comparison ({args.base_name} N={base_n}  vs  {args.sys_name} N={sys_n})"
+    )
     _print_table(args.base_name, base, args.sys_name, sys_)
     print()
     return 0

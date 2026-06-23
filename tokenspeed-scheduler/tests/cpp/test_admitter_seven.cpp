@@ -41,4 +41,55 @@ TEST(AdmitterSevenTest, DeferWhenBothPoolsStarved) {
     EXPECT_EQ(decision.action, AdmitAction::kDefer);
 }
 
+// S2.6 tests -------------------------------------------------------------------
+
+// When both pools are starved but there are enough active KV pages to retract
+// a victim, the admitter should return kCrossMigrate instead of kDefer.
+TEST(AdmitterSevenTest, CrossMigrateWhenBothStarvedButActiveKvAvailable) {
+    CostModel model;
+    Admitter admitter(model);
+    PoolSnapshot snap{
+        .kv_free_pages = 0,
+        .mamba_free_slots = 0,
+        .queue_len = 2,
+        .kv_active_pages = 256,  // enough to satisfy the 64-page request
+    };
+    auto decision = admitter.DecideForRequest(64, snap);
+    EXPECT_EQ(decision.action, AdmitAction::kCrossMigrate);
+    EXPECT_EQ(decision.pages_needed, 64);
+    EXPECT_GT(decision.cost_us, 0.0);
+}
+
+// When both pools are starved AND kv_active_pages is insufficient, kDefer
+// still takes priority (no victim large enough to retract).
+TEST(AdmitterSevenTest, DeferWhenBothStarvedAndActiveKvInsufficient) {
+    CostModel model;
+    Admitter admitter(model);
+    PoolSnapshot snap{
+        .kv_free_pages = 0,
+        .mamba_free_slots = 0,
+        .queue_len = 1,
+        .kv_active_pages = 16,  // less than the 64-page request needs
+    };
+    auto decision = admitter.DecideForRequest(64, snap);
+    EXPECT_EQ(decision.action, AdmitAction::kDefer);
+}
+
+// kCrossMigrate cost must exceed zero (it models write-back + eviction).
+TEST(AdmitterSevenTest, CrossMigrateCostIsPositive) {
+    CostModel model;
+    // Use a non-trivial c_m so CMigrateUs() != 0.
+    model.eviction_config.c_m = 500.0;
+    Admitter admitter(model);
+    PoolSnapshot snap{
+        .kv_free_pages = 0,
+        .mamba_free_slots = 0,
+        .queue_len = 0,
+        .kv_active_pages = 512,
+    };
+    auto decision = admitter.DecideForRequest(128, snap);
+    EXPECT_EQ(decision.action, AdmitAction::kCrossMigrate);
+    EXPECT_GT(decision.cost_us, 0.0);
+}
+
 }  // namespace tokenspeed::test

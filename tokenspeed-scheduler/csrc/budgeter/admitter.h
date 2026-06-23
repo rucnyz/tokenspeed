@@ -62,14 +62,17 @@ struct PoolSnapshot {
 
     // PressureAdapter inputs (S2.3, HiMA Phase 3).  retracted_count is the
     // number of requests currently in fsm::Retracting/Retracted — a direct
-    // signal that KV demand exceeded supply recently.  paused_count is
-    // reserved for a future Admitter-side defer counter (we plumb the
-    // field now so the BudgetAgent code path is in place; while the
-    // Scheduler::MakePoolSnapshot currently leaves it at 0, the budgeter
-    // multiplies it by config_.xpool_w_paused which defaults to 0 so the
-    // unused field is a no-op).
+    // signal that KV demand exceeded supply recently.  paused_count is the
+    // number of requests that the admitter explicitly deferred (kDefer) since
+    // the last BudgetTick, exposing sustained admission-pressure to the EWMA.
     std::int32_t retracted_count{0};
     std::int32_t paused_count{0};
+
+    // S2.6: pages held by active (Prefilling/Decoding) requests on the GPU.
+    // Used by the admitter to determine if a kCrossMigrate path is feasible:
+    // when both pools are starved but active pages exceed the new request's
+    // need, we can free space by proactively retracting a victim request.
+    std::int32_t kv_active_pages{0};
 };
 
 class Admitter {

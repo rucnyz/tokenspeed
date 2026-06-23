@@ -83,7 +83,9 @@ def _percentile(values: list[float], pct: float) -> float:
     sorted_vals = sorted(v for v in values if not math.isnan(v))
     if not sorted_vals:
         return float("nan")
-    k = max(0, min(len(sorted_vals) - 1, int(round((pct / 100.0) * (len(sorted_vals) - 1)))))
+    k = max(
+        0, min(len(sorted_vals) - 1, int(round((pct / 100.0) * (len(sorted_vals) - 1))))
+    )
     return sorted_vals[k]
 
 

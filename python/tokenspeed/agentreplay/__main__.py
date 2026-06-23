@@ -189,9 +189,15 @@ def _maybe_int(v: str | None) -> int | None:
 
 def _build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="tokenspeed.agentreplay")
-    p.add_argument("--trace", required=True, help="Path to a cc_qwen*.jsonl trace file.")
-    p.add_argument("--model", required=True, help="HuggingFace path to the model to serve.")
-    p.add_argument("--output-dir", required=True, help="Directory to write metrics into.")
+    p.add_argument(
+        "--trace", required=True, help="Path to a cc_qwen*.jsonl trace file."
+    )
+    p.add_argument(
+        "--model", required=True, help="HuggingFace path to the model to serve."
+    )
+    p.add_argument(
+        "--output-dir", required=True, help="Directory to write metrics into."
+    )
     p.add_argument(
         "--preset",
         choices=sorted(_PRESETS),
@@ -231,6 +237,19 @@ def _build_argparser() -> argparse.ArgumentParser:
             "not affect intra-session tool_gap_after delays."
         ),
     )
+    p.add_argument(
+        "--max-prompt-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Skip any step whose prompt token count exceeds this limit "
+            "rather than submitting it to the engine.  Matching steps are "
+            "recorded with error='prompt_too_long_N' in the metrics CSV. "
+            "Useful to avoid ValueError from the engine on traces containing "
+            "multi-turn conversations that exceed the model's context window. "
+            "Default: None (no limit)."
+        ),
+    )
     # Engine boot
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument("--attention-backend", default="triton")
@@ -259,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
         request_timeout_s=args.request_timeout_s,
         normalize_time=args.normalize_time,
         max_inter_session_gap_s=max_gap,
+        max_prompt_tokens=args.max_prompt_tokens,
     )
 
     config_dump = {
@@ -270,6 +290,7 @@ def main(argv: list[str] | None = None) -> int:
         "warmup_seconds": args.warmup_seconds,
         "normalize_time": args.normalize_time,
         "max_inter_session_gap_s": max_gap,
+        "max_prompt_tokens": args.max_prompt_tokens,
         "engine_kwargs": engine_kwargs,
         "start_wall_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }

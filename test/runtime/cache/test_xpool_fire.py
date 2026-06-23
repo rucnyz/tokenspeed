@@ -52,27 +52,19 @@ class _StaticMambaArena:
 
     def grow(self, n: int) -> None:  # pragma: no cover - guard against regression
         self.calls.append(("grow", n))
-        raise AssertionError(
-            "static mamba arena must not be resized post-boot"
-        )
+        raise AssertionError("static mamba arena must not be resized post-boot")
 
     def shrink(self, n: int) -> None:  # pragma: no cover - guard against regression
         self.calls.append(("shrink", n))
-        raise AssertionError(
-            "static mamba arena must not be resized post-boot"
-        )
+        raise AssertionError("static mamba arena must not be resized post-boot")
 
     def grow_with_handles(self, handles):  # pragma: no cover
         self.calls.append(("grow_with_handles", len(handles)))
-        raise AssertionError(
-            "static mamba arena must not be resized post-boot"
-        )
+        raise AssertionError("static mamba arena must not be resized post-boot")
 
     def shrink_with_handles(self, n: int):  # pragma: no cover
         self.calls.append(("shrink_with_handles", n))
-        raise AssertionError(
-            "static mamba arena must not be resized post-boot"
-        )
+        raise AssertionError("static mamba arena must not be resized post-boot")
 
 
 class _KvArena:
@@ -169,9 +161,7 @@ def test_mamba_to_kv_cancels_when_kv_full() -> None:
     actuator = XPoolActuator(kv_arena=kv, mamba_arena=mamba, scheduler=sched)
 
     cpp_plan = SimpleNamespace(op_id=2, direction="mamba_to_kv", page_ids=[1])
-    plan = FirePlan(
-        direction="mamba_to_kv", page_ids=[1], op_id=2, cpp_plan=cpp_plan
-    )
+    plan = FirePlan(direction="mamba_to_kv", page_ids=[1], op_id=2, cpp_plan=cpp_plan)
     actuator._execute_locked(plan)
 
     assert kv.calls == []  # no physical action on cancel
@@ -182,9 +172,7 @@ def test_mamba_to_kv_cancels_when_kv_full() -> None:
 def test_unknown_direction_raises() -> None:
     # _execute_locked logs and swallows exceptions for background-thread
     # safety, so we test _do_vmm directly.
-    actuator = XPoolActuator(
-        kv_arena=_KvArena(), mamba_arena=_StaticMambaArena()
-    )
+    actuator = XPoolActuator(kv_arena=_KvArena(), mamba_arena=_StaticMambaArena())
 
     with pytest.raises(ValueError, match="unknown fire direction"):
         actuator._do_vmm(FirePlan(direction="sideways", page_ids=[1]))
@@ -207,9 +195,7 @@ def test_scheduler_apply_called_after_vmm_ops() -> None:
 
 def test_record_fire_cost_seeds_then_smooths_ewma() -> None:
     """First sample seeds the EWMA so we don't sit at 0 forever."""
-    actuator = XPoolActuator(
-        kv_arena=_KvArena(), mamba_arena=_StaticMambaArena()
-    )
+    actuator = XPoolActuator(kv_arena=_KvArena(), mamba_arena=_StaticMambaArena())
 
     actuator._record_fire_cost(n_pages=10, elapsed_us=1000.0)
     assert actuator.ewma_xfer_us_per_page == pytest.approx(100.0)
@@ -222,9 +208,7 @@ def test_record_fire_cost_seeds_then_smooths_ewma() -> None:
 
 
 def test_record_fire_cost_ignores_invalid_samples() -> None:
-    actuator = XPoolActuator(
-        kv_arena=_KvArena(), mamba_arena=_StaticMambaArena()
-    )
+    actuator = XPoolActuator(kv_arena=_KvArena(), mamba_arena=_StaticMambaArena())
     actuator._record_fire_cost(n_pages=0, elapsed_us=10.0)
     actuator._record_fire_cost(n_pages=10, elapsed_us=0.0)
     assert actuator.ewma_xfer_us_per_page == 0.0
@@ -255,9 +239,7 @@ def test_cancelled_fire_does_not_update_ewma() -> None:
     actuator = XPoolActuator(kv_arena=kv, mamba_arena=mamba, scheduler=sched)
 
     cpp_plan = SimpleNamespace(op_id=12, direction="mamba_to_kv", page_ids=[1])
-    plan = FirePlan(
-        direction="mamba_to_kv", page_ids=[1], op_id=12, cpp_plan=cpp_plan
-    )
+    plan = FirePlan(direction="mamba_to_kv", page_ids=[1], op_id=12, cpp_plan=cpp_plan)
     actuator._execute_locked(plan)
     assert sched.cancelled == 1
     assert actuator.ewma_xfer_us_per_page == 0.0
@@ -281,9 +263,7 @@ def test_scheduler_not_called_when_none() -> None:
 
 def _actuator_with_recorder():
     """Return (actuator, fired) where fired records launched op_ids."""
-    actuator = XPoolActuator(
-        kv_arena=_KvArena(), mamba_arena=_StaticMambaArena()
-    )
+    actuator = XPoolActuator(kv_arena=_KvArena(), mamba_arena=_StaticMambaArena())
     fired: list[int] = []
     actuator.execute_async = lambda plan: fired.append(plan.op_id)  # type: ignore[method-assign]
     return actuator, fired

@@ -27,6 +27,7 @@ CI before it claims a GPU.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
@@ -38,8 +39,8 @@ from tokenspeed.agentreplay.reader import ReplayStep, iter_trace, sessions_in_or
 from tokenspeed.agentreplay.replayer import (
     ReplayConfig,
     _compute_session_dispatch_times,
+    _run_one_step,
 )
-
 
 _TRACE_DIR = os.environ.get(
     "TOKENSPEED_REPLAY_TRACES",
@@ -172,9 +173,7 @@ def test_compute_dispatch_times_normalizes_and_caps_gaps():
         ("s1", [_mk_step("s1", t=1_000_002.0)]),
         ("s2", [_mk_step("s2", t=1_000_004.0)]),
     ]
-    cfg = ReplayConfig(
-        trace_path="x", normalize_time=True, max_inter_session_gap_s=5.0
-    )
+    cfg = ReplayConfig(trace_path="x", normalize_time=True, max_inter_session_gap_s=5.0)
     out = _compute_session_dispatch_times(sessions, cfg)
     # First session arrives at t=0 after normalization. Second is
     # ~1e6 seconds later in raw time -> capped to 5s. Third is 2s after
@@ -207,6 +206,108 @@ def test_compute_dispatch_times_applies_time_scale():
     out = _compute_session_dispatch_times(sessions, cfg)
     assert out[0] == pytest.approx(0.0)
     assert out[1] == pytest.approx(5.0)
+
+
+def test_replay_config_max_prompt_tokens_default_none():
+    """ReplayConfig.max_prompt_tokens should default to None (no filter)."""
+    cfg = ReplayConfig(trace_path="x")
+    assert cfg.max_prompt_tokens is None
+
+
+def test_run_one_step_skips_oversized_prompt():
+    """_run_one_step must record prompt_too_long_N and NOT call async_generate."""
+    from unittest.mock import MagicMock
+
+    mock_engine = MagicMock()
+    called = []
+    mock_engine.async_generate = lambda **kw: called.append(kw)  # sync sentinel
+
+    oversized_step = ReplayStep(
+        t=0.0,
+        program_id="test-pid",
+        step=1,
+        parent_program_id=None,
+        spawn_ts=None,
+        input_ids=list(range(500)),  # 500 tokens, exceeds limit of 100
+        forced_output_ids=[1],
+        tool_gap_after=0.0,
+    )
+    collected: list[PerRequestMetric] = []
+    asyncio.run(
+        _run_one_step(
+            mock_engine,
+            oversized_step,
+            harness_start=0.0,
+            metrics=collected,
+            timeout_s=5.0,
+            max_prompt_tokens=100,
+        )
+    )
+    assert len(collected) == 1
+    assert collected[0].error.startswith("prompt_too_long_")
+    assert "500" in collected[0].error
+    # async_generate must never have been awaited.
+    assert called == []
+
+
+def test_run_one_step_allows_within_limit():
+    """_run_one_step with max_prompt_tokens set must still submit prompts within limit."""
+    from unittest.mock import MagicMock
+
+    # async_generate must be an async function (coroutine) returning an async
+    # iterable.  Wrap the generator so it's awaitable.
+    class _FakeAsyncGen:
+        async def __aiter__(self):
+            yield {
+                "meta_info": {
+                    "cached_tokens": 5,
+                    "completion_tokens": 3,
+                    "finish_reason": "stop",
+                }
+            }
+
+        def __aiter__(self):  # type: ignore[misc]
+            async def _gen():
+                yield {
+                    "meta_info": {
+                        "cached_tokens": 5,
+                        "completion_tokens": 3,
+                        "finish_reason": "stop",
+                    }
+                }
+
+            return _gen()
+
+    async def _fake_gen(**kwargs):
+        return _FakeAsyncGen()
+
+    mock_engine = MagicMock()
+    mock_engine.async_generate = _fake_gen
+
+    small_step = ReplayStep(
+        t=0.0,
+        program_id="test-pid",
+        step=1,
+        parent_program_id=None,
+        spawn_ts=None,
+        input_ids=list(range(50)),  # 50 tokens, within limit of 100
+        forced_output_ids=[1],
+        tool_gap_after=0.0,
+    )
+    collected: list[PerRequestMetric] = []
+    asyncio.run(
+        _run_one_step(
+            mock_engine,
+            small_step,
+            harness_start=0.0,
+            metrics=collected,
+            timeout_s=5.0,
+            max_prompt_tokens=100,
+        )
+    )
+    assert len(collected) == 1
+    assert collected[0].error == ""
+    assert collected[0].cached_tokens == 5
 
 
 @pytest.mark.skipif(not _has_real_trace(), reason="dataset trace not present")

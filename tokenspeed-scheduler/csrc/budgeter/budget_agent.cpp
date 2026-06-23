@@ -117,6 +117,17 @@ void BudgetAgent::OnRequestArrival(std::int32_t prompt_tokens, const PoolSnapsho
             plan.page_ids.push_back(i + 1);
         }
         pending_fire_ = std::move(plan);
+    } else if (decision.action == AdmitAction::kCrossMigrate) {
+        // S2.6: latch a migration plan so the Python actuator can retract the
+        // best victim request and free enough KV pages for the new request.
+        XPoolMigratePlan plan;
+        plan.pages_needed = decision.pages_needed;
+        plan.op_id = next_op_id_++;
+        pending_migrate_ = std::move(plan);
+    } else if (decision.action == AdmitAction::kDefer) {
+        // S2.3 w_paused: count explicit defer decisions so MakePoolSnapshot
+        // can expose paused_count to the PressureAdapter EWMA.
+        deferred_count_++;
     }
 }
 
@@ -201,6 +212,7 @@ std::optional<XPoolFirePlan> BudgetAgent::Tick(const PoolSnapshot& snapshot) {
                 "(adj_kv={:.3f} adj_mamba={:.3f})",
                 config_.xpool_saturation_low, adj_kv, adj_mamba);
         }
+        deferred_count_ = 0;
         return std::nullopt;
     }
 
@@ -212,6 +224,7 @@ std::optional<XPoolFirePlan> BudgetAgent::Tick(const PoolSnapshot& snapshot) {
                 BudgetLogger().info("BudgetTick: mamba_to_kv blocked by kv_headroom ({} < {})",
                                     snapshot.kv_headroom_pages, n_kv);
             }
+            deferred_count_ = 0;
             return std::nullopt;
         }
         // S2.2 reverse-direction cooldown.
@@ -221,6 +234,7 @@ std::optional<XPoolFirePlan> BudgetAgent::Tick(const PoolSnapshot& snapshot) {
                     "BudgetTick: mamba_to_kv suppressed by reverse_cooldown (last_fire={}, within {:.2f}s)",
                     last_fire_direction_, config_.xpool_reverse_cooldown_s);
             }
+            deferred_count_ = 0;
             return std::nullopt;
         }
         XPoolFirePlan plan;
@@ -231,11 +245,13 @@ std::optional<XPoolFirePlan> BudgetAgent::Tick(const PoolSnapshot& snapshot) {
             plan.page_ids.push_back(i + 1);
         }
         pending_fire_ = plan;
+        deferred_count_ = 0;
         return plan;
     }
     if (adj_mamba > adj_kv + config_.xpool_nb_margin) {
         // Guard: only fire if mamba has physical VMM headroom to receive handles.
         if (n_mamba > 0 && snapshot.mamba_headroom_slots < n_mamba) {
+            deferred_count_ = 0;
             return std::nullopt;
         }
         // S2.2 reverse-direction cooldown.
@@ -245,6 +261,7 @@ std::optional<XPoolFirePlan> BudgetAgent::Tick(const PoolSnapshot& snapshot) {
                     "BudgetTick: kv_to_mamba suppressed by reverse_cooldown (last_fire={}, within {:.2f}s)",
                     last_fire_direction_, config_.xpool_reverse_cooldown_s);
             }
+            deferred_count_ = 0;
             return std::nullopt;
         }
         XPoolFirePlan plan;
@@ -255,8 +272,12 @@ std::optional<XPoolFirePlan> BudgetAgent::Tick(const PoolSnapshot& snapshot) {
             plan.page_ids.push_back(i + 1);
         }
         pending_fire_ = plan;
+        deferred_count_ = 0;
         return plan;
     }
+    // S2.3 w_paused: reset deferred_count_ at the end of each tick so the
+    // accumulation window covers exactly one inter-tick interval.
+    deferred_count_ = 0;
     return std::nullopt;
 }
 

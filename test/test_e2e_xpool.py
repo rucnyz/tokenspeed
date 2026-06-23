@@ -6,6 +6,7 @@ Verifies:
   - Inference produces correct output (no data corruption)
   - C++ capacity accounting responds to budgeter ticks
 """
+
 import time
 
 MODEL = "/home/songyang/models/Qwen3.5-35B-A3B"
@@ -13,6 +14,7 @@ MODEL = "/home/songyang/models/Qwen3.5-35B-A3B"
 
 def main():
     import torch
+
     from tokenspeed.runtime.entrypoints.engine import Engine
 
     print("Creating engine with xpool enabled…")
