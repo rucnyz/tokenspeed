@@ -80,3 +80,81 @@ def test_cancelled_fire_increments_only_cancelled_counters():
     # Scheduler.cancel_xpool_fire must be invoked exactly once per cancelled
     # plan so the budgeter latch is released.
     assert scheduler.cancel_xpool_fire.call_count == 2
+
+
+# S2.6 migration tests -----------------------------------------------------------
+
+
+def _make_migrate_plan(op_id: int, pages_needed: int = 64):
+    """Minimal mock object accepted by maybe_execute_migrate()."""
+    plan = MagicMock()
+    plan.op_id = op_id
+    plan.pages_needed = pages_needed
+    return plan
+
+
+def test_maybe_execute_migrate_commits_when_candidate_found():
+    """When best_migrate_candidate() returns a non-empty id the actuator
+    calls apply_xpool_migrate and increments committed_migrate."""
+    scheduler = MagicMock()
+    scheduler.best_migrate_candidate = MagicMock(return_value="req-abc")
+    scheduler.apply_xpool_migrate = MagicMock()
+    scheduler.cancel_xpool_migrate = MagicMock()
+
+    actuator = XPoolActuator(
+        kv_arena=MagicMock(),
+        mamba_arena=MagicMock(),
+        scheduler=scheduler,
+    )
+
+    assert actuator.committed_migrate == 0
+    plan = _make_migrate_plan(op_id=10, pages_needed=128)
+    result = actuator.maybe_execute_migrate(plan)
+
+    assert result is True
+    assert actuator.committed_migrate == 1
+    scheduler.apply_xpool_migrate.assert_called_once_with(plan)
+    scheduler.cancel_xpool_migrate.assert_not_called()
+
+
+def test_maybe_execute_migrate_cancels_when_no_candidate():
+    """When best_migrate_candidate() returns '' the latch must be cancelled."""
+    scheduler = MagicMock()
+    scheduler.best_migrate_candidate = MagicMock(return_value="")
+    scheduler.apply_xpool_migrate = MagicMock()
+    scheduler.cancel_xpool_migrate = MagicMock()
+
+    actuator = XPoolActuator(
+        kv_arena=MagicMock(),
+        mamba_arena=MagicMock(),
+        scheduler=scheduler,
+    )
+
+    plan = _make_migrate_plan(op_id=11)
+    result = actuator.maybe_execute_migrate(plan)
+
+    assert result is False
+    assert actuator.committed_migrate == 0
+    scheduler.apply_xpool_migrate.assert_not_called()
+    scheduler.cancel_xpool_migrate.assert_called_once()
+
+
+def test_maybe_execute_migrate_deduplicates_by_op_id():
+    """Repeated calls with the same op_id must be silently ignored."""
+    scheduler = MagicMock()
+    scheduler.best_migrate_candidate = MagicMock(return_value="req-xyz")
+    scheduler.apply_xpool_migrate = MagicMock()
+
+    actuator = XPoolActuator(
+        kv_arena=MagicMock(),
+        mamba_arena=MagicMock(),
+        scheduler=scheduler,
+    )
+
+    plan = _make_migrate_plan(op_id=20)
+    actuator.maybe_execute_migrate(plan)
+    actuator.maybe_execute_migrate(plan)  # duplicate
+    actuator.maybe_execute_migrate(plan)  # duplicate
+
+    assert actuator.committed_migrate == 1
+    scheduler.apply_xpool_migrate.assert_called_once()
