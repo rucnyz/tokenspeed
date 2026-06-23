@@ -470,7 +470,9 @@ class CudaKernelBuilder:
         # sm_103a).  Consumer/workstation Blackwell (sm_120, RTX 50xx / RTX PRO
         # 6000) is major==12 and does NOT have an "a" variant in NVCC.
         is_consumer_blackwell = major >= 12
-        suffix = "a" if (has_suffix or (major >= 9 and not is_consumer_blackwell)) else ""
+        suffix = (
+            "a" if (has_suffix or (major >= 9 and not is_consumer_blackwell)) else ""
+        )
         return f"{major}{minor}{suffix}"
 
     def _detect_cuda_archs(self):
@@ -708,7 +710,16 @@ class CudaKernelBuilder:
             ):
                 skipped_groups += 1
                 continue
-            stale_groups.append((name, sources, extra_ldflags, extra_cflags, so_path, group_arch_override))
+            stale_groups.append(
+                (
+                    name,
+                    sources,
+                    extra_ldflags,
+                    extra_cflags,
+                    so_path,
+                    group_arch_override,
+                )
+            )
 
         stale_sources = sum(len(srcs) for _, srcs, _, _, _, _ in stale_groups)
         print(
@@ -724,15 +735,21 @@ class CudaKernelBuilder:
         with ThreadPoolExecutor(max_workers=max_jobs) as executor:
             group_meta = []
             futures = []
-            for name, sources, extra_ldflags, extra_cflags, so_path, group_arch_override in stale_groups:
+            for (
+                name,
+                sources,
+                extra_ldflags,
+                extra_cflags,
+                so_path,
+                group_arch_override,
+            ) in stale_groups:
                 if group_arch_override is not None:
                     group_gencode = [
                         f"-gencode=arch=compute_{a},code=sm_{a}"
                         for a in sorted(group_arch_override)
                     ]
                     group_nvcc_flags = [
-                        f for f in nvcc_flags
-                        if not f.startswith("-gencode=")
+                        f for f in nvcc_flags if not f.startswith("-gencode=")
                     ] + group_gencode
                 else:
                     group_nvcc_flags = nvcc_flags
