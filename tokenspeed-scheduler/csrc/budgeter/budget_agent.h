@@ -50,12 +50,58 @@ public:
     std::optional<XPoolFirePlan> PendingFire() const { return pending_fire_; }
     void ClearPendingFire() { pending_fire_.reset(); }
 
+    // S2.2 reverse-direction cooldown. Called from Scheduler::ApplyXPoolFire
+    // AFTER the physical Grow/Shrink succeeds, so cancelled fires (which take
+    // the CancelXPoolFire / ClearPendingFire path) do not arm the cooldown.
+    // Subsequent Tick() calls within xpool_reverse_cooldown_s will refuse to
+    // emit a plan in the OPPOSITE direction; same-direction plans are still
+    // allowed so a sustained pressure imbalance can keep transferring capacity.
+    void OnFireCommitted(const std::string& direction);
+
+    // Test introspection. Returns the direction recorded by the most recent
+    // OnFireCommitted call, or empty string if no fire has committed yet.
+    const std::string& LastFireDirection() const { return last_fire_direction_; }
+
+    // PressureAdapter introspection (S2.3): the EWMA-smoothed adjusted
+    // pressures last computed by Tick().  Useful for unit tests that want
+    // to verify the queue/retract weighting actually moves the comparison.
+    double EwmaPressureKv() const { return ewma_pressure_kv_; }
+    double EwmaPressureMamba() const { return ewma_pressure_mamba_; }
+    double EwmaQueue() const { return ewma_queue_; }
+    double EwmaRetract() const { return ewma_retract_; }
+    double EwmaPaused() const { return ewma_paused_; }
+
     const Admitter& GetAdmitter() const { return admitter_; }
 
 private:
+    // True iff a fire in `direction` would be in the opposite direction of
+    // the last committed fire and we're still within the cooldown window.
+    // Returns false if cooldown is disabled (xpool_reverse_cooldown_s <= 0)
+    // or if no prior fire has committed.
+    bool ReverseDirectionGated(const std::string& direction,
+                               std::chrono::steady_clock::time_point now) const;
+
+    // PressureAdapter (S2.3): apply the weighted queue/retract/paused
+    // signals on top of the raw utilisation EWMA, returning the adjusted
+    // pressure value clamped to [0, 1].  When all weights are 0 this
+    // simply returns *base_pressure*.
+    double AdjustedPressureKv(double base_pressure) const;
+    double AdjustedPressureMamba(double base_pressure) const;
+
     double ewma_pressure_kv_{0.0};
     double ewma_pressure_mamba_{0.0};
+    // PressureAdapter EWMA state.  Updated each Tick using the same
+    // time-decayed weight as the utilisation EWMA so the signals share a
+    // smoothing horizon.
+    double ewma_queue_{0.0};
+    double ewma_retract_{0.0};
+    double ewma_paused_{0.0};
     std::chrono::steady_clock::time_point last_tick_{std::chrono::steady_clock::now()};
+
+    // S2.2 reverse-direction cooldown state. Updated only on physical commit
+    // via OnFireCommitted (Scheduler::ApplyXPoolFire), never on cancel.
+    std::string last_fire_direction_{};
+    std::chrono::steady_clock::time_point last_fire_time_{};
 
     SchedulerConfig config_;
     CostModel cost_model_;

@@ -59,6 +59,17 @@ struct PoolSnapshot {
     // does not generate plans that the Python actuator would immediately cancel.
     std::int32_t kv_headroom_pages{0};
     std::int32_t mamba_headroom_slots{0};
+
+    // PressureAdapter inputs (S2.3, HiMA Phase 3).  retracted_count is the
+    // number of requests currently in fsm::Retracting/Retracted — a direct
+    // signal that KV demand exceeded supply recently.  paused_count is
+    // reserved for a future Admitter-side defer counter (we plumb the
+    // field now so the BudgetAgent code path is in place; while the
+    // Scheduler::MakePoolSnapshot currently leaves it at 0, the budgeter
+    // multiplies it by config_.xpool_w_paused which defaults to 0 so the
+    // unused field is a no-op).
+    std::int32_t retracted_count{0};
+    std::int32_t paused_count{0};
 };
 
 class Admitter {

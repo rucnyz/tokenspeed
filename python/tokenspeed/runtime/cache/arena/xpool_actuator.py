@@ -82,6 +82,50 @@ class XPoolActuator:
         # The C++ budgeter latches its pending plan (op_id starts at 1), so we
         # de-dup here by the last actuated op_id; 0 means "nothing yet".
         self._last_op_id = 0
+        # Cumulative counters surfaced for replay / Prometheus-style metrics.
+        # We bump them inside _execute_locked so a single fire can be reflected
+        # in either `committed` (VMM succeeded -> apply_xpool_fire) or
+        # `cancelled` (VMM skipped -> cancel_xpool_fire) but not both. Reads
+        # are racy-but-stable: a metrics snapshot may witness +1 mid-fire,
+        # which is fine — we only need the steady-state count.
+        self.committed_kv_to_mamba: int = 0
+        self.committed_mamba_to_kv: int = 0
+        self.cancelled_kv_to_mamba: int = 0
+        self.cancelled_mamba_to_kv: int = 0
+        # S2.5: runtime EWMA of physical fire cost in microseconds per KV
+        # page actually unmap/remapped.  Updated only on committed fires
+        # (cancelled fires include no VMM work).  The EWMA half-life is
+        # ~8 fires (alpha=0.25), enough to smooth jitter from short
+        # transfers without hiding sustained drift.  Initial 0.0 means
+        # "no samples yet"; calibrate_kappa.py treats that as missing.
+        self.ewma_xfer_us_per_page: float = 0.0
+        self.last_fire_us: float = 0.0
+        self.last_fire_pages: int = 0
+        self._ewma_xfer_alpha: float = 0.25
+        self._fires_observed: int = 0
+
+    def _record_fire_cost(self, n_pages: int, elapsed_us: float) -> None:
+        """Update the runtime EWMA of microseconds per KV page transferred.
+
+        Only called from the actuator background thread after a fire
+        commits.  Cancelled fires don't update the EWMA because the VMM
+        work was a no-op.  We normalise by the number of KV pages in the
+        plan (the FirePlan.page_ids length) so the EWMA mirrors the
+        scheduler's ``xpool_xfer_us_per_page`` cost parameter directly.
+        """
+        if n_pages <= 0 or elapsed_us <= 0.0:
+            return
+        per_page = elapsed_us / float(n_pages)
+        self.last_fire_us = elapsed_us
+        self.last_fire_pages = int(n_pages)
+        self._fires_observed += 1
+        if self.ewma_xfer_us_per_page <= 0.0:
+            # First sample seeds the EWMA so it doesn't take many fires
+            # to climb out of zero.  Subsequent samples blend in normally.
+            self.ewma_xfer_us_per_page = per_page
+        else:
+            a = self._ewma_xfer_alpha
+            self.ewma_xfer_us_per_page = (1.0 - a) * self.ewma_xfer_us_per_page + a * per_page
 
     def maybe_execute(self, plan: object) -> bool:
         """Actuate a budgeter plan unless it was already actuated.
@@ -125,18 +169,28 @@ class XPoolActuator:
                 raise RuntimeError("XPoolActuator: concurrent fire is not supported")
             self._inflight = True
             try:
+                # S2.5: time the VMM work so we can build a runtime EWMA of
+                # the actuator's cost-per-page.  perf_counter_ns is monotonic
+                # and immune to wall-clock jumps.
+                t0_ns = time.perf_counter_ns()
                 vmm_done = self._do_vmm(plan)
+                elapsed_us = (time.perf_counter_ns() - t0_ns) / 1000.0
                 if self._scheduler is not None and plan.cpp_plan is not None:
                     if vmm_done:
-                        # Physical transfer completed: update C++ allocator
-                        # capacities and clear the pending fire latch.
                         try:
                             self._scheduler.apply_xpool_fire(plan.cpp_plan)
                             logger.info(
-                                "XPool fire committed: op_id=%d direction=%s",
+                                "XPool fire committed: op_id=%d direction=%s elapsed_us=%.1f n_pages=%d",
                                 plan.op_id,
                                 plan.direction,
+                                elapsed_us,
+                                len(plan.page_ids),
                             )
+                            self._record_fire_cost(len(plan.page_ids), elapsed_us)
+                            if plan.direction == "kv_to_mamba":
+                                self.committed_kv_to_mamba += 1
+                            elif plan.direction == "mamba_to_kv":
+                                self.committed_mamba_to_kv += 1
                         except Exception as exc:  # noqa: BLE001
                             logger.warning(
                                 "apply_xpool_fire failed (op_id=%s dir=%s): %s",
@@ -166,6 +220,10 @@ class XPoolActuator:
                             plan.op_id,
                             plan.direction,
                         )
+                        if plan.direction == "kv_to_mamba":
+                            self.cancelled_kv_to_mamba += 1
+                        elif plan.direction == "mamba_to_kv":
+                            self.cancelled_mamba_to_kv += 1
             except Exception as exc:  # noqa: BLE001
                 # Background threads silently swallow uncaught exceptions.
                 # Log explicitly so failures are always visible.
@@ -272,26 +330,63 @@ class XPoolActuator:
 
         return raw_handles  # exact match
 
+    def _mamba_is_static(self) -> bool:
+        """Detect a pre-mapped, fixed-size Mamba arena.
+
+        Under the current SimpleMambaPool layout, ``conv_state`` and
+        ``ssm_state`` occupy contiguous slices of the arena VA in the order
+        ``[conv | ssm]``.  Growing or shrinking the tail of that VA window
+        therefore moves the boundary of the SSM block, which the kernel
+        addresses via tensor strides that were fixed at pool construction
+        time — any physical unmap of those tail bytes will corrupt SSM
+        state for slots the kernel still reads.
+
+        HiMA Phase 3 (S2.2-followup) sizes the Python pool to
+        ``base + xpool_mamba_headroom_slots`` slots at boot and the
+        pre-arenas factory maps every chunk that backing requires.  The
+        actuator then *skips* physical handle transfers on the Mamba side:
+        ``apply_xpool_fire`` is still called so the C++ allocator's logical
+        slot bound moves, but the Mamba arena's mapped_chunks never
+        changes after boot.
+
+        This method returns True for both the pre-construction path
+        (factory creates a fully-pre-mapped ChunkArena where the headroom
+        chunks ride along) and any future fully-pre-mapped variant.  When
+        False the actuator falls back to the legacy handle-transfer path
+        (still useful for unit tests with stub arenas).
+        """
+        max_chunks = getattr(self.mamba_arena, "max_chunks", None)
+        mapped_chunks = getattr(self.mamba_arena, "mapped_chunks", None)
+        if max_chunks is None or mapped_chunks is None:
+            return False
+        # Treat "fully mapped" or "arena holds extra VA but we never grow
+        # into it" (the pre-construction factory case where the tensor
+        # already covers the entire useful VA) as static.  We use equality
+        # as the canonical signal; callers that want the old transfer path
+        # can simply leave headroom_chunks > 0 in their arena.
+        return int(max_chunks) == int(mapped_chunks)
+
     def _do_vmm(self, plan: FirePlan) -> bool:
         """Perform physical cuMemUnmap / cuMemMap operations.
 
-        When the arenas support physical handle transfer (pre-construction
-        path with :class:`KvLayerArenaGroup`), the KV handles are donated to
-        the mamba arena rather than released and re-allocated.  This means
-        **no net change in total GPU physical memory** per fire.
+        The KV pool always uses physical mapping (handle release/re-map
+        through its own per-layer arenas).  The Mamba side is *logical
+        only* when the arena is pre-mapped at its full extent (see
+        :meth:`_mamba_is_static`), because the conv/ssm contiguous-slice
+        layout cannot tolerate post-boot resize.
 
-        For ``kv_to_mamba`` the KV pool is capped and drained before unmap.
-        For ``mamba_to_kv`` no drain is needed (we are adding KV capacity).
+        For ``kv_to_mamba`` the KV pool is capped and drained before
+        unmap.  For ``mamba_to_kv`` we drain Mamba's capped tail then
+        re-map physical pages in the KV arena.
 
         Returns:
-            True if the physical VMM transfer was executed, False if skipped
-            (e.g. arena headroom exhausted).  Caller should call
-            ``apply_xpool_fire`` only when True, and ``cancel_xpool_fire`` when
-            False.
+            True if the fire should be committed (``apply_xpool_fire``
+            called), False if it must be cancelled.
         """
         n_kv_pages = len(plan.page_ids)
         n_mamba_chunks = self._kv_pages_to_mamba_chunks(n_kv_pages)
         use_transfer = self._kv_supports_handle_transfer()
+        mamba_static = self._mamba_is_static()
 
         if plan.direction == "mamba_to_kv":
             # KvLayerArenaGroup exposes headroom_pages (in KV-page units) which
@@ -331,8 +426,30 @@ class XPoolActuator:
                         return False
             self._wait_drain("has_capped_mamba_inflight")
 
-            if use_transfer:
-                # True handle transfer: shrink mamba → donate handles → grow KV.
+            if mamba_static:
+                # Logical-only Mamba: never touch the Mamba arena.  KV
+                # grows from cached handles in its own shared pool.  If
+                # there were no prior kv_to_mamba shrinks this grow may
+                # exhaust handle availability — that's a config issue
+                # (mamba_to_kv first without prior cycle) which we surface
+                # via cancellation rather than a corruption.
+                try:
+                    self.kv_arena.grow(n_kv_pages)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "mamba_to_kv fire skipped (op_id=%d): kv grow failed "
+                        "(no handles to re-map?): %s",
+                        plan.op_id, exc,
+                    )
+                    return False
+                logger.info(
+                    "mamba_to_kv VMM done (logical mamba): grew %d kv pages",
+                    n_kv_pages,
+                )
+            elif use_transfer:
+                # Legacy path: true handle transfer.  Kept for tests and
+                # any deployment where the mamba arena layout supports
+                # tail unmap (e.g. a hypothetical slot-major variant).
                 raw = self.mamba_arena.shrink_with_handles(n_mamba_chunks)
                 balanced = self._balance_handles(raw, n_kv_pages)
                 self.kv_arena.grow_with_handles(balanced, n_kv_pages)
@@ -352,19 +469,21 @@ class XPoolActuator:
             return True
 
         elif plan.direction == "kv_to_mamba":
-            mamba_available = getattr(self.mamba_arena, "max_chunks", 0) - getattr(
-                self.mamba_arena, "mapped_chunks", 0
-            )
-            if mamba_available < n_mamba_chunks:
-                logger.warning(
-                    "kv_to_mamba fire skipped (op_id=%d): mamba arena headroom "
-                    "exhausted (%d/%d mapped, need %d more chunks)",
-                    plan.op_id,
-                    getattr(self.mamba_arena, "mapped_chunks", "?"),
-                    getattr(self.mamba_arena, "max_chunks", "?"),
-                    n_mamba_chunks,
-                )
-                return False
+            if not mamba_static:
+                mamba_available = getattr(
+                    self.mamba_arena, "max_chunks", 0
+                ) - getattr(self.mamba_arena, "mapped_chunks", 0)
+                if mamba_available < n_mamba_chunks:
+                    logger.warning(
+                        "kv_to_mamba fire skipped (op_id=%d): mamba arena "
+                        "headroom exhausted (%d/%d mapped, need %d more "
+                        "chunks)",
+                        plan.op_id,
+                        getattr(self.mamba_arena, "mapped_chunks", "?"),
+                        getattr(self.mamba_arena, "max_chunks", "?"),
+                        n_mamba_chunks,
+                    )
+                    return False
 
             if self._scheduler is not None:
                 prepare_fn = getattr(self._scheduler, "prepare_kv_to_mamba_fire", None)
@@ -379,8 +498,17 @@ class XPoolActuator:
                         return False
             self._wait_drain()
 
-            if use_transfer:
-                # True handle transfer: shrink KV → donate handles → grow mamba.
+            if mamba_static:
+                # Logical-only Mamba: KV shrinks (handles stay in KV's
+                # shared pool for later re-map by mamba_to_kv).  No
+                # physical action on the Mamba arena — its tensor view
+                # still covers all slots up to base + headroom.
+                self.kv_arena.shrink(n_kv_pages)
+                logger.info(
+                    "kv_to_mamba VMM done (logical mamba): shrunk %d kv pages",
+                    n_kv_pages,
+                )
+            elif use_transfer:
                 raw = self.kv_arena.shrink_with_handles(n_kv_pages)
                 balanced = self._balance_handles(raw, n_mamba_chunks)
                 self.mamba_arena.grow_with_handles(balanced)

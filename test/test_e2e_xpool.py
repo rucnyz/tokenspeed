@@ -31,6 +31,14 @@ def main():
         budgeter_pages_per_fire=32,
         budgeter_tick_s=0.5,
         xpool_nb_margin=0.001,
+        # Disable the Phase 3 saturation gate so this Phase 2 path-coverage
+        # test continues to exercise XPool fires even at low pool util.
+        xpool_saturation_low=0.0,
+        # Also disable the S2.2 reverse-direction cooldown: this test runs
+        # a tight workload meant to exercise the actuator in any direction;
+        # keeping the cooldown on can suppress some fires and reduce the
+        # path coverage. See test_budgeter.cpp for cooldown-specific tests.
+        xpool_reverse_cooldown_s=0.0,
     )
 
     # 触发推理，产生负载让 budgeter 可能触发

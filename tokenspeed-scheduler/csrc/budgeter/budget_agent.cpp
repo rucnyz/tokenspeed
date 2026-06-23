@@ -96,6 +96,17 @@ void BudgetAgent::OnRequestArrival(std::int32_t prompt_tokens, const PoolSnapsho
     if (!config_.enable_admitter) {
         return;
     }
+    // Saturation gate (S2.1): when both pools are well below capacity, the
+    // admitter's CrossFree / CrossEvict candidates can't beat the trivial
+    // "fit-in-current-pool" path anyway, so skip the (non-trivial) decision
+    // work. We use the EWMA pressure tracked by Tick() rather than the raw
+    // snapshot so transient dips in a steadily-loaded pool don't repeatedly
+    // re-arm the admitter.
+    if (config_.xpool_saturation_low > 0.0 &&
+        ewma_pressure_kv_ < config_.xpool_saturation_low &&
+        ewma_pressure_mamba_ < config_.xpool_saturation_low) {
+        return;
+    }
     auto decision = admitter_.DecideForRequest(prompt_tokens, snapshot);
     if (decision.action == AdmitAction::kCrossFree || decision.action == AdmitAction::kCrossEvict) {
         XPoolFirePlan plan;
@@ -136,6 +147,13 @@ std::optional<XPoolFirePlan> BudgetAgent::Tick(const PoolSnapshot& snapshot) {
     ewma_pressure_kv_ = (1.0 - eta) * ewma_pressure_kv_ + eta * kv_util;
     ewma_pressure_mamba_ = (1.0 - eta) * ewma_pressure_mamba_ + eta * mamba_util;
 
+    // PressureAdapter EWMA (S2.3): smooth the system-level signals with the
+    // same horizon as utilisation.  Cast to double so the time-decayed
+    // average has fractional resolution even when raw counts are zero/one.
+    ewma_queue_   = (1.0 - eta) * ewma_queue_   + eta * static_cast<double>(snapshot.queue_len);
+    ewma_retract_ = (1.0 - eta) * ewma_retract_ + eta * static_cast<double>(snapshot.retracted_count);
+    ewma_paused_  = (1.0 - eta) * ewma_paused_  + eta * static_cast<double>(snapshot.paused_count);
+
     const std::int32_t n_kv = config_.budgeter_pages_per_fire;
     // Compute how many mamba slots correspond to one fire worth of KV pages.
     std::int32_t n_mamba = 0;
@@ -146,24 +164,62 @@ std::optional<XPoolFirePlan> BudgetAgent::Tick(const PoolSnapshot& snapshot) {
             static_cast<std::int64_t>(config_.mamba_bytes_per_slot));
     }
 
+    // PressureAdapter (S2.3): blend the queue/retract/paused EWMA into the
+    // direction-decision pressure values.  When all weights default to 0
+    // these helpers simply return the raw EWMA so the math is unchanged.
+    const double adj_kv    = AdjustedPressureKv(ewma_pressure_kv_);
+    const double adj_mamba = AdjustedPressureMamba(ewma_pressure_mamba_);
+
     if (BudgetLogEnabled()) {
         BudgetLogger().info(
             "BudgetTick: kv_util={:.4f} mamba_util={:.4f}(eff) ewma_kv={:.4f} ewma_mamba={:.4f} "
-            "kv_free={} kv_total={} mamba_free={} mamba_used={} mamba_evict={} mamba_total={} kv_headroom={}",
+            "adj_kv={:.4f} adj_mamba={:.4f} ewma_q={:.2f} ewma_r={:.2f} ewma_p={:.2f} "
+            "kv_free={} kv_total={} mamba_free={} mamba_used={} mamba_evict={} mamba_total={} "
+            "queue={} retract={} paused={} kv_headroom={}",
             kv_util, mamba_util, ewma_pressure_kv_, ewma_pressure_mamba_,
+            adj_kv, adj_mamba,
+            ewma_queue_, ewma_retract_, ewma_paused_,
             snapshot.kv_free_pages, snapshot.kv_total_pages,
             snapshot.mamba_free_slots, mamba_used,
             snapshot.mamba_evictable_slots, snapshot.mamba_total_slots,
+            snapshot.queue_len, snapshot.retracted_count, snapshot.paused_count,
             snapshot.kv_headroom_pages);
     }
 
-    if (ewma_pressure_kv_ > ewma_pressure_mamba_ + config_.xpool_nb_margin &&
+    // Saturation gate (S2.1): only run the fire-decision branches when at
+    // least one pool is approaching saturation. EWMA is still updated above
+    // so rising load is detected the moment either side crosses the gate.
+    // The gate uses the *adjusted* pressure so a heavy queue/retract burst
+    // can lift the budgeter out of the low-saturation no-op regime even
+    // before raw utilisation EWMA climbs.
+    if (config_.xpool_saturation_low > 0.0 &&
+        adj_kv < config_.xpool_saturation_low &&
+        adj_mamba < config_.xpool_saturation_low) {
+        if (BudgetLogEnabled()) {
+            BudgetLogger().info(
+                "BudgetTick: gated by xpool_saturation_low={:.2f} "
+                "(adj_kv={:.3f} adj_mamba={:.3f})",
+                config_.xpool_saturation_low, adj_kv, adj_mamba);
+        }
+        return std::nullopt;
+    }
+
+    if (adj_kv > adj_mamba + config_.xpool_nb_margin &&
         snapshot.mamba_free_slots > config_.xpool_mamba_floor_slots) {
         // Guard: only fire if KV has physical VMM headroom to receive handles.
         if (n_kv > 0 && snapshot.kv_headroom_pages < n_kv) {
             if (BudgetLogEnabled()) {
                 BudgetLogger().info("BudgetTick: mamba_to_kv blocked by kv_headroom ({} < {})",
                                     snapshot.kv_headroom_pages, n_kv);
+            }
+            return std::nullopt;
+        }
+        // S2.2 reverse-direction cooldown.
+        if (ReverseDirectionGated("mamba_to_kv", now)) {
+            if (BudgetLogEnabled()) {
+                BudgetLogger().info(
+                    "BudgetTick: mamba_to_kv suppressed by reverse_cooldown (last_fire={}, within {:.2f}s)",
+                    last_fire_direction_, config_.xpool_reverse_cooldown_s);
             }
             return std::nullopt;
         }
@@ -177,9 +233,18 @@ std::optional<XPoolFirePlan> BudgetAgent::Tick(const PoolSnapshot& snapshot) {
         pending_fire_ = plan;
         return plan;
     }
-    if (ewma_pressure_mamba_ > ewma_pressure_kv_ + config_.xpool_nb_margin) {
+    if (adj_mamba > adj_kv + config_.xpool_nb_margin) {
         // Guard: only fire if mamba has physical VMM headroom to receive handles.
         if (n_mamba > 0 && snapshot.mamba_headroom_slots < n_mamba) {
+            return std::nullopt;
+        }
+        // S2.2 reverse-direction cooldown.
+        if (ReverseDirectionGated("kv_to_mamba", now)) {
+            if (BudgetLogEnabled()) {
+                BudgetLogger().info(
+                    "BudgetTick: kv_to_mamba suppressed by reverse_cooldown (last_fire={}, within {:.2f}s)",
+                    last_fire_direction_, config_.xpool_reverse_cooldown_s);
+            }
             return std::nullopt;
         }
         XPoolFirePlan plan;
@@ -193,6 +258,72 @@ std::optional<XPoolFirePlan> BudgetAgent::Tick(const PoolSnapshot& snapshot) {
         return plan;
     }
     return std::nullopt;
+}
+
+void BudgetAgent::OnFireCommitted(const std::string& direction) {
+    // Only physical commits (Scheduler::ApplyXPoolFire) call this. Cancelled
+    // fires (Scheduler::CancelXPoolFire) intentionally bypass this hook so the
+    // cooldown gate never punishes a no-op cancel.
+    if (direction != "kv_to_mamba" && direction != "mamba_to_kv") {
+        return;
+    }
+    last_fire_direction_ = direction;
+    last_fire_time_ = std::chrono::steady_clock::now();
+}
+
+double BudgetAgent::AdjustedPressureKv(double base_pressure) const {
+    // PressureAdapter (S2.3).  Skip the math when both weights are zero so
+    // the no-config-change codepath stays branch-light.
+    if (config_.xpool_w_queue <= 0.0 && config_.xpool_w_retract <= 0.0) {
+        return base_pressure;
+    }
+    const double queue_ref = static_cast<double>(std::max(
+        1, config_.xpool_queue_ref > 0
+               ? config_.xpool_queue_ref
+               : (config_.max_batch_size > 0 ? config_.max_batch_size / 2 : 1)));
+    const double retract_ref = static_cast<double>(std::max(
+        1, config_.xpool_retract_ref > 0
+               ? config_.xpool_retract_ref
+               : (config_.max_batch_size > 0 ? config_.max_batch_size / 4 : 1)));
+    const double q_norm = std::clamp(ewma_queue_ / queue_ref, 0.0, 1.0);
+    const double r_norm = std::clamp(ewma_retract_ / retract_ref, 0.0, 1.0);
+    const double adjusted = base_pressure
+                          + config_.xpool_w_queue * q_norm
+                          + config_.xpool_w_retract * r_norm;
+    return std::clamp(adjusted, 0.0, 1.0);
+}
+
+double BudgetAgent::AdjustedPressureMamba(double base_pressure) const {
+    // PressureAdapter (S2.3).  Currently only paused contributes; the
+    // queue/retract signals are KV-side indicators.
+    if (config_.xpool_w_paused <= 0.0) {
+        return base_pressure;
+    }
+    const double paused_ref = static_cast<double>(std::max(
+        1, config_.xpool_paused_ref > 0
+               ? config_.xpool_paused_ref
+               : (config_.max_batch_size > 0 ? config_.max_batch_size / 4 : 1)));
+    const double p_norm = std::clamp(ewma_paused_ / paused_ref, 0.0, 1.0);
+    const double adjusted = base_pressure + config_.xpool_w_paused * p_norm;
+    return std::clamp(adjusted, 0.0, 1.0);
+}
+
+bool BudgetAgent::ReverseDirectionGated(
+    const std::string& direction,
+    std::chrono::steady_clock::time_point now) const {
+    if (config_.xpool_reverse_cooldown_s <= 0.0) {
+        return false;
+    }
+    if (last_fire_direction_.empty()) {
+        return false;
+    }
+    if (last_fire_direction_ == direction) {
+        // Same-direction fires accumulate capacity transfer; never gated.
+        return false;
+    }
+    const double elapsed =
+        std::chrono::duration<double>(now - last_fire_time_).count();
+    return elapsed < config_.xpool_reverse_cooldown_s;
 }
 
 }  // namespace tokenspeed

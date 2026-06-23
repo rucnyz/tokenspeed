@@ -183,6 +183,22 @@ MatchResult KVPrefixCache::Match(const token_vec_t& token_ids, MatchIntent inten
     MatchResult& match = walk_result.match;
     match.device.page_size = page_size;
     match.host.page_size = page_size;
+    // S2.4 fix for stale LPB priority. WalkDownUtilMismatch calls
+    // RecordHit() on every node it visits, but the eviction priority stored
+    // in the sorted leaves set is only recomputed by UpdateLeaves(). Without
+    // a refresh here, a node that received N hits during prior Match()
+    // walks still appears with priority = (0 * c_s) / bytes = 0 in the
+    // sorted set, so it'd be evicted as if it were cold. We refresh the
+    // deepest matched leaf on each tier (cheap O(log N)) so LPB ordering
+    // actually reflects observed reuse.
+    if (eviction_config_.policy == EvictionPolicy::kLpb) {
+        if (match.device.last_node != nullptr) {
+            device_.UpdateLeaves(match.device.last_node);
+        }
+        if (match.host.last_node != nullptr) {
+            host_.UpdateLeaves(match.host.last_node);
+        }
+    }
     return match;
 }
 
