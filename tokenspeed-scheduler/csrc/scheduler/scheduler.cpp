@@ -77,7 +77,8 @@ EvictionConfig MakeEvictionConfig(const SchedulerConfig& config) {
 }  // namespace
 
 Scheduler::Scheduler(SchedulerConfig config)
-    : config_{std::move(config)},
+    : original_max_batch_size_{config.max_batch_size},
+      config_{std::move(config)},
       device_allocator_{config_.page_size, config_.device_allocator.total_pages,
                         config_.enable_xpool_dynamic_capacity},
       host_allocator_{config_.page_size, config_.host_allocator.total_pages},
@@ -516,6 +517,11 @@ PoolSnapshot Scheduler::MakePoolSnapshot() const {
         }
     }
     snapshot.queue_len = static_cast<std::int32_t>(WaitingSize());
+    // PressureAdapter (S2.3): retracted_count is the number of requests in
+    // fsm::Retracting/Retracted — a leading indicator that KV demand
+    // recently exceeded supply.  BudgetAgent blends this into KV pressure
+    // when config_.xpool_w_retract > 0 (default 0 = no behavioural change).
+    snapshot.retracted_count = static_cast<std::int32_t>(RetractedSize());
     return snapshot;
 }
 
@@ -524,6 +530,19 @@ void Scheduler::BudgetTick() {
         return;
     }
     budget_agent_->Tick(MakePoolSnapshot());
+    // S2.7 (HiMA Phase 3): dynamic admission cap.  After the budgeter
+    // tick we may have committed kv_to_mamba / mamba_to_kv fires that
+    // changed the Mamba pool size.  Clamp the effective max_batch_size
+    // to the current mamba_total_slots so the scheduler stops admitting
+    // more decoders than can fit in Mamba (preventing churn that would
+    // otherwise immediately retract them).  The cap auto-restores on
+    // mamba_to_kv fires that grow Mamba back.  Capped to
+    // original_max_batch_size_ so we never overflow the ReqPoolAllocator.
+    if (config_.enable_dynamic_admission_cap && mamba_allocator_) {
+        const std::int32_t mamba_total =
+            static_cast<std::int32_t>(mamba_allocator_->MappedSlots());
+        SetMaxBatchSize(mamba_total);
+    }
 }
 
 std::optional<XPoolFirePlan> Scheduler::PendingXPoolFire() const {
@@ -638,8 +657,11 @@ void Scheduler::ApplyXPoolFire(const XPoolFirePlan& plan) {
         }
     }
 
-    // Clear the pending latch so the budgeter can emit new plans.
+    // Clear the pending latch so the budgeter can emit new plans, and arm
+    // the S2.2 reverse-direction cooldown so the opposite direction cannot
+    // fire again in the immediate next tick (cancel path skips this).
     if (budget_agent_) {
+        budget_agent_->OnFireCommitted(plan.direction);
         budget_agent_->ClearPendingFire();
     }
 }
@@ -683,6 +705,17 @@ std::int32_t Scheduler::MappedMambaSlots() const {
         return mamba_allocator_->MappedSlots();
     }
     return 0;
+}
+
+void Scheduler::SetMaxBatchSize(std::int32_t new_cap) {
+    // S2.7: clamp to [1, original_max_batch_size_].  Lower bound 1 keeps
+    // the scheduler making forward progress even when Mamba briefly
+    // drops to zero free slots (the cap controls *admission*, not the
+    // ability to drain existing requests).  Upper bound prevents
+    // overflowing the ReqPoolAllocator, which is sized at boot.
+    const std::int32_t clamped =
+        std::max<std::int32_t>(1, std::min<std::int32_t>(new_cap, original_max_batch_size_));
+    config_.max_batch_size = clamped;
 }
 
 }  // namespace tokenspeed

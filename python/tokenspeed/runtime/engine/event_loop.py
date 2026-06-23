@@ -19,6 +19,8 @@
 # SOFTWARE.
 
 import faulthandler
+import json
+import os
 import signal
 import time
 from collections import OrderedDict
@@ -210,6 +212,34 @@ class EventLoop:
             and hasattr(_txt_cfg_pre, "mamba2_cache_params")
         )
 
+        # HiMA Phase 3 (S2.2-followup): resolve the Mamba pool headroom *up
+        # front*, before the pool is constructed. The Python SimpleMambaPool
+        # tensor must be sized to (base + headroom + 1 + draft) slots from
+        # the start because changing the row-dim post-CUDA-graph-capture
+        # would invalidate captured strides.  We feed the same value to the
+        # C++ scheduler (mamba_pool_total_chunks = base + headroom) and to
+        # the registry (mamba_pool_size = base + headroom + 1).  Auto-derive
+        # uses budgeter_pages_per_fire because the byte-balanced formula
+        # needs the post-pool mamba_bytes_per_slot, which doesn't exist yet.
+        self._xpool_mamba_headroom_slots = 0
+        if _enable_xpool and _pre_has_mamba:
+            cfg_headroom = int(
+                getattr(server_args, "xpool_mamba_headroom_slots", 0)
+            )
+            if cfg_headroom > 0:
+                self._xpool_mamba_headroom_slots = cfg_headroom
+            else:
+                _ppf = max(
+                    1, int(getattr(server_args, "budgeter_pages_per_fire", 64))
+                )
+                # Conservative slot-count default that scales with fire size
+                # but stays small enough that the permanently-reserved Mamba
+                # memory is < 100 MB for typical hybrid models.  For Qwen3.5
+                # (mamba_bytes_per_slot ≈ 2 MB) this caps the reserved
+                # headroom at ~64 MB.  Override via ServerArgs to allow more
+                # cross-pool oscillation before fires hit the slot ceiling.
+                self._xpool_mamba_headroom_slots = max(_ppf // 4, 32)
+
         _xpool_arena_factory = None
         if _enable_xpool and _pre_has_mamba:
             _xpool_arena_factory = self._make_xpool_pre_arena_factory(server_args)
@@ -231,6 +261,7 @@ class EventLoop:
             server_args.enable_memory_saver,
             draft_model_config,
             _xpool_arena_factory=_xpool_arena_factory,
+            xpool_mamba_headroom_slots=self._xpool_mamba_headroom_slots,
         )
 
         num_total_pages = self.max_total_num_tokens // server_args.block_size
@@ -381,17 +412,14 @@ class EventLoop:
         # When XPool dynamic capacity is active the VA window needs headroom
         # above the profiled baseline so transfers in both directions have room.
         # Reserve 4× budgeter_pages_per_fire extra pages in each direction.
+        # Mamba headroom (in slots) was resolved up front so the Python pool
+        # was sized at base + headroom; reuse it here so the C++ allocator's
+        # mamba slot bound matches the Python tensor's row dimension.
         xpool_pages_headroom = 0
-        xpool_mamba_headroom = 0
+        xpool_mamba_headroom = self._xpool_mamba_headroom_slots
         if getattr(server_args, "enable_xpool_dynamic_capacity", False):
             pages_per_fire = int(getattr(server_args, "budgeter_pages_per_fire", 64))
             xpool_pages_headroom = pages_per_fire * 4
-            if mamba_bytes_per_slot > 0 and kv_bytes_per_page > 0:
-                mamba_slots_per_fire = max(
-                    1,
-                    pages_per_fire * kv_bytes_per_page // mamba_bytes_per_slot,
-                )
-                xpool_mamba_headroom = mamba_slots_per_fire * 4
 
         scheduler_cfg = make_config(
             num_device_pages=profiled_kv_pages + xpool_pages_headroom,
@@ -434,6 +462,16 @@ class EventLoop:
             budgeter_pages_per_fire=server_args.budgeter_pages_per_fire,
             xpool_nb_margin=server_args.xpool_nb_margin,
             xpool_ewma_tau_s=server_args.xpool_ewma_tau_s,
+            xpool_saturation_low=server_args.xpool_saturation_low,
+            xpool_reverse_cooldown_s=server_args.xpool_reverse_cooldown_s,
+            # PressureAdapter (S2.3): forward-looking signal weights.
+            xpool_w_queue=server_args.xpool_w_queue,
+            xpool_w_retract=server_args.xpool_w_retract,
+            xpool_w_paused=server_args.xpool_w_paused,
+            xpool_queue_ref=server_args.xpool_queue_ref,
+            xpool_retract_ref=server_args.xpool_retract_ref,
+            xpool_paused_ref=server_args.xpool_paused_ref,
+            enable_dynamic_admission_cap=server_args.enable_dynamic_admission_cap,
             # Initial capacities: profiled baselines (strictly less than VA window).
             xpool_initial_kv_pages=profiled_kv_pages if xpool_pages_headroom > 0 else 0,
             xpool_initial_mamba_slots=(
@@ -462,6 +500,25 @@ class EventLoop:
         self.scheduler = Scheduler(scheduler_cfg)
         self._budgeter_tick_s = float(server_args.budgeter_tick_s)
         self._last_budget_tick = 0.0
+        # Replay metrics: when TOKENSPEED_REPLAY_METRICS_PATH is set to a file
+        # path, the event loop appends a JSONL snapshot every
+        # TOKENSPEED_REPLAY_METRICS_INTERVAL_S seconds (default 0.1). This is
+        # the per-tick time series that ``tokenspeed.agentreplay`` uses to
+        # plot pool occupancy / fire timing for HiMA A/B benchmarks. Keeping
+        # the contract here (rather than in agentreplay) means any harness
+        # can opt in by setting the env var, not just the replay CLI.
+        self._replay_metrics_path = os.environ.get("TOKENSPEED_REPLAY_METRICS_PATH")
+        self._replay_metrics_interval_s = float(
+            os.environ.get("TOKENSPEED_REPLAY_METRICS_INTERVAL_S", "0.1")
+        )
+        self._replay_metrics_file = None
+        self._replay_metrics_last_t = 0.0
+        self._replay_metrics_start_t = 0.0
+        if self._replay_metrics_path:
+            # Open in line-buffered mode so a crash doesn't lose the recent
+            # tail. We intentionally truncate any prior file so each run
+            # has its own time series.
+            self._replay_metrics_file = open(self._replay_metrics_path, "w", buffering=1)
         self._init_xpool_actuator(
             server_args,
             has_mamba,
@@ -1046,21 +1103,30 @@ class EventLoop:
             mamba_current_chunks = max(
                 1, math.ceil(mamba_pool_bytes / CHUNK_SIZE_BYTES)
             )
-            # Headroom for XPool transfers (≈ 4× budgeter_pages_per_fire
-            # worth of mamba slots, expressed in chunks).
-            mamba_max_chunks = mamba_current_chunks + max(pages_per_fire * 4, 4)
+            # HiMA Phase 3 (S2.2-followup): mamba_total_size already accounts
+            # for xpool_mamba_headroom_slots (see _create_hybrid_linear_attn).
+            # The arena is sized at base+headroom and FULLY pre-mapped at
+            # boot so the SimpleMambaPool tensor (a view over the same VA)
+            # is backed by physical pages from slot 0 up to total_size.
+            # The XPoolActuator detects the equal max_chunks/mapped_chunks
+            # signal and treats Mamba as logical-only — kv_to_mamba and
+            # mamba_to_kv fires update the C++ allocator's slot bound but
+            # never resize the Mamba arena, which the conv/ssm
+            # contiguous-slice layout cannot safely support.
+            mamba_max_chunks = mamba_current_chunks
+            mamba_mapped_chunks = mamba_current_chunks
 
             mamba_handles = SharedHandlePool(mamba_max_chunks, device=gpu_id)
             mamba_arena = ChunkArena(
                 shared_pool=mamba_handles,
                 max_chunks=mamba_max_chunks,
-                mapped_chunks=mamba_current_chunks,
+                mapped_chunks=mamba_mapped_chunks,
                 name="xpool_mamba",
             )
             logger.info(
                 "XPool pre-arenas factory: mamba arena created "
-                "(%d/%d chunks, %d bytes)",
-                mamba_current_chunks,
+                "(%d/%d chunks pre-mapped, %d bytes; logical-only resize)",
+                mamba_mapped_chunks,
                 mamba_max_chunks,
                 mamba_pool_bytes,
             )
@@ -1221,33 +1287,15 @@ class EventLoop:
                 else pages_per_fire * 4
             )
 
-            xpool_mamba_headroom = (
-                int(getattr(server_args, "budgeter_pages_per_fire", 64)) * 4
-            )
-            mamba_bytes_per_slot = getattr(server_args, "mamba_bytes_per_slot", 0)
-            if mamba_bytes_per_slot > 0 and kv_bytes_per_page > 0:
-                mamba_slots_per_fire = max(
-                    1, pages_per_fire * kv_bytes_per_page // mamba_bytes_per_slot
-                )
-                xpool_mamba_headroom = mamba_slots_per_fire * 4
-
-            mamba_headroom_chunks = (
-                max(
-                    1,
-                    math.ceil(
-                        xpool_mamba_headroom
-                        * (
-                            mamba_pool_bytes
-                            / max(1, mamba_current_chunks)
-                            / CHUNK_SIZE_BYTES
-                        )
-                    ),
-                )
-                if mamba_pool_bytes > 0
-                else pages_per_fire * 4
-            )
-
-            mamba_max_chunks = mamba_current_chunks + mamba_headroom_chunks
+            # HiMA Phase 3 (S2.2-followup): legacy post-capture path also
+            # treats Mamba as logical-only.  The Python SimpleMambaPool
+            # tensor is sized at base+headroom (via
+            # xpool_mamba_headroom_slots passed to the registry), so the
+            # C++ allocator can grow logically without overflowing the
+            # tensor.  The arena's physical mapping never moves —
+            # set max_chunks == mapped_chunks to signal the static state
+            # to XPoolActuator._mamba_is_static.
+            mamba_max_chunks = mamba_current_chunks
 
             mamba_handles = SharedHandlePool(mamba_max_chunks, device=self.gpu_id)
             mamba_arena = ChunkArena(
@@ -1379,13 +1427,15 @@ class EventLoop:
                 )
 
             # Mamba rebind is skipped on the legacy path because CUDA graphs
-            # have already captured the old tensor pointers.  Logical capacity
-            # tracking still functions correctly; only physical memory transfer
-            # to/from the mamba pool is disabled on this path.
+            # have already captured the old tensor pointers.  The Python
+            # SimpleMambaPool was sized to base+headroom (registry honors
+            # xpool_mamba_headroom_slots) so the C++ allocator's logical
+            # Grow never overflows the tensor's slot dim, and the arena
+            # never moves physically (max_chunks==mapped_chunks signals
+            # static state to XPoolActuator).
             logger.info(
-                "XPool: mamba VMM arena ready (%d mapped/%d max chunks); "
-                "tensor rebind skipped (post-graph-capture path — "
-                "physical memory transfer disabled, logical tracking active)",
+                "XPool: mamba VMM arena ready (%d/%d chunks pre-mapped); "
+                "logical-only path (tensor rebind skipped, post-graph-capture)",
                 mamba_current_chunks,
                 mamba_max_chunks,
             )
@@ -1432,16 +1482,88 @@ class EventLoop:
 
     def _maybe_budget_tick(self) -> None:
         if self._budgeter_tick_s <= 0:
+            self._maybe_emit_replay_metrics()
             return
         now = time.monotonic()
         if self._last_budget_tick == 0.0:
             self._last_budget_tick = now
             return
         if now - self._last_budget_tick < self._budgeter_tick_s:
+            self._maybe_emit_replay_metrics()
             return
         self.scheduler.budget_tick()
         self._last_budget_tick = now
         self._maybe_fire_xpool()
+        self._maybe_emit_replay_metrics()
+
+    def _maybe_emit_replay_metrics(self) -> None:
+        """Periodically append a pool-state snapshot to the replay log.
+
+        Cheap fields only -- we call this from the hot scheduler loop, so
+        any expensive aggregation (e.g. iterating all requests) is avoided.
+        Returns silently when ``TOKENSPEED_REPLAY_METRICS_PATH`` is unset.
+        """
+        if self._replay_metrics_file is None:
+            return
+        now = time.monotonic()
+        if self._replay_metrics_start_t == 0.0:
+            self._replay_metrics_start_t = now
+        if (
+            self._replay_metrics_last_t > 0.0
+            and now - self._replay_metrics_last_t < self._replay_metrics_interval_s
+        ):
+            return
+        self._replay_metrics_last_t = now
+
+        actuator = getattr(self, "_xpool_actuator", None)
+        kv_arena = getattr(actuator, "kv_arena", None) if actuator else None
+        mamba_arena = getattr(actuator, "mamba_arena", None) if actuator else None
+        snap = {
+            "t": now - self._replay_metrics_start_t,
+            "queue_len": int(self.scheduler.waiting_size()),
+            "decoding": int(self.scheduler.decoding_size()),
+            "prefilling": int(self.scheduler.prefilling_size()),
+            "retract_count": int(self.scheduler.retract_count()),
+            "kv_free_pages": int(self.scheduler.available_kv_pages()),
+            "kv_active_pages": int(self.scheduler.active_kv_pages()),
+            "kv_mapped_pages": (
+                int(getattr(kv_arena, "mapped_chunks", 0)) if kv_arena is not None else 0
+            ),
+            "kv_headroom_pages": (
+                int(getattr(kv_arena, "headroom_pages", 0)) if kv_arena is not None else 0
+            ),
+            "mamba_mapped_chunks": (
+                int(getattr(mamba_arena, "mapped_chunks", 0))
+                if mamba_arena is not None
+                else 0
+            ),
+            "fires_kv_to_mamba_total": (
+                int(actuator.committed_kv_to_mamba) if actuator else 0
+            ),
+            "fires_mamba_to_kv_total": (
+                int(actuator.committed_mamba_to_kv) if actuator else 0
+            ),
+            "fires_cancelled_total": (
+                int(actuator.cancelled_kv_to_mamba + actuator.cancelled_mamba_to_kv)
+                if actuator
+                else 0
+            ),
+            "xpool_ewma_xfer_us_per_page": (
+                float(getattr(actuator, "ewma_xfer_us_per_page", 0.0))
+                if actuator
+                else 0.0
+            ),
+            "xpool_last_fire_us": (
+                float(getattr(actuator, "last_fire_us", 0.0)) if actuator else 0.0
+            ),
+            "xpool_last_fire_pages": (
+                int(getattr(actuator, "last_fire_pages", 0)) if actuator else 0
+            ),
+        }
+        try:
+            self._replay_metrics_file.write(json.dumps(snap) + "\n")
+        except Exception:  # pragma: no cover - best-effort tracing
+            pass
 
     def _process_new_requests(self):
         recv_reqs = self.request_handler.recv_reqs()

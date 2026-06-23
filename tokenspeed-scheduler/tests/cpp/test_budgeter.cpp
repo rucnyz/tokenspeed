@@ -40,6 +40,11 @@ SchedulerConfig MakeBudgeterConfig() {
     config.xpool_nb_margin = 0.1;
     config.xpool_mamba_floor_slots = 0;
     config.budgeter_pages_per_fire = 64;
+    // Most existing tests intentionally exercise far-from-saturation
+    // snapshots (e.g. kv_util=0 vs mamba_util=1). Disable the S2.1
+    // saturation gate by default so those tests still see fires. A
+    // dedicated test below exercises the gate explicitly.
+    config.xpool_saturation_low = 0.0;
     return config;
 }
 
@@ -191,6 +196,181 @@ TEST(BudgeterTest, MambaHeadroomGuardBlocksKvToMambaFire) {
         << "kv_to_mamba must be suppressed when mamba arena lacks headroom";
 }
 
+TEST(BudgeterTest, SaturationGateSuppressesFireWhenBothPoolsLowPressure) {
+    // S2.1: With xpool_saturation_low > both pools' EWMA pressure, the
+    // budgeter must skip the fire branches even when the inter-pool delta
+    // exceeds xpool_nb_margin. This is the explicit "no fire when neither
+    // pool is anywhere near full" guard.
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.xpool_saturation_low = 0.5;
+    BudgetAgent agent(config);
+
+    TinySleep();
+    PoolSnapshot snap = MakeBaseSnapshot();
+    // KV at 30% util, mamba at 0% util. Delta (0.30) >> margin (0.1) so
+    // the legacy logic would emit mamba_to_kv. With the saturation gate
+    // we want this suppressed because no pool is anywhere near full.
+    snap.kv_free_pages = 70;        // kv_util = 30%
+    snap.mamba_free_slots = 100;    // mamba_util(eff) = 0%
+    EXPECT_FALSE(agent.Tick(snap).has_value())
+        << "fire must be suppressed when both pools are below xpool_saturation_low";
+}
+
+TEST(BudgeterTest, SaturationGateAllowsFireWhenOneSideSaturates) {
+    // Symmetric: once at least one side crosses the saturation threshold,
+    // the normal fire-decision branches run again.
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.xpool_saturation_low = 0.5;
+    BudgetAgent agent(config);
+
+    TinySleep();
+    PoolSnapshot snap = MakeBaseSnapshot();
+    snap.kv_free_pages = 0;             // kv_util = 100% (>> threshold)
+    snap.mamba_free_slots = 100;        // mamba_util(eff) = 0%
+    auto plan = agent.Tick(snap);
+    ASSERT_TRUE(plan.has_value())
+        << "fire must resume once one pool crosses the saturation threshold";
+    EXPECT_EQ(plan->direction, "mamba_to_kv");
+}
+
+TEST(BudgeterTest, SaturationGateDisabledByZero) {
+    // xpool_saturation_low = 0.0 must restore the legacy "always run the
+    // fire path" behavior so existing deployments aren't surprised.
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.xpool_saturation_low = 0.0;
+    BudgetAgent agent(config);
+
+    TinySleep();
+    PoolSnapshot snap = MakeBaseSnapshot();
+    snap.kv_free_pages = 70;        // kv_util = 30%
+    snap.mamba_free_slots = 100;    // mamba_util(eff) = 0%
+    // With gate disabled and util delta 0.30 > margin 0.10, must fire.
+    auto plan = agent.Tick(snap);
+    ASSERT_TRUE(plan.has_value());
+    EXPECT_EQ(plan->direction, "mamba_to_kv");
+}
+
+// =====================================================================
+// S2.2 reverse-direction cooldown tests
+// =====================================================================
+//
+// After a fire commits in direction D, the budgeter must suppress any plan
+// in the OPPOSITE direction for xpool_reverse_cooldown_s seconds. Same-
+// direction plans and disabled cooldown (0.0) must remain unaffected. The
+// hook point is BudgetAgent::OnFireCommitted, called from
+// Scheduler::ApplyXPoolFire after physical Grow/Shrink succeed.
+
+TEST(BudgeterTest, ReverseCooldownSuppressesOppositeDirection) {
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.xpool_reverse_cooldown_s = 1.0;  // 1-second window
+    BudgetAgent agent(config);
+
+    // Step 1: a kv_to_mamba fire commits.
+    agent.OnFireCommitted("kv_to_mamba");
+    EXPECT_EQ(agent.LastFireDirection(), "kv_to_mamba");
+
+    // Step 2: pressure flips. Without the cooldown this snapshot would
+    // produce a mamba_to_kv plan (kv exhausted, mamba free), but the
+    // gate must suppress it because we're still inside the 1s window.
+    TinySleep();
+    PoolSnapshot snap = MakeBaseSnapshot();
+    snap.kv_free_pages = 0;             // kv_util = 100%
+    snap.mamba_free_slots = 100;        // mamba_util = 0%
+    auto plan = agent.Tick(snap);
+    EXPECT_FALSE(plan.has_value());
+}
+
+TEST(BudgeterTest, ReverseCooldownAllowsSameDirection) {
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.xpool_reverse_cooldown_s = 1.0;
+    BudgetAgent agent(config);
+
+    // Step 1: a kv_to_mamba fire commits.
+    agent.OnFireCommitted("kv_to_mamba");
+
+    // Step 2: pressure stays in the SAME direction (mamba still exhausted,
+    // kv still free). Cooldown must NOT gate this — same-direction fires
+    // can accumulate capacity transfer.
+    TinySleep();
+    PoolSnapshot snap = MakeBaseSnapshot();
+    snap.kv_free_pages = 100;           // kv_util = 0%
+    snap.mamba_free_slots = 0;          // mamba_util = 100%
+    auto plan = agent.Tick(snap);
+    ASSERT_TRUE(plan.has_value());
+    EXPECT_EQ(plan->direction, "kv_to_mamba");
+}
+
+TEST(BudgeterTest, ReverseCooldownExpiresAfterWindow) {
+    SchedulerConfig config = MakeBudgeterConfig();
+    // Tiny window so the test stays fast. 20 ms is well above the 2 ms
+    // TinySleep used elsewhere and below the timeout budget for unit tests.
+    config.xpool_reverse_cooldown_s = 0.02;
+    BudgetAgent agent(config);
+
+    agent.OnFireCommitted("kv_to_mamba");
+
+    // Sleep past the cooldown window.
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    PoolSnapshot snap = MakeBaseSnapshot();
+    snap.kv_free_pages = 0;             // kv_util = 100%
+    snap.mamba_free_slots = 100;        // mamba_util = 0%
+    auto plan = agent.Tick(snap);
+    ASSERT_TRUE(plan.has_value());
+    EXPECT_EQ(plan->direction, "mamba_to_kv");
+}
+
+TEST(BudgeterTest, ReverseCooldownDisabledByZero) {
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.xpool_reverse_cooldown_s = 0.0;  // disabled
+    BudgetAgent agent(config);
+
+    // Same setup as ReverseCooldownSuppressesOppositeDirection but with
+    // the cooldown disabled. The opposite-direction plan must fire.
+    agent.OnFireCommitted("kv_to_mamba");
+
+    TinySleep();
+    PoolSnapshot snap = MakeBaseSnapshot();
+    snap.kv_free_pages = 0;
+    snap.mamba_free_slots = 100;
+    auto plan = agent.Tick(snap);
+    ASSERT_TRUE(plan.has_value());
+    EXPECT_EQ(plan->direction, "mamba_to_kv");
+}
+
+TEST(BudgeterTest, ReverseCooldownNotArmedByCancel) {
+    // OnFireCommitted is only called from Scheduler::ApplyXPoolFire (physical
+    // commit). The cancel path in Scheduler::CancelXPoolFire goes through
+    // ClearPendingFire only, which must NOT arm the cooldown — a cancelled
+    // fire is a no-op at the physical layer, so it should not block the
+    // budgeter from picking a different direction on the next tick.
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.xpool_reverse_cooldown_s = 1.0;
+    BudgetAgent agent(config);
+
+    // Simulate a kv_to_mamba plan that the actuator then cancels.
+    TinySleep();
+    PoolSnapshot pressure_snap = MakeBaseSnapshot();
+    pressure_snap.kv_free_pages = 100;     // kv_util = 0%
+    pressure_snap.mamba_free_slots = 0;    // mamba_util = 100%
+    auto fire_plan = agent.Tick(pressure_snap);
+    ASSERT_TRUE(fire_plan.has_value());
+    EXPECT_EQ(fire_plan->direction, "kv_to_mamba");
+    // Cancel path: only ClearPendingFire is called, NOT OnFireCommitted.
+    agent.ClearPendingFire();
+    EXPECT_EQ(agent.LastFireDirection(), "");  // cooldown not armed
+
+    // Now flip pressure to the opposite direction — must be allowed since
+    // the previous fire was cancelled, not committed.
+    TinySleep();
+    PoolSnapshot snap = MakeBaseSnapshot();
+    snap.kv_free_pages = 0;
+    snap.mamba_free_slots = 100;
+    auto plan = agent.Tick(snap);
+    ASSERT_TRUE(plan.has_value());
+    EXPECT_EQ(plan->direction, "mamba_to_kv");
+}
+
 TEST(BudgeterTest, PendingFireIsLatchedAndClearable) {
     BudgetAgent agent(MakeBudgeterConfig());
 
@@ -201,13 +381,137 @@ TEST(BudgeterTest, PendingFireIsLatchedAndClearable) {
     auto plan = agent.Tick(snap);
     ASSERT_TRUE(plan.has_value());
 
-    // The plan stays latched until explicitly cleared.
     auto pending = agent.PendingFire();
     ASSERT_TRUE(pending.has_value());
     EXPECT_EQ(pending->op_id, plan->op_id);
 
     agent.ClearPendingFire();
     EXPECT_FALSE(agent.PendingFire().has_value());
+}
+
+// =====================================================================
+// S2.3 PressureAdapter tests
+// =====================================================================
+//
+// Weighted queue / retract / paused signals augment the utilisation EWMA
+// before the fire-direction comparison and the S2.1 saturation gate.
+// Default weights are all 0 so the baseline behaviour is preserved
+// (verified implicitly by every test above this section).
+
+TEST(BudgeterTest, PressureAdapterDefaultWeightsAreNoOp) {
+    // With all weights at 0, even a large queue/retract burst must not
+    // change the fire decision.
+    BudgetAgent agent(MakeBudgeterConfig());
+
+    TinySleep();
+    PoolSnapshot snap = MakeBaseSnapshot();
+    snap.kv_free_pages = 50;        // kv_util = 50%
+    snap.mamba_free_slots = 50;     // mamba_util = 50%, delta = 0
+    snap.queue_len = 1000;
+    snap.retracted_count = 1000;
+    snap.paused_count = 1000;
+    EXPECT_FALSE(agent.Tick(snap).has_value());
+}
+
+TEST(BudgeterTest, PressureAdapterQueueLiftsKvPressure) {
+    // With xpool_w_queue > 0, a large queue must lift adjusted KV pressure
+    // above mamba so the budgeter fires mamba_to_kv even though raw
+    // utilisation is balanced.
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.xpool_w_queue = 0.5;     // queue full = +0.5 KV pressure
+    config.xpool_queue_ref = 10;    // queue saturates at 10 reqs
+    BudgetAgent agent(config);
+
+    TinySleep();
+    PoolSnapshot snap = MakeBaseSnapshot();
+    snap.kv_free_pages = 50;        // kv_util = 50%
+    snap.mamba_free_slots = 50;     // mamba_util = 50%
+    snap.queue_len = 20;            // > queue_ref => q_norm = 1
+    auto plan = agent.Tick(snap);
+    ASSERT_TRUE(plan.has_value());
+    EXPECT_EQ(plan->direction, "mamba_to_kv");
+
+    // The EWMA accessor reports the smoothed queue depth.
+    EXPECT_GT(agent.EwmaQueue(), 0.0);
+}
+
+TEST(BudgeterTest, PressureAdapterRetractLiftsKvPressure) {
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.xpool_w_retract = 0.4;
+    config.xpool_retract_ref = 4;
+    BudgetAgent agent(config);
+
+    TinySleep();
+    PoolSnapshot snap = MakeBaseSnapshot();
+    snap.kv_free_pages = 50;            // kv_util = 50%
+    snap.mamba_free_slots = 50;         // mamba_util = 50%
+    snap.retracted_count = 8;           // r_norm saturates at 1
+    auto plan = agent.Tick(snap);
+    ASSERT_TRUE(plan.has_value());
+    EXPECT_EQ(plan->direction, "mamba_to_kv");
+    EXPECT_GT(agent.EwmaRetract(), 0.0);
+}
+
+TEST(BudgeterTest, PressureAdapterPausedLiftsMambaPressure) {
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.xpool_w_paused = 0.5;
+    config.xpool_paused_ref = 4;
+    // The mamba-headroom guard fires only when n_mamba > headroom; we set
+    // bytes_per_page == bytes_per_slot so n_mamba == n_kv == 64 and the
+    // headroom default (1000) easily accomodates it.
+    config.kv_bytes_per_page = 1024;
+    config.mamba_bytes_per_slot = 1024;
+    BudgetAgent agent(config);
+
+    TinySleep();
+    PoolSnapshot snap = MakeBaseSnapshot();
+    snap.kv_free_pages = 50;            // kv_util = 50%
+    snap.mamba_free_slots = 50;         // mamba_util = 50%
+    snap.paused_count = 8;              // p_norm saturates at 1
+    auto plan = agent.Tick(snap);
+    ASSERT_TRUE(plan.has_value());
+    EXPECT_EQ(plan->direction, "kv_to_mamba");
+    EXPECT_GT(agent.EwmaPaused(), 0.0);
+}
+
+TEST(BudgeterTest, PressureAdapterCanLiftBelowSaturationGate) {
+    // A heavy queue burst must lift adjusted KV pressure across the S2.1
+    // saturation gate even when raw utilisation EWMA stays low.
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.xpool_saturation_low = 0.5;
+    config.xpool_w_queue = 0.6;
+    config.xpool_queue_ref = 10;
+    BudgetAgent agent(config);
+
+    TinySleep();
+    PoolSnapshot snap = MakeBaseSnapshot();
+    snap.kv_free_pages = 70;        // kv_util = 30% (below gate)
+    snap.mamba_free_slots = 100;    // mamba_util = 0% (below gate)
+    snap.queue_len = 20;            // adj_kv = 0.30 + 0.6*1.0 = 0.90 >> 0.5
+    auto plan = agent.Tick(snap);
+    ASSERT_TRUE(plan.has_value())
+        << "queue burst must lift adj_kv above xpool_saturation_low";
+    EXPECT_EQ(plan->direction, "mamba_to_kv");
+}
+
+TEST(BudgeterTest, PressureAdapterRespectsReverseCooldown) {
+    // Even with a strong queue signal, an opposite-direction fire must
+    // still be suppressed during the reverse cooldown window.  This
+    // catches accidental interactions between S2.2 and S2.3 — they are
+    // independent gates that compose conservatively.
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.xpool_reverse_cooldown_s = 1.0;
+    config.xpool_w_queue = 0.5;
+    config.xpool_queue_ref = 10;
+    BudgetAgent agent(config);
+
+    agent.OnFireCommitted("kv_to_mamba");
+    TinySleep();
+    PoolSnapshot snap = MakeBaseSnapshot();
+    snap.kv_free_pages = 50;
+    snap.mamba_free_slots = 50;
+    snap.queue_len = 20;
+    EXPECT_FALSE(agent.Tick(snap).has_value());
 }
 
 }  // namespace tokenspeed::test

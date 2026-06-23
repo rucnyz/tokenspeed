@@ -244,6 +244,49 @@ class ServerArgs:
     budgeter_pages_per_fire: int = 64
     xpool_nb_margin: float = 0.05
     xpool_ewma_tau_s: float = 1.0
+    # HiMA Phase 3 (S2.1): when both pools' EWMA pressure stay below this
+    # threshold, skip the XPool fire-decision branches and per-request
+    # admit gating. 0.0 disables the gate (always run the full path).
+    xpool_saturation_low: float = 0.5
+    # HiMA Phase 3 (S2.2): after a fire physically commits in direction D,
+    # suppress fires in the OPPOSITE direction for this many seconds.
+    # Same-direction fires are never gated. 0.0 disables the cooldown.
+    # See SchedulerConfig::xpool_reverse_cooldown_s for the design note.
+    xpool_reverse_cooldown_s: float = 2.0
+    # HiMA Phase 3 (S2.2-followup): Mamba pool headroom for the budgeter to
+    # logically transfer into. The Python SimpleMambaPool tensor is sized to
+    # (mamba_pool_total_chunks + this) slots at boot, and the mamba VMM
+    # arena is fully pre-mapped — so kv_to_mamba fires only update the C++
+    # allocator's slot bound (physical handle transfer to Mamba is unsafe
+    # under the current conv/ssm contiguous-slice layout).
+    # 0 (default) auto-derives a sensible value from budgeter_pages_per_fire.
+    xpool_mamba_headroom_slots: int = 0
+    # PressureAdapter weights (S2.3, HiMA Phase 3). The budgeter blends
+    # forward-looking system signals into the per-pool pressure used for
+    # the direction decision:
+    #   adj_kv_pressure    = ewma_pressure_kv
+    #                      + xpool_w_queue   * clamp01(queue_len   / queue_ref)
+    #                      + xpool_w_retract * clamp01(retracted   / retract_ref)
+    #   adj_mamba_pressure = ewma_pressure_mamba
+    #                      + xpool_w_paused  * clamp01(paused      / paused_ref)
+    # Each *_ref defaults to max_num_seqs/2 (queue) or max_num_seqs/4
+    # (retract/paused) when set to 0.  All weights default to 0 which
+    # preserves the pre-S2.3 behaviour; set > 0 to make the budgeter
+    # react to queue buildup and KV retractions before raw EWMA catches up.
+    xpool_w_queue: float = 0.0
+    xpool_w_retract: float = 0.0
+    xpool_w_paused: float = 0.0
+    xpool_queue_ref: int = 0
+    xpool_retract_ref: int = 0
+    xpool_paused_ref: int = 0
+    # HiMA Phase 3 (S2.7): per-tick sync max_batch_size with the current
+    # Mamba pool size.  When True, BudgetTick clamps max_batch_size to
+    # the current mamba_total_slots (clamped to [1, boot-time
+    # max_num_seqs]) so the scheduler stops admitting decoders that
+    # cannot fit in Mamba after a kv_to_mamba fire.  Auto-restores when
+    # mamba_to_kv fires return slots.  Defaults to False so unrelated
+    # workloads see no behavioural change.
+    enable_dynamic_admission_cap: bool = False
     disable_kvstore: bool = False
     enforce_eager: bool = False
     disable_cuda_graph_padding: bool = False

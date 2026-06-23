@@ -173,6 +173,16 @@ def main() -> None:
         # avoid thrashing; the test uses aggressive values for determinism.
         xpool_nb_margin=0.001,
         xpool_ewma_tau_s=0.001,
+        # Stress test intentionally drives fires at any imbalance so the
+        # Phase 2 actuator paths get exercised; Phase 3's saturation gate
+        # would suppress those fires at low pool util, so disable it here.
+        xpool_saturation_low=0.0,
+        # Phase A drives kv_to_mamba; Phase B drives mamba_to_kv shortly
+        # after. The S2.2 reverse-direction cooldown would suppress Phase
+        # B's first fires until the timer expires, making the verification
+        # grep flaky on tight CI. Disable it for this dedicated stress
+        # coverage; a separate test exercises the cooldown explicitly.
+        xpool_reverse_cooldown_s=0.0,
     )
     print("Engine ready.\n")
 

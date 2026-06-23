@@ -74,6 +74,15 @@ class GenerateReqInput:
     precomputed_multimodal_inputs: Any | None = None
     # The sampling_params. See descriptions below.
     sampling_params: list[dict] | dict | None = None
+    # Token-exact replay convenience: if provided, the engine will set
+    # sampling_params.max_new_tokens = len(forced_output_ids) and
+    # sampling_params.ignore_eos = True so each request decodes for an
+    # identical number of steps as the trace it was captured from. This
+    # gives byte-equal request length / memory pressure / arrival timing
+    # for A/B benchmarking against real agent traces, without touching
+    # the GPU sampler. (Bit-exact KV bytes — needed for *exact* prefix
+    # cache_hit reproduction — is a separate, deeper plumbing change.)
+    forced_output_ids: list[list[int]] | list[int] | None = None
     input_extra_infos: list[dict] | dict | None = None
     # Optional client label for logging; defaults to `rid`. Safe to reuse.
     user_rid: list[str] | str | None = None
@@ -319,6 +328,13 @@ class GenerateReqInput:
                 else None
             ),
             sampling_params=self.sampling_params[i],
+            forced_output_ids=(
+                self.forced_output_ids[i]
+                if isinstance(self.forced_output_ids, list)
+                and self.forced_output_ids
+                and isinstance(self.forced_output_ids[0], list)
+                else self.forced_output_ids
+            ),
             user_rid=self.user_rid[i],
             return_logprob=self.return_logprob[i],
             logprob_start_len=self.logprob_start_len[i],

@@ -110,8 +110,17 @@ def make_config(
     budgeter_pages_per_fire: int = 64,
     xpool_nb_margin: float = 0.05,
     xpool_ewma_tau_s: float = 1.0,
+    xpool_saturation_low: float = 0.5,
+    xpool_reverse_cooldown_s: float = 2.0,
+    xpool_w_queue: float = 0.0,
+    xpool_w_retract: float = 0.0,
+    xpool_w_paused: float = 0.0,
+    xpool_queue_ref: int = 0,
+    xpool_retract_ref: int = 0,
+    xpool_paused_ref: int = 0,
     xpool_initial_kv_pages: int = 0,
     xpool_initial_mamba_slots: int = 0,
+    enable_dynamic_admission_cap: bool = False,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
@@ -162,8 +171,17 @@ def make_config(
     cfg.budgeter_pages_per_fire = budgeter_pages_per_fire
     cfg.xpool_nb_margin = xpool_nb_margin
     cfg.xpool_ewma_tau_s = xpool_ewma_tau_s
+    cfg.xpool_saturation_low = xpool_saturation_low
+    cfg.xpool_reverse_cooldown_s = xpool_reverse_cooldown_s
+    cfg.xpool_w_queue = xpool_w_queue
+    cfg.xpool_w_retract = xpool_w_retract
+    cfg.xpool_w_paused = xpool_w_paused
+    cfg.xpool_queue_ref = xpool_queue_ref
+    cfg.xpool_retract_ref = xpool_retract_ref
+    cfg.xpool_paused_ref = xpool_paused_ref
     cfg.xpool_initial_kv_pages = xpool_initial_kv_pages
     cfg.xpool_initial_mamba_slots = xpool_initial_mamba_slots
+    cfg.enable_dynamic_admission_cap = enable_dynamic_admission_cap
     return cfg
 
 

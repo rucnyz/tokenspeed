@@ -117,6 +117,16 @@ public:
     std::int32_t AvailableMambaSlots() const;
     std::int32_t MappedMambaSlots() const;
 
+    // Dynamic admission cap (S2.7).  Returns the current effective
+    // max_batch_size (== config_.max_batch_size), and lets callers
+    // shrink it.  The setter clamps to [1, original_max_batch_size_]
+    // because the ReqPoolAllocator is sized for the boot-time value
+    // and cannot grow beyond it.  Used by BudgetTick when
+    // enable_dynamic_admission_cap is on, and exposed via pybind so
+    // operators can drive the cap directly during ablation studies.
+    std::int32_t MaxBatchSize() const { return config_.max_batch_size; }
+    void SetMaxBatchSize(std::int32_t new_cap);
+
 private:
     // Second element is LoadBackOperation list (normal path) or WriteBackOperation list (retract triggered).
     std::tuple<std::vector<ForwardOperation>,
@@ -170,6 +180,10 @@ private:
     }
 
 private:
+    // S2.7: remember the boot-time max_batch_size so SetMaxBatchSize()
+    // can clamp dynamic-cap reductions back up safely.  Initialised from
+    // config_.max_batch_size in the Scheduler constructor.
+    std::int32_t original_max_batch_size_{};
     SchedulerConfig config_;
     // Tracks how many KV/mamba pages have been pre-shrunk via the Prepare*
     // helpers so that ApplyXPoolFire does not double-shrink.

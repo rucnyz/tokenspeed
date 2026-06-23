@@ -58,6 +58,11 @@ def _make_engine(
         budgeter_tick_s=1.0,
         enable_xpool_dynamic_capacity=enable_xpool,
         budgeter_pages_per_fire=budgeter_pages_per_fire,
+        # Phase 2 path-coverage test: keep saturation gate off so we still
+        # exercise the fire path with the small synthetic workload below.
+        # Same rationale applies to the S2.2 reverse cooldown.
+        xpool_saturation_low=0.0,
+        xpool_reverse_cooldown_s=0.0,
     )
 
 

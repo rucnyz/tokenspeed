@@ -259,10 +259,19 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("xpool_ewma_tau_s", &tokenspeed::SchedulerConfig::xpool_ewma_tau_s)
         .def_rw("xpool_nb_margin", &tokenspeed::SchedulerConfig::xpool_nb_margin)
         .def_rw("xpool_mamba_floor_slots", &tokenspeed::SchedulerConfig::xpool_mamba_floor_slots)
+        .def_rw("xpool_saturation_low", &tokenspeed::SchedulerConfig::xpool_saturation_low)
+        .def_rw("xpool_reverse_cooldown_s", &tokenspeed::SchedulerConfig::xpool_reverse_cooldown_s)
         .def_rw("xpool_xfer_us_per_page", &tokenspeed::SchedulerConfig::xpool_xfer_us_per_page)
         .def_rw("xpool_queue_wait_us", &tokenspeed::SchedulerConfig::xpool_queue_wait_us)
+        .def_rw("xpool_w_queue", &tokenspeed::SchedulerConfig::xpool_w_queue)
+        .def_rw("xpool_w_retract", &tokenspeed::SchedulerConfig::xpool_w_retract)
+        .def_rw("xpool_w_paused", &tokenspeed::SchedulerConfig::xpool_w_paused)
+        .def_rw("xpool_queue_ref", &tokenspeed::SchedulerConfig::xpool_queue_ref)
+        .def_rw("xpool_retract_ref", &tokenspeed::SchedulerConfig::xpool_retract_ref)
+        .def_rw("xpool_paused_ref", &tokenspeed::SchedulerConfig::xpool_paused_ref)
         .def_rw("xpool_initial_kv_pages", &tokenspeed::SchedulerConfig::xpool_initial_kv_pages)
-        .def_rw("xpool_initial_mamba_slots", &tokenspeed::SchedulerConfig::xpool_initial_mamba_slots);
+        .def_rw("xpool_initial_mamba_slots", &tokenspeed::SchedulerConfig::xpool_initial_mamba_slots)
+        .def_rw("enable_dynamic_admission_cap", &tokenspeed::SchedulerConfig::enable_dynamic_admission_cap);
 
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
@@ -512,5 +521,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("available_mamba_slots", &tokenspeed::Scheduler::AvailableMambaSlots,
              "Number of free mamba slots available for new allocations.")
         .def("mapped_mamba_slots", &tokenspeed::Scheduler::MappedMambaSlots,
-             "Number of mamba slots currently backed by physical memory.");
+             "Number of mamba slots currently backed by physical memory.")
+        .def("max_batch_size", &tokenspeed::Scheduler::MaxBatchSize,
+             "Current effective max_batch_size (may be dynamically capped).")
+        .def("set_max_batch_size", &tokenspeed::Scheduler::SetMaxBatchSize,
+             nb::arg("new_cap"),
+             "Set the dynamic admission cap; clamped to [1, boot-time max_batch_size].");
 }

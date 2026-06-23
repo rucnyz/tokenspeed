@@ -203,6 +203,7 @@ def _create_hybrid_linear_attn(
     full_attn_backend_name: str = None,
     mamba_pool_total_chunks: int = 0,
     pre_arenas_factory: "callable | None" = None,
+    xpool_mamba_headroom_slots: int = 0,
 ) -> tuple[AttentionBackend, BaseTokenToKVPool, object]:
     """Create a hybrid backend + pool for GDN hybrid models (Qwen3.5, Qwen3Next)."""
     from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
@@ -262,8 +263,13 @@ def _create_hybrid_linear_attn(
     _max_req_pool_size = server_args.max_num_seqs // dp_size
     # Mamba radix cache uses C++ chunk indices. Without radix cache, the
     # backend uses 1-based req_pool_indices directly, so keep slot 0 as padding.
+    # HiMA Phase 3 (S2.2-followup): when XPool dynamic capacity is enabled
+    # we pre-size the Python pool to (base + headroom + 1) slots so the C++
+    # allocator's logical Grow up to base + headroom never overflows the
+    # tensor's slot dimension. The pre-arenas factory then maps physical
+    # chunks for the full extent at boot; no post-graph-capture resize.
     mamba_pool_size = (
-        mamba_pool_total_chunks + 1
+        mamba_pool_total_chunks + max(0, int(xpool_mamba_headroom_slots)) + 1
         if mamba_pool_total_chunks > 0
         else (_max_req_pool_size + 1)
     )
@@ -364,6 +370,7 @@ def create_attn_components(
     enable_memory_saver: bool = False,
     draft_model_config: ModelConfig | None = None,
     _xpool_arena_factory: "callable | None" = None,
+    xpool_mamba_headroom_slots: int = 0,
 ) -> tuple[
     AttentionBackend,
     BaseTokenToKVPool,
@@ -631,6 +638,7 @@ def create_attn_components(
             ),
             mamba_pool_total_chunks=mamba_pool_total_chunks,
             pre_arenas_factory=_xpool_arena_factory,
+            xpool_mamba_headroom_slots=xpool_mamba_headroom_slots,
         )
     else:
         backend = _create_attn_backend(arch, config)

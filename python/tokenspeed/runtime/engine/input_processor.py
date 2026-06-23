@@ -188,6 +188,11 @@ class InputProcessor:
                 f"model's context length ({self.engine.context_len} tokens)."
             )
 
+        forced_output_ids = getattr(obj, "forced_output_ids", None)
+        if forced_output_ids is not None and len(forced_output_ids) > 0:
+            obj.sampling_params["max_new_tokens"] = len(forced_output_ids)
+            obj.sampling_params["ignore_eos"] = True
+
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
             max_new_tokens is not None

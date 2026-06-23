@@ -166,6 +166,7 @@ class Engine(EngineBase):
         bootstrap_port: list[int] | int | None = None,
         bootstrap_room: list[int] | int | None = None,
         data_parallel_rank: int | None = None,
+        forced_output_ids: list[list[int]] | list[int] | None = None,
     ) -> dict | Iterator[dict]:
         """
         The arguments of this function match
@@ -192,6 +193,7 @@ class Engine(EngineBase):
             text=prompt,
             input_ids=input_ids,
             sampling_params=sampling_params,
+            forced_output_ids=forced_output_ids,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -235,6 +237,7 @@ class Engine(EngineBase):
         bootstrap_port: list[int] | int | None = None,
         bootstrap_room: list[int] | int | None = None,
         user_rid: list[str] | str | None = None,
+        forced_output_ids: list[list[int]] | list[int] | None = None,
     ) -> dict | AsyncIterator[dict]:
         """
         The arguments of this function match
@@ -255,6 +258,7 @@ class Engine(EngineBase):
             input_multi_ids=input_multi_ids,
             input_extra_infos=input_extra_infos,
             sampling_params=sampling_params,
+            forced_output_ids=forced_output_ids,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
