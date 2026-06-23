@@ -97,6 +97,22 @@ AdmitDecision Admitter::DecideForRequest(std::int32_t prompt_tokens, const PoolS
     if (kv_enough && !mamba_enough) {
         return decide(mamba_need_slots, mamba_need_slots, snapshot, true, "kv_to_mamba");
     }
+    // S2.6: both pools starved → check if proactive KV retraction can open
+    // space for the new request.  kCrossMigrate signals the Python actuator
+    // to find and retract the best victim (Stage-0: directed retraction;
+    // Stage-1 will byte-copy the victim's KV state to host before freeing).
+    if (snapshot.kv_active_pages >= prompt_tokens) {
+        AdmitDecision migrate;
+        migrate.action = AdmitAction::kCrossMigrate;
+        // Cost = retract/writeback latency of victim pages + re-prefill cost
+        // for the freed space.  CMigrateUs() models the write-back; we add
+        // a cheap CEvictUs estimate for the prefix-cache writeback overhead.
+        migrate.cost_us = cost_model_.CMigrateUs()
+                        + cost_model_.CEvictUs(prompt_tokens, 1);
+        migrate.direction = "kv_active_to_pool";
+        migrate.pages_needed = prompt_tokens;
+        return migrate;
+    }
     AdmitDecision defer;
     defer.action = AdmitAction::kDefer;
     defer.cost_us = cost_model_.WQueueUs() * snapshot.queue_len;

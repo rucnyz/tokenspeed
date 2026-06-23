@@ -22,8 +22,8 @@
 
 from __future__ import annotations
 
-import math
 import logging
+import math
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -75,7 +75,9 @@ class KvLayerArenaGroup:
         self._layer_num = len(k_arenas)
         self._page_size = page_size
         # Per-layer bytes added/removed for one KV page (= page_size rows).
-        self._bytes_per_page_per_layer = page_size * head_num * head_dim * dtype_itemsize
+        self._bytes_per_page_per_layer = (
+            page_size * head_num * head_dim * dtype_itemsize
+        )
         self.initial_live_rows = initial_live_rows
 
     # ------------------------------------------------------------------
@@ -100,7 +102,9 @@ class KvLayerArenaGroup:
 
     def _pages_to_chunks(self, n_pages: int) -> int:
         """Convert a KV page count to a per-layer chunk count (rounds up)."""
-        return max(1, math.ceil(n_pages * self._bytes_per_page_per_layer / CHUNK_SIZE_BYTES))
+        return max(
+            1, math.ceil(n_pages * self._bytes_per_page_per_layer / CHUNK_SIZE_BYTES)
+        )
 
     def grow(self, n_kv_pages: int) -> None:
         """Map ``n_kv_pages`` worth of additional per-layer physical chunks.
@@ -125,7 +129,9 @@ class KvLayerArenaGroup:
             )
         logger.debug(
             "KvLayerArenaGroup grew %d pages (%d chunks/layer × %d arenas)",
-            n_kv_pages, n_chunks, 2 * self._layer_num,
+            n_kv_pages,
+            n_chunks,
+            2 * self._layer_num,
         )
 
     def shrink(self, n_kv_pages: int) -> None:
@@ -153,7 +159,9 @@ class KvLayerArenaGroup:
             )
         logger.debug(
             "KvLayerArenaGroup shrank %d pages (%d chunks/layer × %d arenas)",
-            n_kv_pages, n_chunks, 2 * self._layer_num,
+            n_kv_pages,
+            n_chunks,
+            2 * self._layer_num,
         )
 
     def shrink_with_handles(self, n_kv_pages: int) -> list[int]:
@@ -183,13 +191,15 @@ class KvLayerArenaGroup:
                 errors.append(f"{arena.name}: {exc}")
         if errors:
             raise RuntimeError(
-                f"KvLayerArenaGroup.shrink_with_handles failed: "
-                + "; ".join(errors)
+                f"KvLayerArenaGroup.shrink_with_handles failed: " + "; ".join(errors)
             )
         logger.debug(
             "KvLayerArenaGroup shrink_with_handles: %d pages → "
             "%d chunks/layer × %d arenas = %d handles extracted",
-            n_kv_pages, n_chunks, 2 * self._layer_num, len(all_handles),
+            n_kv_pages,
+            n_chunks,
+            2 * self._layer_num,
+            len(all_handles),
         )
         return all_handles
 
@@ -228,13 +238,14 @@ class KvLayerArenaGroup:
             offset += count
         if errors:
             raise RuntimeError(
-                f"KvLayerArenaGroup.grow_with_handles failed: "
-                + "; ".join(errors)
+                f"KvLayerArenaGroup.grow_with_handles failed: " + "; ".join(errors)
             )
         logger.debug(
             "KvLayerArenaGroup grow_with_handles: %d handles → "
             "%d pages across %d arenas",
-            len(raw_handles), n_kv_pages, n_arenas,
+            len(raw_handles),
+            n_kv_pages,
+            n_arenas,
         )
 
     # ------------------------------------------------------------------
@@ -287,4 +298,6 @@ class KvLayerArenaGroup:
             try:
                 arena.close()
             except Exception as exc:  # noqa: BLE001
-                logger.warning("KvLayerArenaGroup.close error on %s: %s", arena.name, exc)
+                logger.warning(
+                    "KvLayerArenaGroup.close error on %s: %s", arena.name, exc
+                )

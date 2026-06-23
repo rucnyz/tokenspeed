@@ -81,6 +81,18 @@ public:
     void BudgetTick();
     std::optional<XPoolFirePlan> PendingXPoolFire() const;
 
+    // S2.6 migration plan: latched when the admitter selects kCrossMigrate.
+    // The Python actuator reads this, calls BestMigrateCandidate() to find a
+    // victim, retracts it, and then calls ApplyXPoolMigrate() to commit.
+    std::optional<XPoolMigratePlan> PendingXPoolMigrate() const;
+    void ApplyXPoolMigrate(const XPoolMigratePlan& plan);
+    void CancelXPoolMigrate();
+
+    // Returns the request ID of the best migration candidate (the Decoding or
+    // PrefillDone request with the most active KV pages).  Empty string when
+    // no suitable candidate exists.
+    std::string BestMigrateCandidate() const;
+
     // Apply the capacity changes described by a fire plan after the Python
     // actuator has completed the corresponding cuMemMap / cuMemUnmap ops.
     // Calls Grow/Shrink on both KV and mamba allocators and clears the

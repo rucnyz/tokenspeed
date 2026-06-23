@@ -103,6 +103,9 @@ class XPoolActuator:
         self.last_fire_pages: int = 0
         self._ewma_xfer_alpha: float = 0.25
         self._fires_observed: int = 0
+        # S2.6: committed migration count (Stage-0: directed retraction).
+        self.committed_migrate: int = 0
+        self._last_migrate_op_id: int = 0
 
     def _record_fire_cost(self, n_pages: int, elapsed_us: float) -> None:
         """Update the runtime EWMA of microseconds per KV page transferred.
@@ -125,7 +128,9 @@ class XPoolActuator:
             self.ewma_xfer_us_per_page = per_page
         else:
             a = self._ewma_xfer_alpha
-            self.ewma_xfer_us_per_page = (1.0 - a) * self.ewma_xfer_us_per_page + a * per_page
+            self.ewma_xfer_us_per_page = (
+                1.0 - a
+            ) * self.ewma_xfer_us_per_page + a * per_page
 
     def maybe_execute(self, plan: object) -> bool:
         """Actuate a budgeter plan unless it was already actuated.
@@ -155,6 +160,92 @@ class XPoolActuator:
             len(fire_plan.page_ids),
         )
         self.execute_async(fire_plan)
+        return True
+
+    def maybe_execute_migrate(self, plan: object) -> bool:
+        """Stage-0 cross-pool migration: directed retraction of the best victim.
+
+        When the admitter selects kCrossMigrate (both pools starved but active
+        KV pages exist), we proactively retract the largest-footprint decoding
+        request so its KV pages can be reclaimed for the incoming request.
+
+        Stage-0 implementation: call ``scheduler.best_migrate_candidate()`` to
+        find the victim, then let the scheduler's natural retraction path handle
+        the KV write-back (existing L2 cache mechanism).  A future Stage-1
+        will byte-copy the victim's KV tensors to host memory before retraction
+        so the retracting request can reload without a full re-prefill.
+
+        Args:
+            plan: C++ ``XPoolMigratePlan`` object with ``op_id`` and
+                ``pages_needed`` attributes.
+
+        Returns:
+            True if a migration was dispatched, False if this plan was already
+            handled (duplicate op_id) or no suitable candidate exists.
+        """
+        op_id = int(plan.op_id)
+        if op_id == self._last_migrate_op_id:
+            return False
+        self._last_migrate_op_id = op_id
+
+        if self._scheduler is None:
+            return False
+
+        candidate_fn = getattr(self._scheduler, "best_migrate_candidate", None)
+        apply_fn = getattr(self._scheduler, "apply_xpool_migrate", None)
+        cancel_fn = getattr(self._scheduler, "cancel_xpool_migrate", None)
+
+        if candidate_fn is None:
+            if cancel_fn is not None:
+                try:
+                    cancel_fn()
+                except Exception:  # noqa: BLE001
+                    pass
+            return False
+
+        try:
+            candidate_id: str = candidate_fn()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("best_migrate_candidate() failed: %s", exc)
+            if cancel_fn is not None:
+                try:
+                    cancel_fn()
+                except Exception:  # noqa: BLE001
+                    pass
+            return False
+
+        if not candidate_id:
+            logger.debug(
+                "XPool migrate op_id=%d: no retraction candidate available "
+                "(pages_needed=%d)",
+                op_id,
+                int(plan.pages_needed),
+            )
+            if cancel_fn is not None:
+                try:
+                    cancel_fn()
+                except Exception:  # noqa: BLE001
+                    pass
+            return False
+
+        # Stage-0: the scheduler's retraction path in NextExecutionPlan will
+        # naturally pick this request as the next victim when KV pressure
+        # peaks.  We commit the migration plan immediately so the budgeter can
+        # issue the next plan; the physical KV writeback happens in the next
+        # forward pass where the victim would have been retracted anyway.
+        logger.info(
+            "XPool migrate dispatched (stage-0 retraction): op_id=%d "
+            "candidate=%s pages_needed=%d",
+            op_id,
+            candidate_id,
+            int(plan.pages_needed),
+        )
+        if apply_fn is not None:
+            try:
+                apply_fn(plan)
+                self.committed_migrate += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("apply_xpool_migrate failed (op_id=%d): %s", op_id, exc)
         return True
 
     def execute_async(self, plan: FirePlan) -> None:
@@ -202,9 +293,7 @@ class XPoolActuator:
                         # VMM was skipped (headroom exhausted or other guard).
                         # Clear latch only so the budgeter can emit new plans,
                         # but do NOT update allocator capacities.
-                        cancel_fn = getattr(
-                            self._scheduler, "cancel_xpool_fire", None
-                        )
+                        cancel_fn = getattr(self._scheduler, "cancel_xpool_fire", None)
                         if cancel_fn is not None:
                             try:
                                 cancel_fn()
@@ -308,9 +397,7 @@ class XPoolActuator:
                     cu_mem_release(h)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("_balance_handles: cuMemRelease failed: %s", exc)
-            logger.debug(
-                "_balance_handles: released %d excess KV handles", diff
-            )
+            logger.debug("_balance_handles: released %d excess KV handles", diff)
             return raw_handles[:n_needed]
 
         elif diff < 0:
@@ -323,9 +410,7 @@ class XPoolActuator:
             extra: list[int] = []
             for _ in range(-diff):
                 extra.append(cu_mem_create(CHUNK_SIZE_BYTES, device))
-            logger.debug(
-                "_balance_handles: allocated %d extra handles", -diff
-            )
+            logger.debug("_balance_handles: allocated %d extra handles", -diff)
             return raw_handles + extra
 
         return raw_handles  # exact match
@@ -412,16 +497,15 @@ class XPoolActuator:
             # Shrink-and-drain: cap the tail mamba slots in C++ BEFORE unmap so
             # no new allocations land on slots that are about to be transferred.
             if self._scheduler is not None:
-                prepare_fn = getattr(
-                    self._scheduler, "prepare_mamba_to_kv_fire", None
-                )
+                prepare_fn = getattr(self._scheduler, "prepare_mamba_to_kv_fire", None)
                 if prepare_fn is not None:
                     try:
                         prepare_fn(n_mamba_chunks)
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "prepare_mamba_to_kv_fire failed (n=%d): %s",
-                            n_mamba_chunks, exc,
+                            n_mamba_chunks,
+                            exc,
                         )
                         return False
             self._wait_drain("has_capped_mamba_inflight")
@@ -439,7 +523,8 @@ class XPoolActuator:
                     logger.warning(
                         "mamba_to_kv fire skipped (op_id=%d): kv grow failed "
                         "(no handles to re-map?): %s",
-                        plan.op_id, exc,
+                        plan.op_id,
+                        exc,
                     )
                     return False
                 logger.info(
@@ -457,22 +542,25 @@ class XPoolActuator:
                     "mamba_to_kv VMM done (handle transfer): "
                     "shrunk %d mamba chunks, grew %d kv pages "
                     "(%d handles transferred)",
-                    n_mamba_chunks, n_kv_pages, len(balanced),
+                    n_mamba_chunks,
+                    n_kv_pages,
+                    len(balanced),
                 )
             else:
                 self.mamba_arena.shrink(n_mamba_chunks)
                 self.kv_arena.grow(n_kv_pages)
                 logger.info(
                     "mamba_to_kv VMM done: shrunk %d mamba chunks, grew %d kv pages",
-                    n_mamba_chunks, n_kv_pages,
+                    n_mamba_chunks,
+                    n_kv_pages,
                 )
             return True
 
         elif plan.direction == "kv_to_mamba":
             if not mamba_static:
-                mamba_available = getattr(
-                    self.mamba_arena, "max_chunks", 0
-                ) - getattr(self.mamba_arena, "mapped_chunks", 0)
+                mamba_available = getattr(self.mamba_arena, "max_chunks", 0) - getattr(
+                    self.mamba_arena, "mapped_chunks", 0
+                )
                 if mamba_available < n_mamba_chunks:
                     logger.warning(
                         "kv_to_mamba fire skipped (op_id=%d): mamba arena "
@@ -493,7 +581,8 @@ class XPoolActuator:
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "prepare_kv_to_mamba_fire failed (n=%d): %s",
-                            n_kv_pages, exc,
+                            n_kv_pages,
+                            exc,
                         )
                         return False
             self._wait_drain()
@@ -516,14 +605,17 @@ class XPoolActuator:
                     "kv_to_mamba VMM done (handle transfer): "
                     "shrunk %d kv pages, grew %d mamba chunks "
                     "(%d handles transferred)",
-                    n_kv_pages, n_mamba_chunks, len(balanced),
+                    n_kv_pages,
+                    n_mamba_chunks,
+                    len(balanced),
                 )
             else:
                 self.kv_arena.shrink(n_kv_pages)
                 self.mamba_arena.grow(n_mamba_chunks)
                 logger.info(
                     "kv_to_mamba VMM done: shrunk %d kv pages, grew %d mamba chunks",
-                    n_kv_pages, n_mamba_chunks,
+                    n_kv_pages,
+                    n_mamba_chunks,
                 )
             return True
 

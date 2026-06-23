@@ -1,12 +1,11 @@
 from tokenspeed_scheduler import Scheduler, SchedulerConfig, XPoolFirePlan
 
-
 cfg = SchedulerConfig()
 cfg.max_batch_size = 4
 cfg.page_size = 16
-cfg.num_device_pages = 49        # 32 profiled + 16 headroom + 1 reserved
+cfg.num_device_pages = 49  # 32 profiled + 16 headroom + 1 reserved
 cfg.enable_mamba = True
-cfg.mamba_pool_total_chunks = 68 # 64 profiled + 4 headroom
+cfg.mamba_pool_total_chunks = 68  # 64 profiled + 4 headroom
 cfg.mamba_cache_chunk_size = 16
 cfg.kv_bytes_per_page = 4096
 cfg.mamba_bytes_per_slot = 16384

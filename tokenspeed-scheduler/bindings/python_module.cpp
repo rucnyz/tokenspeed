@@ -444,6 +444,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("page_ids", &tokenspeed::XPoolFirePlan::page_ids)
         .def_rw("op_id", &tokenspeed::XPoolFirePlan::op_id);
 
+    // S2.6: migration plan latched when the admitter selects kCrossMigrate.
+    nb::class_<tokenspeed::XPoolMigratePlan>(m, "XPoolMigratePlan")
+        .def(nb::init<>())
+        .def_rw("pages_needed", &tokenspeed::XPoolMigratePlan::pages_needed)
+        .def_rw("op_id", &tokenspeed::XPoolMigratePlan::op_id);
+
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")
         .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config") = tokenspeed::SchedulerConfig{})
         .def("submit_requests",
@@ -526,5 +532,24 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "Current effective max_batch_size (may be dynamically capped).")
         .def("set_max_batch_size", &tokenspeed::Scheduler::SetMaxBatchSize,
              nb::arg("new_cap"),
-             "Set the dynamic admission cap; clamped to [1, boot-time max_batch_size].");
+             "Set the dynamic admission cap; clamped to [1, boot-time max_batch_size].")
+        // S2.6 migration methods.
+        .def(
+            "pending_xpool_migrate",
+            [](tokenspeed::Scheduler& s) -> nb::object {
+                auto plan = s.PendingXPoolMigrate();
+                if (!plan.has_value()) {
+                    return nb::none();
+                }
+                return nb::cast(*plan);
+            },
+            "Return the latched migration plan, or None if none is pending.")
+        .def("apply_xpool_migrate", &tokenspeed::Scheduler::ApplyXPoolMigrate,
+             nb::arg("plan"),
+             "Commit a completed migration: increment counter and clear latch.")
+        .def("cancel_xpool_migrate", &tokenspeed::Scheduler::CancelXPoolMigrate,
+             "Clear the migration plan latch without incrementing the counter.")
+        .def("best_migrate_candidate", &tokenspeed::Scheduler::BestMigrateCandidate,
+             "Return the request_id of the best KV retraction candidate, "
+             "or empty string if none is available.");
 }

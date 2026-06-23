@@ -522,6 +522,15 @@ PoolSnapshot Scheduler::MakePoolSnapshot() const {
     // recently exceeded supply.  BudgetAgent blends this into KV pressure
     // when config_.xpool_w_retract > 0 (default 0 = no behavioural change).
     snapshot.retracted_count = static_cast<std::int32_t>(RetractedSize());
+    // S2.3 w_paused: read the admitter's kDefer count accumulated since the
+    // last Tick() so the PressureAdapter EWMA can weight Mamba pressure by
+    // how many new arrivals the system had to defer.
+    if (budget_agent_) {
+        snapshot.paused_count = budget_agent_->DeferredCount();
+    }
+    // S2.6: active KV pages from Prefilling/Decoding requests; used by the
+    // admitter to evaluate kCrossMigrate feasibility.
+    snapshot.kv_active_pages = static_cast<std::int32_t>(ActiveKvPages());
     return snapshot;
 }
 
@@ -550,6 +559,45 @@ std::optional<XPoolFirePlan> Scheduler::PendingXPoolFire() const {
         return std::nullopt;
     }
     return budget_agent_->PendingFire();
+}
+
+// S2.6 migration methods.
+
+std::optional<XPoolMigratePlan> Scheduler::PendingXPoolMigrate() const {
+    if (!budget_agent_) {
+        return std::nullopt;
+    }
+    return budget_agent_->PendingMigrate();
+}
+
+void Scheduler::ApplyXPoolMigrate(const XPoolMigratePlan& /*plan*/) {
+    if (budget_agent_) {
+        budget_agent_->ClearPendingMigrate();
+        budget_agent_->IncrCommittedMigrate();
+    }
+}
+
+void Scheduler::CancelXPoolMigrate() {
+    if (budget_agent_) {
+        budget_agent_->ClearPendingMigrate();
+    }
+}
+
+std::string Scheduler::BestMigrateCandidate() const {
+    // Select the Decoding (or PrefillDone) request with the most active KV
+    // pages — retracting it frees the most space per migration event.  We
+    // intentionally mirror the retraction victim-selection in forward.cpp.
+    Request* best = nullptr;
+    for (const auto& [id, req] : requests_) {
+        if (!req->Is<fsm::Decoding>() &&
+            !(req->Is<fsm::PrefillDone>() && config_.role != Role::kD)) {
+            continue;
+        }
+        if (best == nullptr || req->TokenSize() > best->TokenSize()) {
+            best = req.get();
+        }
+    }
+    return best ? best->Id() : std::string{};
 }
 
 void Scheduler::PrepareKvToMambaFire(std::int32_t n_kv_pages) {

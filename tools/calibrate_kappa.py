@@ -76,7 +76,9 @@ def _iter_budget_records(path: pathlib.Path) -> Iterator[dict]:
                 continue
 
 
-def _extract_fires(records: Iterable[dict]) -> tuple[list[FireSample], float, list[dict]]:
+def _extract_fires(
+    records: Iterable[dict],
+) -> tuple[list[FireSample], float, list[dict]]:
     """Return all committed-fire samples and the final EWMA seen in the trace.
 
     Snapshots include the cumulative committed-fire counter and the latest
@@ -221,9 +223,7 @@ def calibrate(paths: list[pathlib.Path]) -> dict:
     return {
         "files": per_file_reports,
         "samples": per_page_stats,
-        "final_ewma_us_per_page_mean": (
-            statistics.fmean(ewmas) if ewmas else None
-        ),
+        "final_ewma_us_per_page_mean": (statistics.fmean(ewmas) if ewmas else None),
         "queue_wait_lower_bound_us": queue_us_total,
         "recommended_xpool_xfer_us_per_page": recommended,
         "recommended_rationale": rationale,

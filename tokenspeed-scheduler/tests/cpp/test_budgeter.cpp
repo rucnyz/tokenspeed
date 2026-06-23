@@ -514,4 +514,111 @@ TEST(BudgeterTest, PressureAdapterRespectsReverseCooldown) {
     EXPECT_FALSE(agent.Tick(snap).has_value());
 }
 
+// S2.3 w_paused / S2.6 migration -----------------------------------------------
+
+// DeferredCount() must increment for each kDefer decision and reset after Tick.
+TEST(BudgeterTest, DeferredCountAccumulatesAndResetsOnTick) {
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.enable_admitter = true;
+    config.xpool_saturation_low = 0.0;  // no gate
+    BudgetAgent agent(config);
+
+    // Starved snapshot: both pools empty, no active KV → admitter defers.
+    PoolSnapshot starved;
+    starved.kv_free_pages = 0;
+    starved.mamba_free_slots = 0;
+    starved.kv_total_pages = 100;
+    starved.mamba_total_slots = 100;
+    starved.kv_active_pages = 0;
+
+    EXPECT_EQ(agent.DeferredCount(), 0);
+    agent.OnRequestArrival(128, starved);
+    EXPECT_EQ(agent.DeferredCount(), 1);
+    agent.OnRequestArrival(64, starved);
+    EXPECT_EQ(agent.DeferredCount(), 2);
+
+    // After Tick() the counter resets.
+    TinySleep();
+    agent.Tick(starved);
+    EXPECT_EQ(agent.DeferredCount(), 0);
+}
+
+// When the admitter decides kCrossMigrate, a migration plan is latched and
+// DeferredCount stays 0 (migrate != defer).
+TEST(BudgeterTest, MigratePlanLatchedOnCrossMigrate) {
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.enable_admitter = true;
+    config.xpool_saturation_low = 0.0;
+    BudgetAgent agent(config);
+
+    PoolSnapshot snap;
+    snap.kv_free_pages = 0;
+    snap.mamba_free_slots = 0;
+    snap.kv_total_pages = 100;
+    snap.mamba_total_slots = 100;
+    snap.kv_active_pages = 512;  // victim available
+
+    EXPECT_FALSE(agent.PendingMigrate().has_value());
+    agent.OnRequestArrival(64, snap);
+
+    ASSERT_TRUE(agent.PendingMigrate().has_value());
+    EXPECT_EQ(agent.PendingMigrate()->pages_needed, 64);
+    // kCrossMigrate must NOT increment the defer counter.
+    EXPECT_EQ(agent.DeferredCount(), 0);
+}
+
+// CommittedMigrateCount increments via IncrCommittedMigrate and ClearPendingMigrate
+// clears the latch.
+TEST(BudgeterTest, CommitAndClearMigratePlan) {
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.enable_admitter = true;
+    config.xpool_saturation_low = 0.0;
+    BudgetAgent agent(config);
+
+    PoolSnapshot snap;
+    snap.kv_free_pages = 0;
+    snap.mamba_free_slots = 0;
+    snap.kv_total_pages = 100;
+    snap.mamba_total_slots = 100;
+    snap.kv_active_pages = 256;
+
+    agent.OnRequestArrival(128, snap);
+    ASSERT_TRUE(agent.PendingMigrate().has_value());
+    EXPECT_EQ(agent.CommittedMigrateCount(), 0);
+
+    agent.IncrCommittedMigrate();
+    EXPECT_EQ(agent.CommittedMigrateCount(), 1);
+
+    agent.ClearPendingMigrate();
+    EXPECT_FALSE(agent.PendingMigrate().has_value());
+}
+
+// paused_count fed into PoolSnapshot should be reflected in EwmaPaused after Tick.
+TEST(BudgeterTest, PausedCountFlowsThroughEwmaViaDeferredCounter) {
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.enable_admitter = true;
+    config.xpool_saturation_low = 0.0;
+    BudgetAgent agent(config);
+
+    // Accumulate two defer decisions so DeferredCount() == 2.
+    PoolSnapshot starved;
+    starved.kv_free_pages = 0;
+    starved.mamba_free_slots = 0;
+    starved.kv_total_pages = 100;
+    starved.mamba_total_slots = 100;
+    starved.kv_active_pages = 0;
+
+    agent.OnRequestArrival(128, starved);
+    agent.OnRequestArrival(64, starved);
+    EXPECT_EQ(agent.DeferredCount(), 2);
+
+    // Build a snapshot with paused_count == DeferredCount (as MakePoolSnapshot
+    // would do) and tick: EwmaPaused must be positive afterward.
+    PoolSnapshot snap_with_paused = starved;
+    snap_with_paused.paused_count = agent.DeferredCount();
+    TinySleep();
+    agent.Tick(snap_with_paused);
+    EXPECT_GT(agent.EwmaPaused(), 0.0);
+}
+
 }  // namespace tokenspeed::test

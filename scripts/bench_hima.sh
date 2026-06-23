@@ -45,6 +45,10 @@ REPS="${2:-1}"
 MODEL="${MODEL:-/home/songyang/models/Qwen3.5-9B}"
 TRACE="${TRACE:-dataset/claude-code-traces/traces/cc_qwen_mamba.jsonl}"
 MAX_SESSIONS="${MAX_SESSIONS:-50}"
+# Skip steps with prompts longer than the model's context window to avoid
+# ValueError from the engine (cc_qwen traces contain multi-turn sessions
+# that grow past 262K tokens).  Default matches Qwen3.5-9B max_model_len.
+MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-262000}"
 TIME_SCALE="${TIME_SCALE:-1.0}"
 # The cc_qwen* traces use absolute wall-clock t spanning weeks of real
 # Claude Code usage. Without a cap we'd sleep for hours between sessions.
@@ -113,6 +117,7 @@ run_one_arm() {
         --preset "$arm" \
         --output-dir "$out_dir" \
         --max-sessions "$MAX_SESSIONS" \
+        --max-prompt-tokens "$MAX_PROMPT_TOKENS" \
         --time-scale "$TIME_SCALE" \
         --max-inter-session-gap-s "$MAX_INTER_SESSION_GAP_S" \
         --base-gpu-id "$gpu" \

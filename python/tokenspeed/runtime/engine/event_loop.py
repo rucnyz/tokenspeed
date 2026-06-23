@@ -208,8 +208,7 @@ class EventLoop:
         _pre_has_mamba = getattr(
             self.model_config, "mambaish_config", None
         ) is not None or (
-            _txt_cfg_pre is not None
-            and hasattr(_txt_cfg_pre, "mamba2_cache_params")
+            _txt_cfg_pre is not None and hasattr(_txt_cfg_pre, "mamba2_cache_params")
         )
 
         # HiMA Phase 3 (S2.2-followup): resolve the Mamba pool headroom *up
@@ -223,15 +222,11 @@ class EventLoop:
         # needs the post-pool mamba_bytes_per_slot, which doesn't exist yet.
         self._xpool_mamba_headroom_slots = 0
         if _enable_xpool and _pre_has_mamba:
-            cfg_headroom = int(
-                getattr(server_args, "xpool_mamba_headroom_slots", 0)
-            )
+            cfg_headroom = int(getattr(server_args, "xpool_mamba_headroom_slots", 0))
             if cfg_headroom > 0:
                 self._xpool_mamba_headroom_slots = cfg_headroom
             else:
-                _ppf = max(
-                    1, int(getattr(server_args, "budgeter_pages_per_fire", 64))
-                )
+                _ppf = max(1, int(getattr(server_args, "budgeter_pages_per_fire", 64)))
                 # Conservative slot-count default that scales with fire size
                 # but stays small enough that the permanently-reserved Mamba
                 # memory is < 100 MB for typical hybrid models.  For Qwen3.5
@@ -518,7 +513,9 @@ class EventLoop:
             # Open in line-buffered mode so a crash doesn't lose the recent
             # tail. We intentionally truncate any prior file so each run
             # has its own time series.
-            self._replay_metrics_file = open(self._replay_metrics_path, "w", buffering=1)
+            self._replay_metrics_file = open(
+                self._replay_metrics_path, "w", buffering=1
+            )
         self._init_xpool_actuator(
             server_args,
             has_mamba,
@@ -1139,14 +1136,22 @@ class EventLoop:
             # future mamba_to_kv growth.
             # ----------------------------------------------------------
             total_rows = kv_max_tokens + kv_page_size
-            single_layer_bytes = total_rows * kv_head_num * kv_head_dim * kv_dtype_itemsize
+            single_layer_bytes = (
+                total_rows * kv_head_num * kv_head_dim * kv_dtype_itemsize
+            )
             # All rows live: map the full capacity upfront.
             max_chunks_per_layer = max(
                 1, math.ceil(single_layer_bytes / CHUNK_SIZE_BYTES)
             )
             # Reserve extra VA for mamba_to_kv headroom (up to 4× fire size).
             kv_headroom_pages = pages_per_fire * 4
-            kv_headroom_bytes = kv_headroom_pages * kv_page_size * kv_head_num * kv_head_dim * kv_dtype_itemsize
+            kv_headroom_bytes = (
+                kv_headroom_pages
+                * kv_page_size
+                * kv_head_num
+                * kv_head_dim
+                * kv_dtype_itemsize
+            )
             kv_headroom_chunks = max(1, math.ceil(kv_headroom_bytes / CHUNK_SIZE_BYTES))
             kv_max_chunks_with_headroom = max_chunks_per_layer + kv_headroom_chunks
 
@@ -1480,6 +1485,23 @@ class EventLoop:
             )
             self._xpool_actuator.maybe_execute(plan)
 
+    def _maybe_migrate_xpool(self) -> None:
+        """Drain the budgeter's pending migrate plan (S2.6 Stage-0).
+
+        Called immediately after _maybe_fire_xpool() on every budget tick.
+        The actuator de-dups by op_id so calling on every tick is safe.
+        """
+        if self._xpool_actuator is None:
+            return
+        plan = getattr(self.scheduler, "pending_xpool_migrate", lambda: None)()
+        if plan is not None:
+            logger.debug(
+                "XPool pending migrate: op_id=%s pages_needed=%d",
+                getattr(plan, "op_id", "?"),
+                int(getattr(plan, "pages_needed", 0)),
+            )
+            self._xpool_actuator.maybe_execute_migrate(plan)
+
     def _maybe_budget_tick(self) -> None:
         if self._budgeter_tick_s <= 0:
             self._maybe_emit_replay_metrics()
@@ -1494,6 +1516,7 @@ class EventLoop:
         self.scheduler.budget_tick()
         self._last_budget_tick = now
         self._maybe_fire_xpool()
+        self._maybe_migrate_xpool()
         self._maybe_emit_replay_metrics()
 
     def _maybe_emit_replay_metrics(self) -> None:
@@ -1527,10 +1550,14 @@ class EventLoop:
             "kv_free_pages": int(self.scheduler.available_kv_pages()),
             "kv_active_pages": int(self.scheduler.active_kv_pages()),
             "kv_mapped_pages": (
-                int(getattr(kv_arena, "mapped_chunks", 0)) if kv_arena is not None else 0
+                int(getattr(kv_arena, "mapped_chunks", 0))
+                if kv_arena is not None
+                else 0
             ),
             "kv_headroom_pages": (
-                int(getattr(kv_arena, "headroom_pages", 0)) if kv_arena is not None else 0
+                int(getattr(kv_arena, "headroom_pages", 0))
+                if kv_arena is not None
+                else 0
             ),
             "mamba_mapped_chunks": (
                 int(getattr(mamba_arena, "mapped_chunks", 0))
@@ -1558,6 +1585,10 @@ class EventLoop:
             ),
             "xpool_last_fire_pages": (
                 int(getattr(actuator, "last_fire_pages", 0)) if actuator else 0
+            ),
+            # S2.6: accumulated migration events since process start.
+            "migrations_total": (
+                int(getattr(actuator, "committed_migrate", 0)) if actuator else 0
             ),
         }
         try:

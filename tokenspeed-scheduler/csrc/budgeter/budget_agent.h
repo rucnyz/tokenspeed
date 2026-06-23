@@ -41,6 +41,15 @@ struct XPoolFirePlan {
     cache_op_id op_id{0};
 };
 
+// S2.6: plan emitted by the budgeter when the admitter selects kCrossMigrate.
+// The Python actuator receives this via pending_xpool_migrate(), retracts the
+// best victim request (BestMigrateCandidate), and calls apply_xpool_migrate()
+// to commit the operation and increment the migration counter.
+struct XPoolMigratePlan {
+    std::int32_t pages_needed{0};
+    cache_op_id op_id{0};
+};
+
 class BudgetAgent {
 public:
     explicit BudgetAgent(const SchedulerConfig& config);
@@ -49,6 +58,16 @@ public:
     std::optional<XPoolFirePlan> Tick(const PoolSnapshot& snapshot);
     std::optional<XPoolFirePlan> PendingFire() const { return pending_fire_; }
     void ClearPendingFire() { pending_fire_.reset(); }
+
+    // S2.6 migration plan accessors.
+    std::optional<XPoolMigratePlan> PendingMigrate() const { return pending_migrate_; }
+    void ClearPendingMigrate() { pending_migrate_.reset(); }
+    void IncrCommittedMigrate() { committed_migrate_count_++; }
+    std::int32_t CommittedMigrateCount() const { return committed_migrate_count_; }
+
+    // S2.3 w_paused: number of kDefer decisions emitted since last Tick().
+    // Scheduler::MakePoolSnapshot() reads this to populate paused_count.
+    std::int32_t DeferredCount() const { return deferred_count_; }
 
     // S2.2 reverse-direction cooldown. Called from Scheduler::ApplyXPoolFire
     // AFTER the physical Grow/Shrink succeeds, so cancelled fires (which take
@@ -107,6 +126,14 @@ private:
     CostModel cost_model_;
     Admitter admitter_;
     std::optional<XPoolFirePlan> pending_fire_{};
+    // S2.6: migration plan latched by OnRequestArrival when admitter decides
+    // kCrossMigrate.  Cleared by ApplyXPoolMigrate / CancelXPoolMigrate.
+    std::optional<XPoolMigratePlan> pending_migrate_{};
+    std::int32_t committed_migrate_count_{0};
+    // S2.3 w_paused: accumulated kDefer count since last Tick().  Reset at
+    // the end of each Tick() call so MakePoolSnapshot (called just before
+    // Tick) sees the count for the preceding inter-tick interval.
+    std::int32_t deferred_count_{0};
     cache_op_id next_op_id_{1};
 };
 

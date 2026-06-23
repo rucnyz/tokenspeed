@@ -111,7 +111,9 @@ def test_extract_fires_picks_up_counter_advances(tmp_path: pathlib.Path) -> None
     assert len(snaps) == 4
 
 
-def test_calibrate_recommends_median_with_enough_samples(tmp_path: pathlib.Path) -> None:
+def test_calibrate_recommends_median_with_enough_samples(
+    tmp_path: pathlib.Path,
+) -> None:
     """With >=16 samples the median is the recommended kappa value."""
     records: list[dict] = [_snap(0.0)]
     fires_total = 0
@@ -186,7 +188,9 @@ def test_queue_wait_lower_bound_accumulates_time(tmp_path: pathlib.Path) -> None
     assert report["queue_wait_lower_bound_us"] == pytest.approx(2_000_000.0)
 
 
-def test_main_json_output(tmp_path: pathlib.Path, capsys: pytest.CaptureFixture) -> None:
+def test_main_json_output(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+) -> None:
     path = tmp_path / "budget.jsonl"
     _write_budget_jsonl(
         path,

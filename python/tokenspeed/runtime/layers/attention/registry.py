@@ -252,9 +252,7 @@ def _create_hybrid_linear_attn(
     # Mamba pool size — computed before tensor allocation so that the
     # pre-arenas factory can size both KV and mamba arenas at once.
     # ----------------------------------------------------------------
-    dp_size = max(
-        server_args.data_parallel_size or server_args.mapping.attn.dp_size, 1
-    )
+    dp_size = max(server_args.data_parallel_size or server_args.mapping.attn.dp_size, 1)
     _spec_draft_tokens = (
         server_args.speculative_num_draft_tokens
         if server_args.speculative_algorithm is not None
@@ -274,7 +272,9 @@ def _create_hybrid_linear_attn(
         else (_max_req_pool_size + 1)
     )
     # total_size mirrors SimpleMambaPool.__init__ so the factory sizes the arena correctly.
-    _current_input_size = _max_req_pool_size + 1 if _max_req_pool_size > 0 else mamba_pool_size
+    _current_input_size = (
+        _max_req_pool_size + 1 if _max_req_pool_size > 0 else mamba_pool_size
+    )
     _draft_slots_per_req = max(0, _spec_draft_tokens - 1)
     _mamba_total_size = mamba_pool_size + _current_input_size * _draft_slots_per_req
 
@@ -292,6 +292,7 @@ def _create_hybrid_linear_attn(
     mamba_arena = None
     if pre_arenas_factory is not None and len(mamba_layer_ids) > 0:
         import torch
+
         try:
             kv_arena_group, mamba_arena = pre_arenas_factory(
                 kv_num_layers=num_full_attn_layers,
@@ -316,7 +317,10 @@ def _create_hybrid_linear_attn(
             mamba_arena = None
 
     inner_pool = config.create_pool(
-        num_full_attn_layers, max_num_tokens, rank, enable_memory_saver,
+        num_full_attn_layers,
+        max_num_tokens,
+        rank,
+        enable_memory_saver,
         kv_arena_group=kv_arena_group,
     )
     # Wrap with layer ID mapping (global layer IDs -> pool indices)

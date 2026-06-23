@@ -34,6 +34,7 @@ Verify directions after run::
     grep -E "fire committed.*kv_to_mamba" /tmp/stress_xpool.log | wc -l
     grep -E "fire committed.*mamba_to_kv" /tmp/stress_xpool.log | wc -l
 """
+
 from __future__ import annotations
 
 import threading
@@ -45,6 +46,7 @@ MODEL = "/home/songyang/models/Qwen3.5-35B-A3B"
 # ---------------------------------------------------------------------------
 # Prompt generators
 # ---------------------------------------------------------------------------
+
 
 def _kv_heavy_prompts(n: int, salt: int = 0) -> list[str]:
     """Long UNIQUE prompts so each request allocates many fresh KV pages.
@@ -82,6 +84,7 @@ def _mamba_heavy_prompts(n: int, salt: int = 0) -> list[str]:
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _run_sequential(
     engine,
     prompts: list[str],
@@ -118,8 +121,10 @@ def _run_concurrent(
     Using more output tokens (max_new_tokens) ensures the KV pages stay
     allocated across multiple budget-tick intervals (tick_s=0.5).
     """
-    print(f"[{tag}] sending {len(prompts)} prompts concurrently "
-          f"(max_new_tokens={max_new_tokens}) …")
+    print(
+        f"[{tag}] sending {len(prompts)} prompts concurrently "
+        f"(max_new_tokens={max_new_tokens}) …"
+    )
     lock = threading.Lock()
 
     def _submit(idx: int, prompt: str) -> None:
@@ -148,6 +153,7 @@ def _run_concurrent(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     from tokenspeed.runtime.entrypoints.engine import Engine
@@ -200,8 +206,11 @@ def main() -> None:
     # ------------------------------------------------------------------
     for r in range(5):
         _run_sequential(
-            engine, _mamba_heavy_prompts(8, salt=r * 100),
-            f"mamba_heavy_r{r}", results, corruption_count_ref,
+            engine,
+            _mamba_heavy_prompts(8, salt=r * 100),
+            f"mamba_heavy_r{r}",
+            results,
+            corruption_count_ref,
         )
         time.sleep(1.5)  # let budgeter tick
 
@@ -227,8 +236,11 @@ def main() -> None:
     # ------------------------------------------------------------------
     for r in range(3):
         _run_concurrent(
-            engine, _kv_heavy_prompts(3, salt=500 + r * 100),
-            f"kv_heavy_r{r}", results, corruption_count_ref,
+            engine,
+            _kv_heavy_prompts(3, salt=500 + r * 100),
+            f"kv_heavy_r{r}",
+            results,
+            corruption_count_ref,
             max_new_tokens=512,
         )
         time.sleep(1.5)  # let budgeter tick
@@ -237,13 +249,19 @@ def main() -> None:
     # Phase C: alternate again to confirm both paths repeat
     # ------------------------------------------------------------------
     _run_sequential(
-        engine, _mamba_heavy_prompts(8, salt=900),
-        "mamba_heavy_final", results, corruption_count_ref,
+        engine,
+        _mamba_heavy_prompts(8, salt=900),
+        "mamba_heavy_final",
+        results,
+        corruption_count_ref,
     )
     time.sleep(1.5)
     _run_concurrent(
-        engine, _kv_heavy_prompts(3, salt=950),
-        "kv_heavy_final", results, corruption_count_ref,
+        engine,
+        _kv_heavy_prompts(3, salt=950),
+        "kv_heavy_final",
+        results,
+        corruption_count_ref,
         max_new_tokens=512,
     )
     time.sleep(2.0)
