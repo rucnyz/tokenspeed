@@ -341,7 +341,19 @@ class XPoolActuator:
         )
 
     def _wait_drain(self, drain_fn_name: str = "has_capped_kv_inflight") -> None:
-        """Poll until no capped pages/slots remain in-flight (or timeout).
+        """Poll until no capped pages/slots remain in-flight, then GPU-sync.
+
+        Two-phase drain:
+        1. Poll the C++ scheduler until it reports no requests are using capped
+           pages/slots (or timeout).  This ensures no NEW GPU kernels will be
+           dispatched that touch those pages.
+        2. Call ``torch.cuda.synchronize()`` to flush all in-flight GPU kernels
+           that were already dispatched.  CUDA kernel launches are asynchronous:
+           the C++ scheduler advances request state before the GPU finishes the
+           corresponding decode/prefill kernel.  Without this synchronize,
+           ``cu_mem_unmap`` can race with a running kernel that still reads the
+           soon-to-be-unmapped KV-cache pages, producing
+           ``CUDA error: an illegal memory access was encountered``.
 
         Args:
             drain_fn_name: Name of the C++ scheduler method to poll.  Defaults
@@ -364,6 +376,15 @@ class XPoolActuator:
                 )
                 break
             time.sleep(self.DRAIN_POLL_S)
+        # Phase 2: flush all pending GPU kernels so that no asynchronous CUDA
+        # work can access the pages we are about to unmap.
+        try:
+            import torch.cuda  # noqa: PLC0415
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # Helper: decide whether the kv_arena supports physical handle transfer
