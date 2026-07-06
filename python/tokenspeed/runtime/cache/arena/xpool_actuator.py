@@ -77,6 +77,15 @@ class XPoolActuator:
         # kv_bytes_per_page is used to convert KV page counts to mamba chunk
         # counts when the two arenas have different byte-per-unit ratios.
         self._kv_bytes_per_page = kv_bytes_per_page
+        # CUDA device index for the GPU this actuator operates on, used for
+        # device-specific synchronization in _wait_drain.  Try mamba_arena
+        # first (ChunkArena stores it as _device), then kv_arena, then fall
+        # back to None (torch.cuda.synchronize(None) uses current device).
+        self._device: int | None = (
+            getattr(mamba_arena, "_device", None)
+            or getattr(kv_arena, "_device", None)
+            or getattr(getattr(kv_arena, "shared_pool", None), "device", None)
+        )
         self._lock = threading.Lock()
         self._inflight = False
         # The C++ budgeter latches its pending plan (op_id starts at 1), so we
@@ -365,26 +374,66 @@ class XPoolActuator:
         drain_fn = getattr(self._scheduler, drain_fn_name, None)
         if drain_fn is None:
             return
-        deadline = time.monotonic() + self.DRAIN_TIMEOUT_S
-        while drain_fn():
-            if time.monotonic() > deadline:
-                logger.warning(
-                    "XPool drain timeout after %.1f s (fn=%s); proceeding with "
-                    "unmap (some in-flight pages may still be in use)",
-                    self.DRAIN_TIMEOUT_S,
-                    drain_fn_name,
-                )
-                break
-            time.sleep(self.DRAIN_POLL_S)
-        # Phase 2: flush all pending GPU kernels so that no asynchronous CUDA
-        # work can access the pages we are about to unmap.
+
         try:
             import torch.cuda  # noqa: PLC0415
 
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            cuda_ok = torch.cuda.is_available()
         except Exception:  # noqa: BLE001
-            pass
+            cuda_ok = False
+
+        def _sync() -> None:
+            if not cuda_ok:
+                return
+            try:
+                torch.cuda.synchronize(self._device)
+            except Exception:  # noqa: BLE001
+                pass
+
+        deadline = time.monotonic() + self.DRAIN_TIMEOUT_S
+        # Poll-then-sync-then-recheck: a request whose pages the C++ scheduler
+        # just marked "drained" may still have its terminal decode/prefill
+        # kernel sitting in an execution-stream queue that the overlap event
+        # loop (event_loop_overlap) submitted *ahead* of committing that
+        # request's results (that pipelining is the whole point of overlap
+        # scheduling).  A single poll -> sync -> unmap sequence is vulnerable
+        # to a request transitioning to "drained" in the tiny window between
+        # our poll and our sync call.  We close that window by re-polling
+        # after every sync and looping until a sync is immediately followed
+        # by a clean (still-zero) drain check.
+        while True:
+            while drain_fn():
+                if time.monotonic() > deadline:
+                    logger.warning(
+                        "XPool drain timeout after %.1f s (fn=%s); proceeding "
+                        "with unmap (some in-flight pages may still be in use)",
+                        self.DRAIN_TIMEOUT_S,
+                        drain_fn_name,
+                    )
+                    _sync()
+                    return
+                time.sleep(self.DRAIN_POLL_S)
+            # Phase 2: flush all pending GPU kernels on the correct device so
+            # that no asynchronous CUDA work in flight at the moment the poll
+            # above returned False can still touch the pages we're about to
+            # unmap.  torch.cuda.synchronize(device) is equivalent to
+            # cudaSetDevice(device) + cudaDeviceSynchronize() — it blocks
+            # until every stream on that device (regardless of which CPU
+            # thread submitted the work) is idle.
+            _sync()
+            # Re-check: if new capped-inflight usage appeared while we were
+            # synchronizing, loop back to drain+sync again instead of racing
+            # ahead with the unmap.
+            if not drain_fn():
+                return
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "XPool drain timeout after %.1f s (fn=%s) on recheck; "
+                    "proceeding with unmap",
+                    self.DRAIN_TIMEOUT_S,
+                    drain_fn_name,
+                )
+                return
 
     # ------------------------------------------------------------------
     # Helper: decide whether the kv_arena supports physical handle transfer
