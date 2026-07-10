@@ -210,3 +210,75 @@ def test_main_json_output(
     out = capsys.readouterr().out
     parsed = json.loads(out)
     assert parsed["recommended_xpool_xfer_us_per_page"] == pytest.approx(100.0)
+
+
+def test_extract_fires_reads_stage_breakdown_fields(tmp_path: pathlib.Path) -> None:
+    path = tmp_path / "budget.jsonl"
+    _write_budget_jsonl(
+        path,
+        [
+            _snap(0.0),
+            _snap(
+                0.1,
+                fires_mamba_to_kv_total=1,
+                xpool_last_fire_us=1000.0,
+                xpool_last_fire_pages=10,
+                xpool_last_fire_prepare_us=10.0,
+                xpool_last_fire_drain_poll_us=20.0,
+                xpool_last_fire_drain_sync_us=800.0,
+                xpool_last_fire_vmm_us=170.0,
+            ),
+        ],
+    )
+    records = list(ck._iter_budget_records(path))
+    samples, _, _ = ck._extract_fires(records)
+    assert len(samples) == 1
+    assert samples[0].prepare_us == pytest.approx(10.0)
+    assert samples[0].drain_sync_us == pytest.approx(800.0)
+
+
+def test_calibrate_stage_breakdown_identifies_dominant_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = tmp_path / "budget.jsonl"
+    records = [_snap(0.0)]
+    for i in range(5):
+        records.append(
+            _snap(
+                0.1 * (i + 1),
+                fires_mamba_to_kv_total=i + 1,
+                xpool_last_fire_us=1000.0,
+                xpool_last_fire_pages=10,
+                xpool_last_fire_prepare_us=10.0,
+                xpool_last_fire_drain_poll_us=20.0,
+                xpool_last_fire_drain_sync_us=900.0,
+                xpool_last_fire_vmm_us=70.0,
+            )
+        )
+    _write_budget_jsonl(path, records)
+    report = ck.calibrate([path])
+    sb = report["stage_breakdown"]
+    assert sb["n"] == 5
+    assert sb["dominant_stage"] == "drain_sync"
+    assert sb["avg_share"]["drain_sync"] == pytest.approx(0.9)
+
+
+def test_calibrate_stage_breakdown_backward_compatible_without_new_fields(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = tmp_path / "budget.jsonl"
+    _write_budget_jsonl(
+        path,
+        [
+            _snap(0.0),
+            _snap(
+                0.1,
+                fires_mamba_to_kv_total=1,
+                xpool_last_fire_us=6400.0,
+                xpool_last_fire_pages=64,
+            ),
+        ],
+    )
+    report = ck.calibrate([path])
+    assert report["stage_breakdown"]["n"] == 1
+    assert report["stage_breakdown"]["dominant_stage"] is None

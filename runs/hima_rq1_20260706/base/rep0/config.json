@@ -1,0 +1,24 @@
+{
+  "preset": "base",
+  "trace": "dataset/claude-code-traces/traces/cc_qwen3p5_9b.jsonl",
+  "model": "/scratch/yuzhou/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+  "max_sessions": 6,
+  "time_scale": 1.0,
+  "warmup_seconds": 0.0,
+  "normalize_time": true,
+  "max_inter_session_gap_s": 5.0,
+  "max_prompt_tokens": 262000,
+  "engine_kwargs": {
+    "model": "/scratch/yuzhou/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+    "dtype": "bfloat16",
+    "attention_backend": "triton",
+    "mamba_full_memory_ratio": 0.15,
+    "base_gpu_id": 1,
+    "radix_eviction_policy": "lru",
+    "enable_budgeter": false,
+    "enable_admitter": false,
+    "enable_xpool_dynamic_capacity": false,
+    "port": 18100
+  },
+  "start_wall_iso": "2026-07-06T17:22:08+0000"
+}

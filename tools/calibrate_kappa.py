@@ -57,10 +57,18 @@ from dataclasses import dataclass
 class FireSample:
     elapsed_us: float
     pages: int
+    prepare_us: float = 0.0
+    drain_poll_us: float = 0.0
+    drain_sync_us: float = 0.0
+    vmm_us: float = 0.0
 
     @property
     def per_page(self) -> float:
         return self.elapsed_us / float(self.pages) if self.pages > 0 else 0.0
+
+    @property
+    def staged_total_us(self) -> float:
+        return self.prepare_us + self.drain_poll_us + self.drain_sync_us + self.vmm_us
 
 
 def _iter_budget_records(path: pathlib.Path) -> Iterator[dict]:
@@ -106,7 +114,20 @@ def _extract_fires(
                 # still see only the latest sample; this is best-effort
                 # (sampling bias toward longer fires), which matches how
                 # the EWMA itself sees the data.
-                samples.append(FireSample(elapsed_us=elapsed_us, pages=pages))
+                samples.append(
+                    FireSample(
+                        elapsed_us=elapsed_us,
+                        pages=pages,
+                        prepare_us=float(rec.get("xpool_last_fire_prepare_us", 0.0)),
+                        drain_poll_us=float(
+                            rec.get("xpool_last_fire_drain_poll_us", 0.0)
+                        ),
+                        drain_sync_us=float(
+                            rec.get("xpool_last_fire_drain_sync_us", 0.0)
+                        ),
+                        vmm_us=float(rec.get("xpool_last_fire_vmm_us", 0.0)),
+                    )
+                )
             last_total = total
         queue_snapshots.append(rec)
     return samples, last_ewma, queue_snapshots
@@ -132,6 +153,52 @@ def _summarise(per_page: list[float]) -> dict:
         "median": statistics.median(per_page),
         "p90": _pct(per_page, 90.0),
         "p99": _pct(per_page, 99.0),
+    }
+
+
+_STAGE_FIELDS: tuple[tuple[str, str], ...] = (
+    ("prepare_us", "prepare"),
+    ("drain_poll_us", "drain_poll"),
+    ("drain_sync_us", "drain_sync"),
+    ("vmm_us", "vmm"),
+)
+
+
+def _summarise_stage_breakdown(samples: list[FireSample]) -> dict:
+    """Aggregate per-fire sub-stage timings and average share of total cost."""
+    if not samples:
+        return {"n": 0}
+
+    stages: dict[str, dict] = {}
+    share_sums: dict[str, float] = {label: 0.0 for _, label in _STAGE_FIELDS}
+    share_count = 0
+
+    for attr, label in _STAGE_FIELDS:
+        values = [float(getattr(s, attr)) for s in samples]
+        stages[label] = _summarise(values)
+
+    for sample in samples:
+        total = sample.staged_total_us
+        if total <= 0.0:
+            continue
+        share_count += 1
+        for attr, label in _STAGE_FIELDS:
+            share_sums[label] += float(getattr(sample, attr)) / total
+
+    avg_share: dict[str, float] = {}
+    if share_count > 0:
+        for _, label in _STAGE_FIELDS:
+            avg_share[label] = share_sums[label] / float(share_count)
+
+    dominant_stage = None
+    if avg_share:
+        dominant_stage = max(avg_share, key=avg_share.get)
+
+    return {
+        "n": len(samples),
+        "stages": stages,
+        "avg_share": avg_share,
+        "dominant_stage": dominant_stage,
     }
 
 
@@ -204,6 +271,7 @@ def calibrate(paths: list[pathlib.Path]) -> dict:
 
     per_page = [s.per_page for s in all_samples]
     per_page_stats = _summarise(per_page)
+    stage_breakdown = _summarise_stage_breakdown(all_samples)
     # Recommended kappa: prefer the median if we have at least 16 samples,
     # else fall back to the average of the per-file final EWMAs.  This
     # tends to stay close to typical fire cost while resisting the long
@@ -223,6 +291,7 @@ def calibrate(paths: list[pathlib.Path]) -> dict:
     return {
         "files": per_file_reports,
         "samples": per_page_stats,
+        "stage_breakdown": stage_breakdown,
         "final_ewma_us_per_page_mean": (statistics.fmean(ewmas) if ewmas else None),
         "queue_wait_lower_bound_us": queue_us_total,
         "recommended_xpool_xfer_us_per_page": recommended,
@@ -286,6 +355,27 @@ def main(argv: list[str] | None = None) -> int:
             f"Final runtime EWMA (mean over files): "
             f"{report['final_ewma_us_per_page_mean']:.2f} us/page"
         )
+    sb = report.get("stage_breakdown", {})
+    if sb.get("n", 0) > 0:
+        print("\nFire sub-stage breakdown (microseconds):")
+        for label in ("prepare", "drain_poll", "drain_sync", "vmm"):
+            stats = sb["stages"].get(label, {})
+            if stats.get("n", 0) <= 0:
+                continue
+            share = sb.get("avg_share", {}).get(label)
+            share_txt = f" avg_share={share * 100:.1f}%" if share is not None else ""
+            print(
+                f"  {label:11s}: median={stats['median']:.1f} "
+                f"mean={stats['mean']:.1f} p90={stats['p90']:.1f}{share_txt}"
+            )
+        dominant = sb.get("dominant_stage")
+        if dominant is not None:
+            dom_share = sb.get("avg_share", {}).get(dominant)
+            if dom_share is not None:
+                print(
+                    f"Dominant stage (avg share): {dominant} "
+                    f"({dom_share * 100:.1f}% of staged time)"
+                )
     print(
         f"Queue-wait lower bound (sum): "
         f"{report['queue_wait_lower_bound_us']:.0f} us"

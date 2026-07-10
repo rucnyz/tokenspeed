@@ -35,6 +35,21 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Keys in the per-fire timing breakdown dict returned by ``_do_vmm``.
+FIRE_BREAKDOWN_PREPARE = "prepare_us"
+FIRE_BREAKDOWN_DRAIN_POLL = "drain_poll_us"
+FIRE_BREAKDOWN_DRAIN_SYNC = "drain_sync_us"
+FIRE_BREAKDOWN_VMM = "vmm_us"
+
+
+def _empty_fire_breakdown() -> dict[str, float]:
+    return {
+        FIRE_BREAKDOWN_PREPARE: 0.0,
+        FIRE_BREAKDOWN_DRAIN_POLL: 0.0,
+        FIRE_BREAKDOWN_DRAIN_SYNC: 0.0,
+        FIRE_BREAKDOWN_VMM: 0.0,
+    }
+
 
 @dataclass(slots=True)
 class FirePlan:
@@ -110,6 +125,13 @@ class XPoolActuator:
         self.ewma_xfer_us_per_page: float = 0.0
         self.last_fire_us: float = 0.0
         self.last_fire_pages: int = 0
+        # S2.5 follow-up: per-fire sub-stage timings (microseconds) from the
+        # most recent committed fire.  Exposed via budget.jsonl for offline
+        # breakdown analysis (see tools/calibrate_kappa.py).
+        self.last_fire_prepare_us: float = 0.0
+        self.last_fire_drain_poll_us: float = 0.0
+        self.last_fire_drain_sync_us: float = 0.0
+        self.last_fire_vmm_us: float = 0.0
         self._ewma_xfer_alpha: float = 0.25
         self._fires_observed: int = 0
         # S2.6: committed migration count (Stage-0: directed retraction).
@@ -140,6 +162,17 @@ class XPoolActuator:
             self.ewma_xfer_us_per_page = (
                 1.0 - a
             ) * self.ewma_xfer_us_per_page + a * per_page
+
+    def _record_fire_breakdown(self, breakdown: dict[str, float]) -> None:
+        """Store sub-stage timings from the most recent committed fire."""
+        self.last_fire_prepare_us = float(breakdown.get(FIRE_BREAKDOWN_PREPARE, 0.0))
+        self.last_fire_drain_poll_us = float(
+            breakdown.get(FIRE_BREAKDOWN_DRAIN_POLL, 0.0)
+        )
+        self.last_fire_drain_sync_us = float(
+            breakdown.get(FIRE_BREAKDOWN_DRAIN_SYNC, 0.0)
+        )
+        self.last_fire_vmm_us = float(breakdown.get(FIRE_BREAKDOWN_VMM, 0.0))
 
     def maybe_execute(self, plan: object) -> bool:
         """Actuate a budgeter plan unless it was already actuated.
@@ -273,20 +306,28 @@ class XPoolActuator:
                 # the actuator's cost-per-page.  perf_counter_ns is monotonic
                 # and immune to wall-clock jumps.
                 t0_ns = time.perf_counter_ns()
-                vmm_done = self._do_vmm(plan)
+                vmm_done, breakdown = self._do_vmm(plan)
                 elapsed_us = (time.perf_counter_ns() - t0_ns) / 1000.0
                 if self._scheduler is not None and plan.cpp_plan is not None:
                     if vmm_done:
                         try:
                             self._scheduler.apply_xpool_fire(plan.cpp_plan)
                             logger.info(
-                                "XPool fire committed: op_id=%d direction=%s elapsed_us=%.1f n_pages=%d",
+                                "XPool fire committed: op_id=%d direction=%s "
+                                "elapsed_us=%.1f n_pages=%d "
+                                "prepare_us=%.1f drain_poll_us=%.1f "
+                                "drain_sync_us=%.1f vmm_us=%.1f",
                                 plan.op_id,
                                 plan.direction,
                                 elapsed_us,
                                 len(plan.page_ids),
+                                breakdown[FIRE_BREAKDOWN_PREPARE],
+                                breakdown[FIRE_BREAKDOWN_DRAIN_POLL],
+                                breakdown[FIRE_BREAKDOWN_DRAIN_SYNC],
+                                breakdown[FIRE_BREAKDOWN_VMM],
                             )
                             self._record_fire_cost(len(plan.page_ids), elapsed_us)
+                            self._record_fire_breakdown(breakdown)
                             if plan.direction == "kv_to_mamba":
                                 self.committed_kv_to_mamba += 1
                             elif plan.direction == "mamba_to_kv":
@@ -349,7 +390,9 @@ class XPoolActuator:
             1, math.ceil(n_kv_pages * self._kv_bytes_per_page / CHUNK_SIZE_BYTES)
         )
 
-    def _wait_drain(self, drain_fn_name: str = "has_capped_kv_inflight") -> None:
+    def _wait_drain(
+        self, drain_fn_name: str = "has_capped_kv_inflight"
+    ) -> tuple[float, float]:
         """Poll until no capped pages/slots remain in-flight, then GPU-sync.
 
         Two-phase drain:
@@ -368,12 +411,19 @@ class XPoolActuator:
             drain_fn_name: Name of the C++ scheduler method to poll.  Defaults
                 to ``has_capped_kv_inflight`` for kv_to_mamba direction.  Pass
                 ``has_capped_mamba_inflight`` for mamba_to_kv direction.
+
+        Returns:
+            ``(poll_us, sync_us)`` — cumulative microseconds spent in the
+            scheduler poll/sleep loop and in ``torch.cuda.synchronize()``
+            calls respectively.
         """
+        poll_us = 0.0
+        sync_us = 0.0
         if self._scheduler is None:
-            return
+            return poll_us, sync_us
         drain_fn = getattr(self._scheduler, drain_fn_name, None)
         if drain_fn is None:
-            return
+            return poll_us, sync_us
 
         try:
             import torch.cuda  # noqa: PLC0415
@@ -383,12 +433,15 @@ class XPoolActuator:
             cuda_ok = False
 
         def _sync() -> None:
+            nonlocal sync_us
             if not cuda_ok:
                 return
+            t0_ns = time.perf_counter_ns()
             try:
                 torch.cuda.synchronize(self._device)
             except Exception:  # noqa: BLE001
                 pass
+            sync_us += (time.perf_counter_ns() - t0_ns) / 1000.0
 
         deadline = time.monotonic() + self.DRAIN_TIMEOUT_S
         # Poll-then-sync-then-recheck: a request whose pages the C++ scheduler
@@ -411,8 +464,10 @@ class XPoolActuator:
                         drain_fn_name,
                     )
                     _sync()
-                    return
+                    return poll_us, sync_us
+                t_sleep_ns = time.perf_counter_ns()
                 time.sleep(self.DRAIN_POLL_S)
+                poll_us += (time.perf_counter_ns() - t_sleep_ns) / 1000.0
             # Phase 2: flush all pending GPU kernels on the correct device so
             # that no asynchronous CUDA work in flight at the moment the poll
             # above returned False can still touch the pages we're about to
@@ -425,7 +480,7 @@ class XPoolActuator:
             # synchronizing, loop back to drain+sync again instead of racing
             # ahead with the unmap.
             if not drain_fn():
-                return
+                return poll_us, sync_us
             if time.monotonic() > deadline:
                 logger.warning(
                     "XPool drain timeout after %.1f s (fn=%s) on recheck; "
@@ -433,7 +488,7 @@ class XPoolActuator:
                     self.DRAIN_TIMEOUT_S,
                     drain_fn_name,
                 )
-                return
+                return poll_us, sync_us
 
     # ------------------------------------------------------------------
     # Helper: decide whether the kv_arena supports physical handle transfer
@@ -521,7 +576,7 @@ class XPoolActuator:
         # can simply leave headroom_chunks > 0 in their arena.
         return int(max_chunks) == int(mapped_chunks)
 
-    def _do_vmm(self, plan: FirePlan) -> bool:
+    def _do_vmm(self, plan: FirePlan) -> tuple[bool, dict[str, float]]:
         """Perform physical cuMemUnmap / cuMemMap operations.
 
         The KV pool always uses physical mapping (handle release/re-map
@@ -535,9 +590,13 @@ class XPoolActuator:
         re-map physical pages in the KV arena.
 
         Returns:
-            True if the fire should be committed (``apply_xpool_fire``
-            called), False if it must be cancelled.
+            ``(committed, breakdown)`` where *committed* is True if the fire
+            should be committed (``apply_xpool_fire`` called), False if it
+            must be cancelled, and *breakdown* holds per-stage microsecond
+            timings (``prepare_us``, ``drain_poll_us``, ``drain_sync_us``,
+            ``vmm_us``).
         """
+        breakdown = _empty_fire_breakdown()
         n_kv_pages = len(plan.page_ids)
         n_mamba_chunks = self._kv_pages_to_mamba_chunks(n_kv_pages)
         use_transfer = self._kv_supports_handle_transfer()
@@ -562,13 +621,14 @@ class XPoolActuator:
                     kv_available,
                     n_kv_pages,
                 )
-                return False
+                return False, breakdown
 
             # Shrink-and-drain: cap the tail mamba slots in C++ BEFORE unmap so
             # no new allocations land on slots that are about to be transferred.
             if self._scheduler is not None:
                 prepare_fn = getattr(self._scheduler, "prepare_mamba_to_kv_fire", None)
                 if prepare_fn is not None:
+                    t0_ns = time.perf_counter_ns()
                     try:
                         prepare_fn(n_mamba_chunks)
                     except Exception as exc:  # noqa: BLE001
@@ -577,9 +637,18 @@ class XPoolActuator:
                             n_mamba_chunks,
                             exc,
                         )
-                        return False
-            self._wait_drain("has_capped_mamba_inflight")
+                        breakdown[FIRE_BREAKDOWN_PREPARE] = (
+                            time.perf_counter_ns() - t0_ns
+                        ) / 1000.0
+                        return False, breakdown
+                    breakdown[FIRE_BREAKDOWN_PREPARE] = (
+                        time.perf_counter_ns() - t0_ns
+                    ) / 1000.0
+            drain_poll_us, drain_sync_us = self._wait_drain("has_capped_mamba_inflight")
+            breakdown[FIRE_BREAKDOWN_DRAIN_POLL] = drain_poll_us
+            breakdown[FIRE_BREAKDOWN_DRAIN_SYNC] = drain_sync_us
 
+            t_vmm_ns = time.perf_counter_ns()
             if mamba_static:
                 # Logical-only Mamba: never touch the Mamba arena.  KV
                 # grows from cached handles in its own shared pool.  If
@@ -590,13 +659,16 @@ class XPoolActuator:
                 try:
                     self.kv_arena.grow(n_kv_pages)
                 except Exception as exc:  # noqa: BLE001
+                    breakdown[FIRE_BREAKDOWN_VMM] = (
+                        time.perf_counter_ns() - t_vmm_ns
+                    ) / 1000.0
                     logger.warning(
                         "mamba_to_kv fire skipped (op_id=%d): kv grow failed "
                         "(no handles to re-map?): %s",
                         plan.op_id,
                         exc,
                     )
-                    return False
+                    return False, breakdown
                 logger.info(
                     "mamba_to_kv VMM done (logical mamba): grew %d kv pages",
                     n_kv_pages,
@@ -624,7 +696,8 @@ class XPoolActuator:
                     n_mamba_chunks,
                     n_kv_pages,
                 )
-            return True
+            breakdown[FIRE_BREAKDOWN_VMM] = (time.perf_counter_ns() - t_vmm_ns) / 1000.0
+            return True, breakdown
 
         elif plan.direction == "kv_to_mamba":
             if not mamba_static:
@@ -641,22 +714,32 @@ class XPoolActuator:
                         getattr(self.mamba_arena, "max_chunks", "?"),
                         n_mamba_chunks,
                     )
-                    return False
+                    return False, breakdown
 
             if self._scheduler is not None:
                 prepare_fn = getattr(self._scheduler, "prepare_kv_to_mamba_fire", None)
                 if prepare_fn is not None:
+                    t0_ns = time.perf_counter_ns()
                     try:
                         prepare_fn(n_kv_pages)
                     except Exception as exc:  # noqa: BLE001
+                        breakdown[FIRE_BREAKDOWN_PREPARE] = (
+                            time.perf_counter_ns() - t0_ns
+                        ) / 1000.0
                         logger.warning(
                             "prepare_kv_to_mamba_fire failed (n=%d): %s",
                             n_kv_pages,
                             exc,
                         )
-                        return False
-            self._wait_drain()
+                        return False, breakdown
+                    breakdown[FIRE_BREAKDOWN_PREPARE] = (
+                        time.perf_counter_ns() - t0_ns
+                    ) / 1000.0
+            drain_poll_us, drain_sync_us = self._wait_drain()
+            breakdown[FIRE_BREAKDOWN_DRAIN_POLL] = drain_poll_us
+            breakdown[FIRE_BREAKDOWN_DRAIN_SYNC] = drain_sync_us
 
+            t_vmm_ns = time.perf_counter_ns()
             if mamba_static:
                 # Logical-only Mamba: KV shrinks (handles stay in KV's
                 # shared pool for later re-map by mamba_to_kv).  No
@@ -687,7 +770,8 @@ class XPoolActuator:
                     n_kv_pages,
                     n_mamba_chunks,
                 )
-            return True
+            breakdown[FIRE_BREAKDOWN_VMM] = (time.perf_counter_ns() - t_vmm_ns) / 1000.0
+            return True, breakdown
 
         else:
             raise ValueError(f"unknown fire direction: {plan.direction}")

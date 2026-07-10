@@ -214,7 +214,7 @@ def test_record_fire_cost_ignores_invalid_samples() -> None:
     assert actuator.ewma_xfer_us_per_page == 0.0
 
 
-def test_committed_fire_updates_ewma() -> None:
+def test_committed_fire_updates_ewma_and_breakdown() -> None:
     """Full path: _execute_locked must time and record the VMM cost."""
     kv = _KvArena(mapped_chunks=5, max_chunks=20)
     mamba = _StaticMambaArena()
@@ -229,6 +229,14 @@ def test_committed_fire_updates_ewma() -> None:
     assert sched.applied == [cpp_plan]
     assert actuator.ewma_xfer_us_per_page > 0.0
     assert actuator.last_fire_pages == 2
+    staged = (
+        actuator.last_fire_prepare_us
+        + actuator.last_fire_drain_poll_us
+        + actuator.last_fire_drain_sync_us
+        + actuator.last_fire_vmm_us
+    )
+    assert staged > 0.0
+    assert staged <= actuator.last_fire_us + 50.0
 
 
 def test_cancelled_fire_does_not_update_ewma() -> None:

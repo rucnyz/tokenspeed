@@ -62,8 +62,10 @@ def test_wait_drain_syncs_once_when_drain_clears_immediately():
     with patch("torch.cuda.is_available", return_value=True), patch(
         "torch.cuda.synchronize"
     ) as mock_sync:
-        actuator._wait_drain()
+        poll_us, sync_us = actuator._wait_drain()
 
+    assert poll_us >= 0.0
+    assert sync_us >= 0.0
     mock_sync.assert_called_once_with(actuator._device)
     # One poll (False -> exit poll loop) + one post-sync recheck (also
     # False -> done): two calls total for the clean, no-contention case.
@@ -85,8 +87,10 @@ def test_wait_drain_rechecks_after_sync_when_new_inflight_appears():
     with patch("torch.cuda.is_available", return_value=True), patch(
         "torch.cuda.synchronize"
     ) as mock_sync, patch("time.sleep") as mock_sleep:
-        actuator._wait_drain()
+        poll_us, sync_us = actuator._wait_drain()
 
+    assert poll_us >= 0.0
+    assert sync_us >= 0.0
     assert mock_sync.call_count == 2
     assert mock_sync.call_args_list[0].args == (actuator._device,)
     mock_sleep.assert_called_once()  # only the first True triggers a poll sleep
@@ -95,8 +99,11 @@ def test_wait_drain_rechecks_after_sync_when_new_inflight_appears():
 def test_wait_drain_noop_without_scheduler():
     actuator = XPoolActuator(kv_arena=MagicMock(), mamba_arena=MagicMock(), scheduler=None)
     with patch("torch.cuda.synchronize") as mock_sync:
-        actuator._wait_drain()
+        poll_us, sync_us = actuator._wait_drain()
+    assert poll_us == 0.0
+    assert sync_us == 0.0
     mock_sync.assert_not_called()
+
 
 def test_wait_drain_noop_without_drain_fn():
     scheduler = MagicMock(spec=[])  # no has_capped_kv_inflight attribute
@@ -104,5 +111,7 @@ def test_wait_drain_noop_without_drain_fn():
         kv_arena=MagicMock(), mamba_arena=MagicMock(), scheduler=scheduler
     )
     with patch("torch.cuda.synchronize") as mock_sync:
-        actuator._wait_drain()
+        poll_us, sync_us = actuator._wait_drain()
+    assert poll_us == 0.0
+    assert sync_us == 0.0
     mock_sync.assert_not_called()

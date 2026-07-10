@@ -1806,6 +1806,24 @@ class EventLoop:
             "xpool_last_fire_pages": (
                 int(getattr(actuator, "last_fire_pages", 0)) if actuator else 0
             ),
+            "xpool_last_fire_prepare_us": (
+                float(getattr(actuator, "last_fire_prepare_us", 0.0))
+                if actuator
+                else 0.0
+            ),
+            "xpool_last_fire_drain_poll_us": (
+                float(getattr(actuator, "last_fire_drain_poll_us", 0.0))
+                if actuator
+                else 0.0
+            ),
+            "xpool_last_fire_drain_sync_us": (
+                float(getattr(actuator, "last_fire_drain_sync_us", 0.0))
+                if actuator
+                else 0.0
+            ),
+            "xpool_last_fire_vmm_us": (
+                float(getattr(actuator, "last_fire_vmm_us", 0.0)) if actuator else 0.0
+            ),
             # S2.6: accumulated migration events since process start.
             "migrations_total": (
                 int(getattr(actuator, "committed_migrate", 0)) if actuator else 0

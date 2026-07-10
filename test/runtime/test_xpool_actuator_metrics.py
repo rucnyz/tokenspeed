@@ -31,7 +31,18 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from tokenspeed.runtime.cache.arena.xpool_actuator import FirePlan, XPoolActuator
+
+
+def _empty_breakdown() -> dict[str, float]:
+    return {
+        "prepare_us": 0.0,
+        "drain_poll_us": 0.0,
+        "drain_sync_us": 0.0,
+        "vmm_us": 0.0,
+    }
 
 
 def _make_actuator(*, vmm_succeeds: bool) -> tuple[XPoolActuator, MagicMock]:
@@ -43,7 +54,7 @@ def _make_actuator(*, vmm_succeeds: bool) -> tuple[XPoolActuator, MagicMock]:
         scheduler=scheduler,
         kv_bytes_per_page=4096,
     )
-    actuator._do_vmm = MagicMock(return_value=vmm_succeeds)
+    actuator._do_vmm = MagicMock(return_value=(vmm_succeeds, _empty_breakdown()))
     return actuator, scheduler
 
 
@@ -54,6 +65,34 @@ def _plan(direction: str, op_id: int) -> FirePlan:
         op_id=op_id,
         cpp_plan=object(),
     )
+
+
+def test_committed_fire_records_breakdown_from_do_vmm():
+    """Committed fires must copy sub-stage timings from _do_vmm breakdown."""
+    actuator, _ = _make_actuator(vmm_succeeds=True)
+    breakdown = {
+        "prepare_us": 10.0,
+        "drain_poll_us": 20.0,
+        "drain_sync_us": 300.0,
+        "vmm_us": 40.0,
+    }
+    actuator._do_vmm = MagicMock(return_value=(True, breakdown))
+    actuator._execute_locked(_plan("kv_to_mamba", op_id=1))
+
+    assert actuator.last_fire_prepare_us == pytest.approx(10.0)
+    assert actuator.last_fire_drain_poll_us == pytest.approx(20.0)
+    assert actuator.last_fire_drain_sync_us == pytest.approx(300.0)
+    assert actuator.last_fire_vmm_us == pytest.approx(40.0)
+
+
+def test_cancelled_fire_does_not_update_breakdown():
+    actuator, _ = _make_actuator(vmm_succeeds=False)
+    actuator._execute_locked(_plan("kv_to_mamba", op_id=1))
+
+    assert actuator.last_fire_prepare_us == 0.0
+    assert actuator.last_fire_drain_poll_us == 0.0
+    assert actuator.last_fire_drain_sync_us == 0.0
+    assert actuator.last_fire_vmm_us == 0.0
 
 
 def test_committed_fire_increments_correct_direction():
