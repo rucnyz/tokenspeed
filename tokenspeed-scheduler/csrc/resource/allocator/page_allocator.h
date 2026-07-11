@@ -58,6 +58,10 @@ public:
     // Returns 0 when it is safe to physically unmap the capped tail.
     std::int32_t CappedInflightPages() const;
 
+    // True when page_id sits in the tail-cap region or was individually marked
+    // capped (HiMA shrink-and-drain).
+    bool IsPageCapped(std::int32_t page_id) const;
+
     // Number of KV pages in the VMM VA window that are not yet physically
     // mapped.  Non-zero only in dynamic-capacity mode; represents the maximum
     // number of pages the arena can still Grow() into (mamba→KV headroom).

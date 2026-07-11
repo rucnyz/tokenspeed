@@ -178,4 +178,11 @@ std::int32_t PageAllocator::CappedInflightPages() const {
     return std::max(0, raw - headroom_pages_);
 }
 
+bool PageAllocator::IsPageCapped(std::int32_t page_id) const {
+    if (!enable_dynamic_capacity_) {
+        return false;
+    }
+    return capped_free_list_.IsCapped(page_id);
+}
+
 }  // namespace tokenspeed

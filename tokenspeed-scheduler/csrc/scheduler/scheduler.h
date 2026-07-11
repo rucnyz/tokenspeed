@@ -162,6 +162,10 @@ private:
     newForwardOperation(std::vector<Request*> candidates);
     std::vector<WriteBackOperation> newWriteBackOperation(
         std::unordered_map<std::string, std::unique_ptr<Request>>& requests);
+    // S2.5-followup (proactive retract): when capped KV/mamba pages are still
+    // held by active decoders after Prepare*Fire, retract the worst offender so
+    // drain_sync can finish sooner than waiting for natural decode completion.
+    std::vector<WriteBackOperation> newXPoolCappedDrainRetractOperations();
     std::optional<WriteBackOperation> newRetractOperation(Request* retract_request);
 
     PrefillOperation applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
@@ -248,6 +252,18 @@ private:
     // helpers so that ApplyXPoolFire does not double-shrink.
     std::int32_t kv_pre_shrunk_pages_{0};
     std::int32_t mamba_pre_shrunk_slots_{0};
+
+    // S2.5-followup-2: proactive retract is issued from NextExecutionPlan(),
+    // which runs on every scheduler tick (far more often than the S2.6
+    // migrate path, which only fires once per budgeter-latched migrate
+    // plan). Re-selecting the same victim on every consecutive tick while
+    // its previous retract op is still in flight both spams scheduleRetract
+    // (already logged as racy under overlap scheduling -- see
+    // scheduleRetract's alloc_count-mismatch warning) and wastes cycles
+    // retracting a request whose local pages haven't actually moved yet.
+    // Track the last request id retracted this way and skip it once, giving
+    // the in-flight retract a tick to land before it becomes eligible again.
+    std::string last_xpool_proactive_retract_id_;
 
 private:
     PageAllocator device_allocator_;

@@ -103,6 +103,15 @@ TEST(XPoolCapacityTest, CapAndUncapRoundTrip) {
     EXPECT_EQ(alloc.AvailablePages(), before);
 }
 
+TEST(XPoolCapacityTest, ShrinkMarksTailPagesCapped) {
+    PageAllocator alloc(/*page_size=*/4, /*total_pages=*/16, /*dynamic=*/true);
+    RestoreFullBaseline(alloc);
+    ASSERT_TRUE(alloc.Shrink(4));
+    EXPECT_TRUE(alloc.IsPageCapped(12));
+    EXPECT_TRUE(alloc.IsPageCapped(15));
+    EXPECT_FALSE(alloc.IsPageCapped(11));
+}
+
 TEST(XPoolCapacityTest, StaticModeRejectsCapOperations) {
     PageAllocator alloc(/*page_size=*/4, /*total_pages=*/8, /*dynamic=*/false);
     EXPECT_THROW(alloc.CapPages({1}), std::runtime_error);

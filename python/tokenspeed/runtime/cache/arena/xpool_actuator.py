@@ -59,6 +59,12 @@ class FirePlan:
     # Raw C++ plan object kept so we can call scheduler.apply_xpool_fire after
     # the VMM ops complete (None for unit-test / stub plans).
     cpp_plan: Any = field(default=None, repr=False)
+    # S2.5-followup (early cap): set by maybe_execute() once the headroom
+    # check + prepare_*_fire tail-cap has already run synchronously on the
+    # main event-loop thread.  _do_vmm() must skip redoing that step and
+    # reuse prepare_us (the elapsed time already measured) instead.
+    already_prepared: bool = False
+    prepare_us: float = 0.0
 
 
 class XPoolActuator:
@@ -177,13 +183,29 @@ class XPoolActuator:
     def maybe_execute(self, plan: object) -> bool:
         """Actuate a budgeter plan unless it was already actuated.
 
+        S2.5-followup (early cap): the CPU-only headroom check and
+        ``prepare_*_fire`` tail-cap run synchronously here, on the calling
+        (main event-loop) thread, *before* the background drain+transfer
+        thread is even spawned.  Previously the tail-cap only took effect
+        once the background thread got scheduled and reached ``_do_vmm``,
+        which could be several event-loop iterations later under load —
+        during that gap ``NextExecutionPlan()`` keeps admitting new
+        requests, some of which land on the soon-to-be-unmapped tail pages
+        and extend the drain wait.  Capping immediately (same iteration as
+        the fire decision) closes that window: the very next
+        ``NextExecutionPlan()`` call already sees the capped tail and stops
+        admitting onto it, so ``_wait_drain()``'s later
+        ``torch.cuda.synchronize()`` has fewer additional in-flight kernels
+        to wait for.  This does not touch requests already using tail pages
+        before the cap -- those still drain naturally.
+
         Args:
             plan: any object exposing ``op_id`` (int), ``direction`` (str) and
                 ``page_ids`` (iterable of int) -- e.g. the C++ ``XPoolFirePlan``.
 
         Returns:
-            True if a new transfer was launched, False if the plan was a
-            duplicate of the previously actuated one.
+            True if a new transfer was launched or cancelled, False if the
+            plan was a duplicate of the previously actuated one.
         """
         op_id = int(plan.op_id)
         if op_id == self._last_op_id:
@@ -201,8 +223,126 @@ class XPoolActuator:
             fire_plan.direction,
             len(fire_plan.page_ids),
         )
+
+        prepare_us = self._check_and_prepare(fire_plan)
+        if prepare_us is None:
+            self._cancel_now(fire_plan)
+            return True
+
+        fire_plan.prepare_us = prepare_us
+        fire_plan.already_prepared = True
         self.execute_async(fire_plan)
         return True
+
+    def _cancel_now(self, plan: FirePlan) -> None:
+        """Cancel a fire whose prepare step failed before any background
+        thread or GPU work was ever dispatched (headroom exhausted or
+        ``prepare_*_fire`` raised).  Mirrors the cancel branch in
+        :meth:`_execute_locked` but runs synchronously on the caller's
+        thread since no VMM/drain work happened.
+        """
+        if self._scheduler is not None:
+            cancel_fn = getattr(self._scheduler, "cancel_xpool_fire", None)
+            if cancel_fn is not None:
+                try:
+                    cancel_fn()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "cancel_xpool_fire failed (op_id=%s): %s", plan.op_id, exc
+                    )
+        logger.info(
+            "XPool fire cancelled (prepare failed): op_id=%d direction=%s",
+            plan.op_id,
+            plan.direction,
+        )
+        if plan.direction == "kv_to_mamba":
+            self.cancelled_kv_to_mamba += 1
+        elif plan.direction == "mamba_to_kv":
+            self.cancelled_mamba_to_kv += 1
+
+    def _check_and_prepare(self, plan: FirePlan) -> float | None:
+        """CPU-only headroom check + C++ tail-cap (no GPU sync involved).
+
+        Safe to call synchronously from any thread: ``Shrink``/``SetCap`` on
+        the C++ side only moves an allocator boundary, it does not touch GPU
+        memory or wait on any kernel.
+
+        Returns:
+            Elapsed microseconds for the ``prepare_*_fire`` call (0.0 if
+            there is no scheduler or no such method, e.g. unit-test stubs),
+            or None if the fire must be cancelled: headroom is exhausted, or
+            the scheduler's ``prepare_*_fire`` call raised.
+        """
+        n_kv_pages = len(plan.page_ids)
+        n_mamba_chunks = self._kv_pages_to_mamba_chunks(n_kv_pages)
+        mamba_static = self._mamba_is_static()
+
+        if plan.direction == "mamba_to_kv":
+            if hasattr(self.kv_arena, "headroom_pages"):
+                kv_available = self.kv_arena.headroom_pages
+            else:
+                kv_available = getattr(self.kv_arena, "max_chunks", 0) - getattr(
+                    self.kv_arena, "mapped_chunks", 0
+                )
+            if kv_available < n_kv_pages:
+                logger.warning(
+                    "mamba_to_kv fire skipped (op_id=%d): kv arena headroom "
+                    "exhausted (headroom=%d pages, need %d pages)",
+                    plan.op_id,
+                    kv_available,
+                    n_kv_pages,
+                )
+                return None
+            if self._scheduler is not None:
+                prepare_fn = getattr(self._scheduler, "prepare_mamba_to_kv_fire", None)
+                if prepare_fn is not None:
+                    t0_ns = time.perf_counter_ns()
+                    try:
+                        prepare_fn(n_mamba_chunks)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "prepare_mamba_to_kv_fire failed (n=%d): %s",
+                            n_mamba_chunks,
+                            exc,
+                        )
+                        return None
+                    return (time.perf_counter_ns() - t0_ns) / 1000.0
+            return 0.0
+
+        elif plan.direction == "kv_to_mamba":
+            if not mamba_static:
+                mamba_available = getattr(self.mamba_arena, "max_chunks", 0) - getattr(
+                    self.mamba_arena, "mapped_chunks", 0
+                )
+                if mamba_available < n_mamba_chunks:
+                    logger.warning(
+                        "kv_to_mamba fire skipped (op_id=%d): mamba arena "
+                        "headroom exhausted (%d/%d mapped, need %d more "
+                        "chunks)",
+                        plan.op_id,
+                        getattr(self.mamba_arena, "mapped_chunks", "?"),
+                        getattr(self.mamba_arena, "max_chunks", "?"),
+                        n_mamba_chunks,
+                    )
+                    return None
+            if self._scheduler is not None:
+                prepare_fn = getattr(self._scheduler, "prepare_kv_to_mamba_fire", None)
+                if prepare_fn is not None:
+                    t0_ns = time.perf_counter_ns()
+                    try:
+                        prepare_fn(n_kv_pages)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "prepare_kv_to_mamba_fire failed (n=%d): %s",
+                            n_kv_pages,
+                            exc,
+                        )
+                        return None
+                    return (time.perf_counter_ns() - t0_ns) / 1000.0
+            return 0.0
+
+        else:
+            raise ValueError(f"unknown fire direction: {plan.direction}")
 
     def maybe_execute_migrate(self, plan: object) -> bool:
         """Stage-0 cross-pool migration: directed retraction of the best victim.
@@ -602,48 +742,20 @@ class XPoolActuator:
         use_transfer = self._kv_supports_handle_transfer()
         mamba_static = self._mamba_is_static()
 
-        if plan.direction == "mamba_to_kv":
-            # KvLayerArenaGroup exposes headroom_pages (in KV-page units) which
-            # already accounts for per-layer chunk → page conversion.  Fall back
-            # to the raw max_chunks/mapped_chunks difference for a plain
-            # ChunkArena (where 1 chunk ≈ 1 page in the caller's mapping).
-            if hasattr(self.kv_arena, "headroom_pages"):
-                kv_available = self.kv_arena.headroom_pages
-            else:
-                kv_available = getattr(self.kv_arena, "max_chunks", 0) - getattr(
-                    self.kv_arena, "mapped_chunks", 0
-                )
-            if kv_available < n_kv_pages:
-                logger.warning(
-                    "mamba_to_kv fire skipped (op_id=%d): kv arena headroom "
-                    "exhausted (headroom=%d pages, need %d pages)",
-                    plan.op_id,
-                    kv_available,
-                    n_kv_pages,
-                )
+        # S2.5-followup: maybe_execute() normally already ran the headroom
+        # check + prepare_*_fire tail-cap synchronously before dispatching
+        # here. Only redo it if that didn't happen (e.g. tests/tools that
+        # call _execute_locked/_do_vmm directly), so this stays a drop-in
+        # replacement for the pre-S2.5-followup behavior.
+        if plan.already_prepared:
+            breakdown[FIRE_BREAKDOWN_PREPARE] = plan.prepare_us
+        else:
+            prepare_us = self._check_and_prepare(plan)
+            if prepare_us is None:
                 return False, breakdown
+            breakdown[FIRE_BREAKDOWN_PREPARE] = prepare_us
 
-            # Shrink-and-drain: cap the tail mamba slots in C++ BEFORE unmap so
-            # no new allocations land on slots that are about to be transferred.
-            if self._scheduler is not None:
-                prepare_fn = getattr(self._scheduler, "prepare_mamba_to_kv_fire", None)
-                if prepare_fn is not None:
-                    t0_ns = time.perf_counter_ns()
-                    try:
-                        prepare_fn(n_mamba_chunks)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "prepare_mamba_to_kv_fire failed (n=%d): %s",
-                            n_mamba_chunks,
-                            exc,
-                        )
-                        breakdown[FIRE_BREAKDOWN_PREPARE] = (
-                            time.perf_counter_ns() - t0_ns
-                        ) / 1000.0
-                        return False, breakdown
-                    breakdown[FIRE_BREAKDOWN_PREPARE] = (
-                        time.perf_counter_ns() - t0_ns
-                    ) / 1000.0
+        if plan.direction == "mamba_to_kv":
             drain_poll_us, drain_sync_us = self._wait_drain("has_capped_mamba_inflight")
             breakdown[FIRE_BREAKDOWN_DRAIN_POLL] = drain_poll_us
             breakdown[FIRE_BREAKDOWN_DRAIN_SYNC] = drain_sync_us
@@ -700,41 +812,6 @@ class XPoolActuator:
             return True, breakdown
 
         elif plan.direction == "kv_to_mamba":
-            if not mamba_static:
-                mamba_available = getattr(self.mamba_arena, "max_chunks", 0) - getattr(
-                    self.mamba_arena, "mapped_chunks", 0
-                )
-                if mamba_available < n_mamba_chunks:
-                    logger.warning(
-                        "kv_to_mamba fire skipped (op_id=%d): mamba arena "
-                        "headroom exhausted (%d/%d mapped, need %d more "
-                        "chunks)",
-                        plan.op_id,
-                        getattr(self.mamba_arena, "mapped_chunks", "?"),
-                        getattr(self.mamba_arena, "max_chunks", "?"),
-                        n_mamba_chunks,
-                    )
-                    return False, breakdown
-
-            if self._scheduler is not None:
-                prepare_fn = getattr(self._scheduler, "prepare_kv_to_mamba_fire", None)
-                if prepare_fn is not None:
-                    t0_ns = time.perf_counter_ns()
-                    try:
-                        prepare_fn(n_kv_pages)
-                    except Exception as exc:  # noqa: BLE001
-                        breakdown[FIRE_BREAKDOWN_PREPARE] = (
-                            time.perf_counter_ns() - t0_ns
-                        ) / 1000.0
-                        logger.warning(
-                            "prepare_kv_to_mamba_fire failed (n=%d): %s",
-                            n_kv_pages,
-                            exc,
-                        )
-                        return False, breakdown
-                    breakdown[FIRE_BREAKDOWN_PREPARE] = (
-                        time.perf_counter_ns() - t0_ns
-                    ) / 1000.0
             drain_poll_us, drain_sync_us = self._wait_drain()
             breakdown[FIRE_BREAKDOWN_DRAIN_POLL] = drain_poll_us
             breakdown[FIRE_BREAKDOWN_DRAIN_SYNC] = drain_sync_us

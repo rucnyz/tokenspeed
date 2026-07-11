@@ -1,0 +1,20 @@
+{
+  "n_requests": 1638,
+  "n_finished": 1603,
+  "n_failed": 35,
+  "wall_seconds": 15319.277380186133,
+  "ttft_ms_p50": 3313.164289109409,
+  "ttft_ms_p90": 9778.18854385987,
+  "ttft_ms_p99": 23206.22262917459,
+  "ttft_ms_mean": 4514.088612944248,
+  "latency_ms_p50": 39589.35116697103,
+  "latency_ms_p99": 463142.4321383238,
+  "output_tokens_per_s": 65.38859341339435,
+  "prompt_tokens_total": 90091134,
+  "output_tokens_total": 1001706,
+  "cached_tokens_total": 32047040,
+  "cache_hit_ratio": 0.3557180221529901,
+  "preset": "base",
+  "trace": "dataset/claude-code-traces/traces/cc_qwen3p5_9b_clean.jsonl",
+  "model": "/scratch/yuzhou/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a"
+}

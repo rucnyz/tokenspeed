@@ -591,31 +591,44 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
     std::int32_t alloc_count =
         static_cast<std::int32_t>(full_paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages.size());
 
-    // Diagnostic only (no behavior change): `alloc_count` is expected to
-    // equal exactly the size of the request's local (uncommitted) KV
-    // allocator, since full_paged_tokens is conceptually
-    // prefix_pages ++ local_allocator_pages. A mismatch here means
-    // `prefix_pages` (walked from root via DevicePagesFromRoot) and
+    // `alloc_count` is expected to equal exactly the size of the request's
+    // local (uncommitted) KV allocator, since full_paged_tokens is
+    // conceptually prefix_pages ++ local_allocator_pages. A mismatch here
+    // means `prefix_pages` (walked from root via DevicePagesFromRoot) and
     // `full_paged_tokens`/`total_available` disagree about how much of the
-    // request's history is already shared in the tree. This has been
-    // suspected as the root cause of two related crashes under long-running
-    // stress: OwnedPages::TakeFirst throwing "count out of range" (plain LRU
+    // request's history is already shared in the tree -- this is the
+    // confirmed root cause of two related crashes under long-running stress:
+    // OwnedPages::TakeFirst throwing "count out of range" (plain LRU
     // eviction, no XPool) and a CUDA "illegal memory access" surfacing much
     // later in an unrelated KV-cache-write kernel (LRU eviction + XPool
-    // dynamic capacity, HiMA sys_lru ablation). Logging here — rather than
-    // clamping — until we have a confirmed repro, since silently clamping
-    // would desync full_paged_tokens/prefix_pages/alloc_pages sizes for the
-    // Insert() call below and could mask or worsen the corruption.
+    // dynamic capacity, HiMA sys_lru ablation). It got dramatically easier to
+    // repro once S2.5-followup-2's proactive retract started calling
+    // scheduleRetract() on nearly every scheduler tick instead of only via
+    // the rare S2.1 out-of-memory fallback or S2.6 migrate paths (see
+    // runs/hima_retract_three_arm_20260711*).
+    //
+    // Silently clamping alloc_count to local_available is *not* safe either:
+    // it would desync full_paged_tokens/prefix_pages/alloc_pages sizes for
+    // the Insert() call below (Insert() assumes
+    // full_paged_tokens.size() == prefix_pages.size() + alloc_pages.size())
+    // and could corrupt the radix tree instead of just this one request.
+    // Throw (rather than `return {}`) so newRetractOperation()'s catch block
+    // treats this as "try a different victim / retry next tick" and does
+    // *not* fall into the sibling "host capacity exhausted" branch, which
+    // would incorrectly abort a request that is otherwise perfectly healthy
+    // -- we haven't mutated any state yet (no TakeFirstPages/Insert call
+    // below this point), so throwing here is side-effect-free.
     const std::int32_t local_available =
         static_cast<std::int32_t>(request->GetLocalAllocatorPages().size());
     if (alloc_count != local_available) {
         spdlog::warn(
             "scheduleRetract: alloc_count mismatch for request {} "
             "(full_paged_tokens={} prefix_pages={} total_available={} "
-            "alloc_count={} local_available={}); proceeding with alloc_count "
-            "as computed -- this may throw or corrupt page ownership",
+            "alloc_count={} local_available={}); aborting this retract attempt "
+            "instead of risking page-ownership corruption",
             request->Id(), full_paged_tokens.size(), prefix_pages.size(), total_available, alloc_count,
             local_available);
+        throw std::runtime_error("scheduleRetract: alloc_count/local_available race, skipping this attempt");
     }
 
     // Skip when alloc_count <= 0: a prefix deeper than total_available would make TakeFirstPages negative.
@@ -680,18 +693,31 @@ std::optional<WriteBackOperation> Scheduler::applyEventAndGenerateOp(Request* re
 }
 
 std::optional<WriteBackOperation> Scheduler::newRetractOperation(Request* retract_request) {
-    if (auto event = scheduleRetract(retract_request)) {
-        if (auto op = applyEventAndGenerateOp(retract_request, std::move(*event))) {
-            return std::move(*op);
-        }
-    } else {
-        spdlog::warn("[Scheduler] Retract failed for request {}: host capacity exhausted, aborting request",
-                     retract_request->Id());
-        retract_request->Apply(fsm::AbortEvent{
+    // scheduleRetract()'s page accounting (full_paged_tokens vs. local
+    // allocator size) can race with concurrent overlap-scheduling mutations
+    // to the radix tree (see the alloc_count-mismatch warning it logs), and
+    // this has more than one caller: the S2.1 "device memory exhausted"
+    // fallback below, the S2.6 migrate path, and the S2.5-followup-2
+    // proactive-retract path in newXPoolCappedDrainRetractOperations(). Guard
+    // centrally here so every caller degrades to "skip this victim, retry
+    // next tick" instead of taking down the whole engine.
+    try {
+        if (auto event = scheduleRetract(retract_request)) {
+            if (auto op = applyEventAndGenerateOp(retract_request, std::move(*event))) {
+                return std::move(*op);
+            }
+        } else {
+            spdlog::warn("[Scheduler] Retract failed for request {}: host capacity exhausted, aborting request",
+                         retract_request->Id());
+            retract_request->Apply(fsm::AbortEvent{
 #if TOKENSPEED_FLAT_KVCACHE
-            &coordinator_
+                &coordinator_
 #endif
-        });
+            });
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("[Scheduler] newRetractOperation for request {} threw ({}); skipping this tick",
+                     retract_request->Id(), e.what());
     }
     return std::nullopt;
 }

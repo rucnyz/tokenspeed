@@ -72,6 +72,10 @@ public:
     // Zero means it is safe to physically unmap the shrunk region.
     std::int32_t CappedInflightSlots() const;
 
+    // True when slot_id sits in the tail-cap region or was individually marked
+    // capped (HiMA shrink-and-drain).
+    bool IsSlotCapped(std::int32_t slot_id) const;
+
     // Number of slots that have been physically mapped but not yet Grow()-ed
     // into allocatable range.  Used by the budgeter headroom check.
     std::int32_t HeadroomSlots() const { return total_slots_ - mapped_slots_; }

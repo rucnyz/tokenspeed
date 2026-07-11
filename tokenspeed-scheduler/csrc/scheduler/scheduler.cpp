@@ -435,6 +435,12 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     }
     std::erase_if(requests_, [](const auto& req) { return req.second->template Is<fsm::Finished>(); });
 
+    {
+        auto xpool_retract_ops = newXPoolCappedDrainRetractOperations();
+        write_back_ops.insert(write_back_ops.end(), std::make_move_iterator(xpool_retract_ops.begin()),
+                              std::make_move_iterator(xpool_retract_ops.end()));
+    }
+
     std::vector<Request*> candidates;
     for (auto& [id, req] : requests_) {
         if (!req->Is<fsm::Draining>() && !req->Is<fsm::Prefetching>() && !req->Is<fsm::Retracting>() &&
@@ -499,6 +505,97 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         check_device_mem();
     }
     return plan;
+}
+
+namespace {
+
+bool IsRetractableForwardRequest(const Request* req, Role role) {
+    if (req->Is<fsm::Retracting>() || req->Is<fsm::WritingBack>() || req->Is<fsm::Draining>() ||
+        req->Is<fsm::Prefetching>()) {
+        return false;
+    }
+    return req->Is<fsm::Decoding>() || (req->Is<fsm::PrefillDone>() && role != Role::kD);
+}
+
+std::int32_t CountCappedKvPages(const PageAllocator& alloc, const std::vector<std::int32_t>& pages) {
+    std::int32_t n = 0;
+    for (std::int32_t page_id : pages) {
+        if (alloc.IsPageCapped(page_id)) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+}  // namespace
+
+std::vector<WriteBackOperation> Scheduler::newXPoolCappedDrainRetractOperations() {
+    std::vector<WriteBackOperation> ops;
+    if (!config_.enable_xpool_dynamic_capacity) {
+        return ops;
+    }
+
+    Request* victim = nullptr;
+    std::int32_t best_score = 0;
+
+    if (HasCappedKvInflight()) {
+        for (const auto& [id, req] : requests_) {
+            if (id == last_xpool_proactive_retract_id_) {
+                // Give the previous tick's retract a chance to land before
+                // re-selecting the same request -- see header comment on
+                // last_xpool_proactive_retract_id_.
+                continue;
+            }
+            if (!IsRetractableForwardRequest(req.get(), config_.role)) {
+                continue;
+            }
+            // Only count capped pages in the request's *local* KV allocator.
+            // GetOccupiedPages() also walks radix-tree prefix pages that are
+            // shared and not movable via scheduleRetract's TakeFirstPages path.
+            // Using occupied pages as the score caused long-prefix decoders to be
+            // picked as victims even when alloc_count >> local_available, which
+            // triggers OwnedPages::TakeFirst "count out of range" under overlap
+            // scheduling (see runs/hima_retract_three_arm_20260711).
+            const std::int32_t score =
+                CountCappedKvPages(device_allocator_, req->GetLocalAllocatorPages());
+            if (score > best_score) {
+                best_score = score;
+                victim = req.get();
+            }
+        }
+    } else if (HasCappedMambaInflight() && mamba_allocator_) {
+        // Mamba slots live on radix-tree nodes; retracting the largest active
+        // decoder is the same heuristic as S2.6 BestMigrateCandidate.
+        for (const auto& [id, req] : requests_) {
+            if (id == last_xpool_proactive_retract_id_) {
+                continue;
+            }
+            if (!IsRetractableForwardRequest(req.get(), config_.role)) {
+                continue;
+            }
+            const std::int32_t score = req->TokenSize();
+            if (score > best_score) {
+                best_score = score;
+                victim = req.get();
+            }
+        }
+    } else {
+        // No capped inflight this tick: clear the cooldown so a request that
+        // legitimately needs retracting again later (new fire plan) isn't
+        // skipped forever.
+        last_xpool_proactive_retract_id_.clear();
+    }
+
+    if (victim != nullptr && best_score > 0) {
+        last_xpool_proactive_retract_id_ = victim->Id();
+        // newRetractOperation() guards scheduleRetract()'s races internally
+        // (see its comment) and returns nullopt on failure instead of
+        // throwing, so a missing op here just means "try again next tick".
+        if (auto op = newRetractOperation(victim)) {
+            ops.push_back(std::move(*op));
+        }
+    }
+    return ops;
 }
 
 void Scheduler::check_device_mem() {

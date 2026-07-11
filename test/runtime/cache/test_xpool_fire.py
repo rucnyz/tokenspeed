@@ -299,6 +299,100 @@ def test_maybe_execute_fires_new_op_id() -> None:
     assert fired == [1, 2]
 
 
+def test_maybe_execute_prepares_synchronously_before_dispatch() -> None:
+    """S2.5-followup (early cap): prepare_*_fire must run on the calling
+    (main event-loop) thread and complete *before* execute_async ever
+    dispatches the background drain+transfer work. This closes the gap
+    during which NextExecutionPlan() could keep admitting requests onto
+    the soon-to-be-unmapped tail pages.
+    """
+    kv = _KvArena(mapped_chunks=5, max_chunks=20)
+    mamba = _StaticMambaArena()
+    sched = _FakeScheduler()
+    actuator = XPoolActuator(kv_arena=kv, mamba_arena=mamba, scheduler=sched)
+
+    dispatched: list[FirePlan] = []
+    prepared_at_dispatch_time: list[list[tuple[str, int]]] = []
+
+    def _record_dispatch(plan: FirePlan) -> None:
+        dispatched.append(plan)
+        prepared_at_dispatch_time.append(list(sched.prepared))
+
+    actuator.execute_async = _record_dispatch  # type: ignore[method-assign]
+
+    cpp_plan = SimpleNamespace(op_id=5, direction="mamba_to_kv", page_ids=[1, 2])
+    assert actuator.maybe_execute(cpp_plan) is True
+
+    # prepare_*_fire already ran (and thus the tail is already capped)
+    # by the time execute_async is invoked -- not deferred to the
+    # background thread.
+    assert sched.prepared == [("mamba_to_kv", 2)]
+    assert prepared_at_dispatch_time == [[("mamba_to_kv", 2)]]
+    assert len(dispatched) == 1
+    assert dispatched[0].already_prepared is True
+    assert dispatched[0].prepare_us >= 0.0
+
+
+def test_maybe_execute_cancels_immediately_without_dispatch_when_headroom_exhausted() -> None:
+    """Headroom exhaustion must cancel synchronously on the caller's
+    thread -- no background thread or GPU work is ever dispatched."""
+    kv = _KvArena(mapped_chunks=20, max_chunks=20)  # no slack
+    mamba = _StaticMambaArena()
+    sched = _FakeScheduler()
+    actuator = XPoolActuator(kv_arena=kv, mamba_arena=mamba, scheduler=sched)
+
+    dispatched: list[FirePlan] = []
+    actuator.execute_async = lambda plan: dispatched.append(plan)  # type: ignore[method-assign]
+
+    cpp_plan = SimpleNamespace(op_id=9, direction="mamba_to_kv", page_ids=[1])
+    assert actuator.maybe_execute(cpp_plan) is True
+
+    assert dispatched == []  # never reached the background thread
+    assert sched.prepared == []  # prepare_*_fire never called either
+    assert sched.cancelled == 1
+    assert actuator.cancelled_mamba_to_kv == 1
+    # De-dup latch still advances so a retried identical op_id isn't re-fired.
+    assert actuator.maybe_execute(cpp_plan) is False
+
+
+def test_do_vmm_skips_prepare_when_already_prepared() -> None:
+    """_do_vmm must not redo prepare_*_fire when the plan says the early
+    cap already happened (S2.5-followup)."""
+    kv = _KvArena(mapped_chunks=5, max_chunks=20)
+    mamba = _StaticMambaArena()
+    sched = _FakeScheduler()
+    actuator = XPoolActuator(kv_arena=kv, mamba_arena=mamba, scheduler=sched)
+
+    plan = FirePlan(
+        direction="mamba_to_kv",
+        page_ids=[1, 2],
+        op_id=3,
+        already_prepared=True,
+        prepare_us=42.0,
+    )
+    committed, breakdown = actuator._do_vmm(plan)
+
+    assert committed is True
+    assert sched.prepared == []  # not called again
+    assert breakdown["prepare_us"] == 42.0
+    assert kv.calls == [("grow", 2)]
+
+
+def test_check_and_prepare_cancels_on_kv_to_mamba_headroom_exhausted() -> None:
+    """The kv_to_mamba headroom guard also runs inside _check_and_prepare
+    now, so it must reject before ever touching prepare_kv_to_mamba_fire."""
+    dynamic_mamba = SimpleNamespace(max_chunks=10, mapped_chunks=9)  # 1 slot free
+    sched = _FakeScheduler()
+    actuator = XPoolActuator(
+        kv_arena=_KvArena(), mamba_arena=dynamic_mamba, scheduler=sched
+    )
+    assert actuator._mamba_is_static() is False
+
+    plan = FirePlan(direction="kv_to_mamba", page_ids=[1, 2], op_id=4)
+    assert actuator._check_and_prepare(plan) is None
+    assert sched.prepared == []
+
+
 def test_static_mamba_signal_detection() -> None:
     """_mamba_is_static True iff arena.max_chunks == arena.mapped_chunks."""
     actuator = XPoolActuator(
