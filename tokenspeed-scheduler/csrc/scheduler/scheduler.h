@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -134,6 +135,10 @@ public:
     // HasCappedMambaInflight() polls until all capped slots are freed.
     void PrepareMambaToKvFire(std::int32_t n_mamba_slots);
     bool HasCappedMambaInflight() const;
+
+    // Record a wall-clock backoff for proactive retract after scheduleRetract
+    // page-accounting mismatch on this request (S2.5-followup-2).
+    void RecordXPoolProactiveRetractBackoff(const std::string& request_id);
 
     // Clears the pending fire latch WITHOUT updating allocator capacities.
     // Call this when the Python actuator decides to skip the physical VMM step
@@ -253,17 +258,16 @@ private:
     std::int32_t kv_pre_shrunk_pages_{0};
     std::int32_t mamba_pre_shrunk_slots_{0};
 
-    // S2.5-followup-2: proactive retract is issued from NextExecutionPlan(),
-    // which runs on every scheduler tick (far more often than the S2.6
-    // migrate path, which only fires once per budgeter-latched migrate
-    // plan). Re-selecting the same victim on every consecutive tick while
-    // its previous retract op is still in flight both spams scheduleRetract
-    // (already logged as racy under overlap scheduling -- see
-    // scheduleRetract's alloc_count-mismatch warning) and wastes cycles
-    // retracting a request whose local pages haven't actually moved yet.
-    // Track the last request id retracted this way and skip it once, giving
-    // the in-flight retract a tick to land before it becomes eligible again.
-    std::string last_xpool_proactive_retract_id_;
+    // S2.5-followup-2: proactive retract runs on every scheduler tick.
+    // After a scheduleRetract page-accounting mismatch (or a failed attempt),
+    // suppress re-selecting that request until wall-clock backoff expires.
+    // Duration reuses xpool_reverse_cooldown_s (same knob as fire direction
+    // thrash guard). Entries are pruned when capped inflight clears.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        xpool_proactive_retract_backoff_until_;
+
+    bool IsXPoolProactiveRetractInBackoff(const std::string& request_id) const;
+    void PruneExpiredXPoolProactiveRetractBackoff();
 
 private:
     PageAllocator device_allocator_;

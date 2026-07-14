@@ -149,6 +149,10 @@ struct SchedulerConfig {
     bool enable_xpool_dynamic_capacity{false};
     double budgeter_tick_s{1.0};
     std::int32_t budgeter_pages_per_fire{64};
+    // Admitter kv_to_mamba fire size (slots/pages moved per arrival fire).
+    // 0 auto-derives max(8, budgeter_pages_per_fire / 8) so arrival fires
+    // move meaningful capacity instead of the historical hard-coded 2.
+    std::int32_t admitter_mamba_need_slots{0};
     double xpool_ewma_tau_s{1.0};
     double xpool_nb_margin{0.05};
     std::int32_t xpool_mamba_floor_slots{32};

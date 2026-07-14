@@ -270,6 +270,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_xpool_dynamic_capacity", &tokenspeed::SchedulerConfig::enable_xpool_dynamic_capacity)
         .def_rw("budgeter_tick_s", &tokenspeed::SchedulerConfig::budgeter_tick_s)
         .def_rw("budgeter_pages_per_fire", &tokenspeed::SchedulerConfig::budgeter_pages_per_fire)
+        .def_rw("admitter_mamba_need_slots", &tokenspeed::SchedulerConfig::admitter_mamba_need_slots)
         .def_rw("xpool_ewma_tau_s", &tokenspeed::SchedulerConfig::xpool_ewma_tau_s)
         .def_rw("xpool_nb_margin", &tokenspeed::SchedulerConfig::xpool_nb_margin)
         .def_rw("xpool_mamba_floor_slots", &tokenspeed::SchedulerConfig::xpool_mamba_floor_slots)

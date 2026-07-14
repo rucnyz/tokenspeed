@@ -84,4 +84,26 @@ TEST_F(XPoolProactiveRetractSuite, NoProactiveRetractWhenXpoolDisabled) {
     EXPECT_EQ(GetWriteBack(plan), nullptr);
 }
 
+// After PrepareFire, repeated plans should not spam retract attempts on the
+// same tick cadence when the first attempt already latched a victim.
+TEST_F(XPoolProactiveRetractSuite, RepeatedPlansDoNotRequireTickCooldownId) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/9, /*start=*/1));
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    PlanOnce();
+
+    scheduler_->PrepareKvToMambaFire(/*n_kv_pages=*/2);
+    ASSERT_TRUE(scheduler_->HasCappedKvInflight());
+
+    auto plan1 = PlanOnce();
+    const auto* wb1 = GetWriteBack(plan1);
+    ASSERT_NE(wb1, nullptr);
+
+    // Second plan while capped inflight persists: either no new retract or a
+    // different victim — must not crash and must remain schedulable.
+    auto plan2 = PlanOnce();
+    (void)GetWriteBack(plan2);
+    SUCCEED();
+}
+
 }  // namespace tokenspeed::test

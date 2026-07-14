@@ -107,7 +107,11 @@ void BudgetAgent::OnRequestArrival(std::int32_t prompt_tokens, const PoolSnapsho
         ewma_pressure_mamba_ < config_.xpool_saturation_low) {
         return;
     }
-    auto decision = admitter_.DecideForRequest(prompt_tokens, snapshot);
+    std::int32_t mamba_need_slots = config_.admitter_mamba_need_slots;
+    if (mamba_need_slots <= 0) {
+        mamba_need_slots = std::max<std::int32_t>(8, config_.budgeter_pages_per_fire / 8);
+    }
+    auto decision = admitter_.DecideForRequest(prompt_tokens, snapshot, mamba_need_slots);
     if (decision.action == AdmitAction::kCrossFree || decision.action == AdmitAction::kCrossEvict) {
         XPoolFirePlan plan;
         plan.direction = decision.direction;

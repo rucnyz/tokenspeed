@@ -126,6 +126,7 @@ def make_config(
     enable_xpool_dynamic_capacity: bool = False,
     budgeter_tick_s: float = 1.0,
     budgeter_pages_per_fire: int = 64,
+    admitter_mamba_need_slots: int = 0,
     xpool_nb_margin: float = 0.05,
     xpool_ewma_tau_s: float = 1.0,
     xpool_saturation_low: float = 0.5,
@@ -187,6 +188,7 @@ def make_config(
     cfg.enable_xpool_dynamic_capacity = enable_xpool_dynamic_capacity
     cfg.budgeter_tick_s = budgeter_tick_s
     cfg.budgeter_pages_per_fire = budgeter_pages_per_fire
+    cfg.admitter_mamba_need_slots = admitter_mamba_need_slots
     cfg.xpool_nb_margin = xpool_nb_margin
     cfg.xpool_ewma_tau_s = xpool_ewma_tau_s
     cfg.xpool_saturation_low = xpool_saturation_low

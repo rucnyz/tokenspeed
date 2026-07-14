@@ -47,6 +47,7 @@
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
 #include "resource/eviction_config.h"
 #include "resource/radix_tree/radix_tree.h"
+#include "resource/radix_tree/node_range.h"
 #include "resource/radix_tree/tree_node.h"
 #include "scheduler/execution_event.h"
 #include "scheduler/operations/cache.h"
@@ -527,7 +528,76 @@ std::int32_t CountCappedKvPages(const PageAllocator& alloc, const std::vector<st
     return n;
 }
 
+// Cheap feasibility gate for proactive retract victim selection. Mirrors the
+// alloc_count/local_available invariant checked inside scheduleRetract() so we
+// do not spam the hot path with doomed TakeFirstPages attempts.
+bool IsProactiveRetractFeasible(const Request* request) {
+    const std::int32_t local_available =
+        static_cast<std::int32_t>(request->GetLocalAllocatorPages().size());
+    // Note: local_available == 0 is NOT excluded here. A request whose
+    // entire KV footprint is already committed to the tree (nothing left in
+    // its local allocator) is a legitimate scheduleRetract() candidate --
+    // it just means alloc_count == 0 == local_available, so scheduleRetract
+    // moves zero device pages and only handles the Mamba-slot side of the
+    // retract. This matters for the HasCappedMambaInflight victim-selection
+    // branch below, whose score (TokenSize()) is unrelated to local KV
+    // pages: excluding such requests here would make an otherwise-best
+    // Mamba victim permanently unselectable. The HasCappedKvInflight branch
+    // is unaffected since its score (CountCappedKvPages over local pages)
+    // is naturally 0 for these requests and never wins victim selection.
+    auto full_paged_tokens = request->GetFullPagedTokens(true);
+    std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(request->GetDeviceNode());
+    const std::int32_t total_available = static_cast<std::int32_t>(request->GetOccupiedPages().size());
+
+    if (total_available < static_cast<std::int32_t>(full_paged_tokens.size())) {
+        full_paged_tokens.resize(static_cast<std::size_t>(total_available));
+    }
+
+    const std::int32_t alloc_count = static_cast<std::int32_t>(full_paged_tokens.size()) -
+                                     static_cast<std::int32_t>(prefix_pages.size());
+    if (alloc_count == local_available) {
+        return true;
+    }
+
+    // scheduleRetract() never fabricates `prefix_pages` when it over-counts
+    // relative to token-derived full pages (doing so corrupts the shared
+    // tree, see the 2026-07-12 note in forward.cpp's scheduleRetract). The
+    // only other feasible case is the safe one: local_available > alloc_count,
+    // where scheduleRetract keeps the real prefix_pages and just takes fewer
+    // local pages this tick.
+    return local_available > alloc_count && alloc_count >= 0;
+}
+
 }  // namespace
+
+bool Scheduler::IsXPoolProactiveRetractInBackoff(const std::string& request_id) const {
+    const auto it = xpool_proactive_retract_backoff_until_.find(request_id);
+    if (it == xpool_proactive_retract_backoff_until_.end()) {
+        return false;
+    }
+    return std::chrono::steady_clock::now() < it->second;
+}
+
+void Scheduler::PruneExpiredXPoolProactiveRetractBackoff() {
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = xpool_proactive_retract_backoff_until_.begin();
+         it != xpool_proactive_retract_backoff_until_.end();) {
+        if (it->second <= now) {
+            it = xpool_proactive_retract_backoff_until_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void Scheduler::RecordXPoolProactiveRetractBackoff(const std::string& request_id) {
+    if (config_.xpool_reverse_cooldown_s <= 0.0) {
+        return;
+    }
+    const auto backoff = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(config_.xpool_reverse_cooldown_s));
+    xpool_proactive_retract_backoff_until_[request_id] = std::chrono::steady_clock::now() + backoff;
+}
 
 std::vector<WriteBackOperation> Scheduler::newXPoolCappedDrainRetractOperations() {
     std::vector<WriteBackOperation> ops;
@@ -539,14 +609,15 @@ std::vector<WriteBackOperation> Scheduler::newXPoolCappedDrainRetractOperations(
     std::int32_t best_score = 0;
 
     if (HasCappedKvInflight()) {
+        PruneExpiredXPoolProactiveRetractBackoff();
         for (const auto& [id, req] : requests_) {
-            if (id == last_xpool_proactive_retract_id_) {
-                // Give the previous tick's retract a chance to land before
-                // re-selecting the same request -- see header comment on
-                // last_xpool_proactive_retract_id_.
+            if (IsXPoolProactiveRetractInBackoff(id)) {
                 continue;
             }
             if (!IsRetractableForwardRequest(req.get(), config_.role)) {
+                continue;
+            }
+            if (!IsProactiveRetractFeasible(req.get())) {
                 continue;
             }
             // Only count capped pages in the request's *local* KV allocator.
@@ -566,11 +637,15 @@ std::vector<WriteBackOperation> Scheduler::newXPoolCappedDrainRetractOperations(
     } else if (HasCappedMambaInflight() && mamba_allocator_) {
         // Mamba slots live on radix-tree nodes; retracting the largest active
         // decoder is the same heuristic as S2.6 BestMigrateCandidate.
+        PruneExpiredXPoolProactiveRetractBackoff();
         for (const auto& [id, req] : requests_) {
-            if (id == last_xpool_proactive_retract_id_) {
+            if (IsXPoolProactiveRetractInBackoff(id)) {
                 continue;
             }
             if (!IsRetractableForwardRequest(req.get(), config_.role)) {
+                continue;
+            }
+            if (!IsProactiveRetractFeasible(req.get())) {
                 continue;
             }
             const std::int32_t score = req->TokenSize();
@@ -580,19 +655,19 @@ std::vector<WriteBackOperation> Scheduler::newXPoolCappedDrainRetractOperations(
             }
         }
     } else {
-        // No capped inflight this tick: clear the cooldown so a request that
-        // legitimately needs retracting again later (new fire plan) isn't
-        // skipped forever.
-        last_xpool_proactive_retract_id_.clear();
+        // No capped inflight this tick: drop stale backoff entries so a later
+        // fire plan can retry requests that were temporarily ineligible.
+        xpool_proactive_retract_backoff_until_.clear();
     }
 
     if (victim != nullptr && best_score > 0) {
-        last_xpool_proactive_retract_id_ = victim->Id();
         // newRetractOperation() guards scheduleRetract()'s races internally
         // (see its comment) and returns nullopt on failure instead of
         // throwing, so a missing op here just means "try again next tick".
         if (auto op = newRetractOperation(victim)) {
             ops.push_back(std::move(*op));
+        } else {
+            RecordXPoolProactiveRetractBackoff(victim->Id());
         }
     }
     return ops;

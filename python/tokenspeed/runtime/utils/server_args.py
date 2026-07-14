@@ -254,6 +254,9 @@ class ServerArgs:
     enable_xpool_dynamic_capacity: bool = False
     budgeter_tick_s: float = 1.0
     budgeter_pages_per_fire: int = 64
+    # Admitter kv_to_mamba slots per arrival fire. 0 auto-derives
+    # max(8, budgeter_pages_per_fire // 8).
+    admitter_mamba_need_slots: int = 0
     xpool_nb_margin: float = 0.05
     xpool_ewma_tau_s: float = 1.0
     # HiMA Phase 3 (S2.1): when both pools' EWMA pressure stay below this

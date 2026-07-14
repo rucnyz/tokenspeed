@@ -502,6 +502,7 @@ class EventLoop:
             enable_xpool_dynamic_capacity=server_args.enable_xpool_dynamic_capacity,
             budgeter_tick_s=server_args.budgeter_tick_s,
             budgeter_pages_per_fire=server_args.budgeter_pages_per_fire,
+            admitter_mamba_need_slots=server_args.admitter_mamba_need_slots,
             xpool_nb_margin=server_args.xpool_nb_margin,
             xpool_ewma_tau_s=server_args.xpool_ewma_tau_s,
             xpool_saturation_low=server_args.xpool_saturation_low,

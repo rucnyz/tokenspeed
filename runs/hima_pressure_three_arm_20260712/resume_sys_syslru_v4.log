@@ -1,0 +1,9 @@
+[resume] GPU3 free=143158MiB (>= 80000MiB)
+[resume] sys on GPU 3
+[resume] sys done exit=0
+[resume] GPU1 free=143158MiB (>= 80000MiB)
+[resume] sys_lru on GPU 1
+[resume] sys_lru done exit=0
+base tok/s 74.04 ttft_p90 15087 lat_p99 839451 n_failed 32
+sys tok/s 64.86 ttft_p90 14505 lat_p99 898467 n_failed 41
+sys_lru tok/s 65.33 ttft_p90 15912 lat_p99 923017 n_failed 38

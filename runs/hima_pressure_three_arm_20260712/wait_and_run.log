@@ -1,0 +1,7 @@
+[three_arm] waiting for pressure probe to exit
+[three_arm] GPU1 free=143158MiB (>= 80000MiB)
+[three_arm] base on GPU 1
+[three_arm] base done exit=0
+[three_arm] GPU3 free=143158MiB (>= 80000MiB)
+[three_arm] sys on GPU 3
+./scripts/wait_probe_then_three_arm.sh: line 40: 3476880 User defined signal 1   "${cmd[@]}" > "${OUT}/${sub}/rep0/run.log" 2>&1
