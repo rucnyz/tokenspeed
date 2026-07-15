@@ -64,6 +64,17 @@ OwnedPages PageAllocator::Allocate(std::int32_t num_pages) {
         for (std::int32_t i = 0; i < num_pages; ++i) {
             auto page = capped_free_list_.Allocate();
             if (!page.has_value()) {
+                // Partial failure: pages already popped this call must go back
+                // to the free list, otherwise they leak permanently (capacity
+                // silently shrinks every time an allocation request races the
+                // free list running dry or hitting an all-capped tail).  Each
+                // page here was just returned by capped_free_list_.Allocate(),
+                // which only ever hands out uncapped ids, so Deallocate() is
+                // guaranteed to push it back onto free_ids_ rather than
+                // treating it as a capped/drained page.
+                for (std::int32_t rolled_back : pages) {
+                    capped_free_list_.Deallocate(rolled_back);
+                }
                 return {};
             }
             pages.push_back(*page);

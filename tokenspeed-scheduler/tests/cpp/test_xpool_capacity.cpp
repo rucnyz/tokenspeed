@@ -112,6 +112,36 @@ TEST(XPoolCapacityTest, ShrinkMarksTailPagesCapped) {
     EXPECT_FALSE(alloc.IsPageCapped(11));
 }
 
+TEST(XPoolCapacityTest, AllocatePartialFailureDoesNotLeakPages) {
+    // Regression test: CappedFreeList::Allocate() pops (erases) a page id
+    // from free_ids_ before PageAllocator::Allocate() knows the whole request
+    // can be satisfied. If a later page in the same request turns out
+    // unavailable (all remaining free ids capped), the pages already popped
+    // this call must be rolled back into the free list — otherwise they leak
+    // permanently and AvailablePages()/free capacity silently shrink every
+    // time a request races the free list running dry.
+    PageAllocator alloc(/*page_size=*/4, /*total_pages=*/16, /*dynamic=*/true);
+    RestoreFullBaseline(alloc);
+    ASSERT_EQ(alloc.AvailablePages(), 15);
+
+    // Cap all but 3 pages so a request for more than 3 pages can only
+    // partially succeed before CappedFreeList::Allocate() starts returning
+    // nullopt (every remaining free id is capped).
+    alloc.CapPages({4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15});
+    ASSERT_EQ(alloc.AvailablePages(), 3);
+
+    // Requesting 5 pages must fail outright (only 3 uncapped pages exist),
+    // and must not silently consume any of the 3 uncapped pages doing so.
+    OwnedPages failed = alloc.Allocate(5);
+    EXPECT_TRUE(failed.Empty());
+    EXPECT_EQ(alloc.AvailablePages(), 3);
+
+    // The 3 pages must still be genuinely allocatable afterwards.
+    OwnedPages ok = alloc.Allocate(3);
+    EXPECT_EQ(ok.Size(), 3);
+    EXPECT_EQ(alloc.AvailablePages(), 0);
+}
+
 TEST(XPoolCapacityTest, StaticModeRejectsCapOperations) {
     PageAllocator alloc(/*page_size=*/4, /*total_pages=*/8, /*dynamic=*/false);
     EXPECT_THROW(alloc.CapPages({1}), std::runtime_error);

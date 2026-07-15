@@ -1,0 +1,371 @@
+2026-07-14 06:10:08,436 INFO tokenspeed.agentreplay: booting engine with preset=base
+[38;20m[2026-07-14 06:10:08,437 None] - INFO - Inferred world_size (1) from attn_tp_size (None) x attn_cp_size (1) x attn_dp_size (None) (server_args.py:499)[0m
+[38;20m[2026-07-14 06:10:08,437 None] - INFO - Parallelism configuration:
+Mapping(rank=?, world_size=1)
+  Cluster : 1 node(s) x 1 proc(s)
+  Attention: tp=1  cp=1  dp=1
+    Vision: tp=1
+  Dense   : tp=1  dp=1
+  MoE     : tp=1  ep=1  dp=1 (server_args.py:554)[0m
+[38;20m[2026-07-14 06:10:08,596 None] - INFO - EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured. (server_args.py:701)[0m
+[38;20m[2026-07-14 06:10:08,597 None] - INFO - server_args=ServerArgs(model='/scratch/yuzhou/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a', tokenizer='/scratch/yuzhou/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a', tokenizer_mode='auto', skip_tokenizer_init=False, load_format='auto', trust_remote_code=True, dtype='bfloat16', kv_cache_dtype='auto', kv_cache_quant_method='none', quantization=None, quantization_param_path=None, max_model_len=None, device='cuda', served_model_name='/scratch/yuzhou/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a', revision=None, language_model_only=False, host='127.0.0.1', port=11600, gpu_memory_utilization=0.88, max_num_seqs=160, max_total_tokens=1940000, chunked_prefill_size=8192, max_prefill_tokens=8192, enable_mixed_batch=False, block_size=64, mamba_ssm_dtype='float32', mamba_track_interval=256, max_mamba_cache_size=None, mamba_full_memory_ratio=0.15, enable_mamba_l2=False, mamba_l2_host_slots=0, mamba_l2_ratio=2.0, mamba_l2_layout='layer_first', mamba_l2_io_backend='kernel', mamba_l2_host_gb=0, stream_interval=1, stream_output=False, enable_inline_detokenizer=True, seed=275543549, distributed_timeout_seconds=None, download_dir=None, ext_yaml=None, base_gpu_id=2, gpu_id_step=1, log_level='error', log_level_http=None, enable_log_requests=False, log_requests_level=0, enable_metrics=False, decode_log_interval=40, metrics_reporters=None, app_key=None, api_key=None, enable_cache_report=False, kv_events_config=None, data_parallel_size=None, load_balance_method='shortest_queue', load_watch_interval=0.02, ep_size=1, init_expert_location='trivial', ep_num_redundant_experts=0, ep_dispatch_algorithm='static', eplb_algorithm='auto', expert_distribution_recorder_mode=None, expert_distribution_recorder_buffer_size=None, enable_expert_distribution_metrics=False, enable_eplb=False, moe_backend='auto', draft_moe_backend=None, all2all_backend='none', deepep_mode='auto', disable_flashinfer_cutlass_moe_fp4_allgather=False, enable_kvstore=True, kvstore_ratio=2.0, kvstore_size=0, kvstore_io_backend='kernel', kvstore_mem_layout='layer_first', kvstore_storage_backend=None, kvstore_storage_backend_extra_config=None, enable_mla_l1_5_cache=False, dist_init_addr=None, nnodes=1, node_rank=0, hf_overrides='{}', preferred_sampling_params=None, attention_backend='triton', drafter_attention_backend=None, sampling_backend='flashinfer', dp_sampling=False, dp_sampling_min_bs=None, attention_use_fp4_indexer_cache=None, use_trtllm_ragged_deepseek_prefill=None, deepseek_v4_mega_moe_max_num_tokens=0, deepseek_v4_indexer_prefill_max_logits_mb=512, deepseek_v4_prefill_chunk_size=4, grammar_backend='none', reasoning_parser=None, grammar_compile_timeout_secs=30.0, grammar_compile_max_retries=2, disable_any_whitespace=False, disable_capturable_grammar=False, draft_model_path_use_base=False, speculative_config=None, speculative_algorithm=None, speculative_draft_model_path=None, speculative_draft_model_quantization=None, speculative_num_steps=3, speculative_eagle_topk=1, speculative_num_draft_tokens=4, eagle3_layers_to_capture=None, enable_output_logprobs=False, disable_pdl=False, enable_prefix_caching=True, radix_eviction_policy='lru', lpb_window_s=60.0, lpb_hit_deque_maxlen=4096, csigma_kv_alpha=1.02e-07, csigma_kv_beta=0.0246, csigma_kv_gamma=5.97, csigma_m=0.0, enable_budgeter=False, enable_admitter=False, enable_xpool_dynamic_capacity=False, budgeter_tick_s=1.0, budgeter_pages_per_fire=64, admitter_mamba_need_slots=0, xpool_nb_margin=0.05, xpool_ewma_tau_s=1.0, xpool_saturation_low=0.5, xpool_reverse_cooldown_s=2.0, xpool_mamba_headroom_slots=0, xpool_w_queue=0.0, xpool_w_retract=0.0, xpool_w_paused=0.0, xpool_queue_ref=0, xpool_retract_ref=0, xpool_paused_ref=0, enable_dynamic_admission_cap=False, disable_kvstore=False, enforce_eager=False, disable_cuda_graph_padding=False, enable_cudagraph_gc=False, enable_nccl_nvls=False, enable_symm_mem=False, disable_custom_all_reduce=False, disable_overlap_schedule=False, disable_tf32=False, force_deterministic_rsag=False, disable_sampling_tp_sync=False, low_latency_max_num_tokens_per_gpu=256, max_cudagraph_capture_size=160, disable_prefill_graph=False, prefill_graph_max_tokens=128, cudagraph_capture_sizes=None, enable_nan_detection=False, enable_nvtx=False, enable_p2p_check=False, triton_attention_reduce_in_fp32=False, delete_ckpt_after_loading=False, weight_loader_prefetch_checkpoints=False, weight_loader_prefetch_num_threads=4, enable_memory_saver=False, enable_custom_logit_processor=False, mla_disable_ragged=False, warmups=None, nprocs_per_node=None, world_size=None, attn_tp_size=None, dense_tp_size=None, moe_tp_size=None, mapping=Mapping(rank=?, world_size=1)
+  Cluster : 1 node(s) x 1 proc(s)
+  Attention: tp=1  cp=1  dp=1
+    Vision: tp=1
+  Dense   : tp=1  dp=1
+  MoE     : tp=1  ep=1  dp=1, mla_chunk_multiplier=4, mm_attention_backend=None, disaggregation_mode='null', disaggregation_bootstrap_port=8998, disaggregation_transfer_backend='mooncake', disaggregation_ib_device=None, disaggregation_layerwise_interval=1, pdlb_url=None, skip_server_warmup=False, comm_fusion_max_num_tokens=2048, enable_allreduce_fusion=False, enable_expert_parallel=False) (engine.py:130)[0m
+/data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/transformers/modeling_rope_utils.py:1036: FutureWarning: `rope_config_validation` is deprecated and has been removed. Its functionality has been moved to RotaryEmbeddingConfigMixin.validate_rope method. PreTrainedConfig inherits this class, so please call self.validate_rope() instead. Also, make sure to use the new rope_parameters syntax. You can call self.standardize_rope_params() in the meantime.
+  warnings.warn(
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_interleaved', 'mrope_section'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_interleaved', 'mrope_section'}
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+/data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/transformers/modeling_rope_utils.py:1036: FutureWarning: `rope_config_validation` is deprecated and has been removed. Its functionality has been moved to RotaryEmbeddingConfigMixin.validate_rope method. PreTrainedConfig inherits this class, so please call self.validate_rope() instead. Also, make sure to use the new rope_parameters syntax. You can call self.standardize_rope_params() in the meantime.
+  warnings.warn(
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_section', 'mrope_interleaved'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_section', 'mrope_interleaved'}
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[W714 06:10:16.674991571 ProcessGroupNCCL.cpp:932] Warning: TORCH_NCCL_AVOID_RECORD_STREAMS is the default now, this environment variable is thus deprecated. (function operator())
+Loading safetensors checkpoint shards:   0% Completed | 0/4 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:  25% Completed | 1/4 [00:00<00:02,  1.12it/s]
+Loading safetensors checkpoint shards:  50% Completed | 2/4 [00:01<00:01,  1.11it/s]
+Loading safetensors checkpoint shards:  75% Completed | 3/4 [00:02<00:00,  1.32it/s]
+Loading safetensors checkpoint shards: 100% Completed | 4/4 [00:03<00:00,  1.26it/s]
+Loading safetensors checkpoint shards: 100% Completed | 4/4 [00:03<00:00,  1.24it/s]
+
+  0%|          | 0/23 [00:00<?, ?it/s]Capturing batches (bs=1 avail_mem=48.26 GB):   0%|          | 0/23 [00:00<?, ?it/s]/data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+[rank0]:[W714 06:10:20.967324864 ProcessGroupNCCL.cpp:5188] Guessing device ID based on global rank. This can cause a hang if rank to GPU mapping is heterogeneous. You can specify device_id in init_process_group()
+/data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+Capturing batches (bs=1 avail_mem=48.26 GB):   4%|▍         | 1/23 [00:03<01:21,  3.69s/it]Capturing batches (bs=2 avail_mem=48.12 GB):   4%|▍         | 1/23 [00:03<01:21,  3.69s/it]/data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+Capturing batches (bs=2 avail_mem=48.12 GB):   9%|▊         | 2/23 [00:04<00:38,  1.82s/it]Capturing batches (bs=4 avail_mem=48.10 GB):   9%|▊         | 2/23 [00:04<00:38,  1.82s/it]Capturing batches (bs=4 avail_mem=48.10 GB):  13%|█▎        | 3/23 [00:04<00:20,  1.04s/it]Capturing batches (bs=8 avail_mem=48.10 GB):  13%|█▎        | 3/23 [00:04<00:20,  1.04s/it]Capturing batches (bs=8 avail_mem=48.10 GB):  17%|█▋        | 4/23 [00:04<00:12,  1.49it/s]Capturing batches (bs=16 avail_mem=48.10 GB):  17%|█▋        | 4/23 [00:04<00:12,  1.49it/s]Capturing batches (bs=16 avail_mem=48.10 GB):  22%|██▏       | 5/23 [00:04<00:08,  2.12it/s]Capturing batches (bs=24 avail_mem=48.08 GB):  22%|██▏       | 5/23 [00:04<00:08,  2.12it/s]Capturing batches (bs=24 avail_mem=48.08 GB):  26%|██▌       | 6/23 [00:04<00:05,  2.84it/s]Capturing batches (bs=32 avail_mem=48.06 GB):  26%|██▌       | 6/23 [00:04<00:05,  2.84it/s]Capturing batches (bs=32 avail_mem=48.06 GB):  30%|███       | 7/23 [00:04<00:04,  3.63it/s]Capturing batches (bs=40 avail_mem=48.02 GB):  30%|███       | 7/23 [00:04<00:04,  3.63it/s]Capturing batches (bs=40 avail_mem=48.02 GB):  35%|███▍      | 8/23 [00:04<00:03,  4.41it/s]Capturing batches (bs=48 avail_mem=47.99 GB):  35%|███▍      | 8/23 [00:04<00:03,  4.41it/s]Capturing batches (bs=48 avail_mem=47.99 GB):  39%|███▉      | 9/23 [00:05<00:03,  4.43it/s]Capturing batches (bs=56 avail_mem=47.94 GB):  39%|███▉      | 9/23 [00:05<00:03,  4.43it/s]Capturing batches (bs=56 avail_mem=47.94 GB):  43%|████▎     | 10/23 [00:05<00:02,  5.06it/s]Capturing batches (bs=64 avail_mem=47.89 GB):  43%|████▎     | 10/23 [00:05<00:02,  5.06it/s]Capturing batches (bs=64 avail_mem=47.89 GB):  48%|████▊     | 11/23 [00:05<00:02,  5.78it/s]Capturing batches (bs=72 avail_mem=47.83 GB):  48%|████▊     | 11/23 [00:05<00:02,  5.78it/s]Capturing batches (bs=72 avail_mem=47.83 GB):  52%|█████▏    | 12/23 [00:05<00:01,  6.37it/s]Capturing batches (bs=80 avail_mem=47.76 GB):  52%|█████▏    | 12/23 [00:05<00:01,  6.37it/s]Capturing batches (bs=80 avail_mem=47.76 GB):  57%|█████▋    | 13/23 [00:05<00:01,  6.87it/s]Capturing batches (bs=88 avail_mem=47.68 GB):  57%|█████▋    | 13/23 [00:05<00:01,  6.87it/s]Capturing batches (bs=88 avail_mem=47.68 GB):  61%|██████    | 14/23 [00:05<00:01,  7.18it/s]Capturing batches (bs=96 avail_mem=47.59 GB):  61%|██████    | 14/23 [00:05<00:01,  7.18it/s]Capturing batches (bs=96 avail_mem=47.59 GB):  65%|██████▌   | 15/23 [00:05<00:01,  7.54it/s]Capturing batches (bs=104 avail_mem=47.50 GB):  65%|██████▌   | 15/23 [00:05<00:01,  7.54it/s]Capturing batches (bs=104 avail_mem=47.50 GB):  70%|██████▉   | 16/23 [00:05<00:00,  7.83it/s]Capturing batches (bs=112 avail_mem=47.41 GB):  70%|██████▉   | 16/23 [00:05<00:00,  7.83it/s]Capturing batches (bs=112 avail_mem=47.41 GB):  74%|███████▍  | 17/23 [00:06<00:00,  8.01it/s]Capturing batches (bs=120 avail_mem=47.30 GB):  74%|███████▍  | 17/23 [00:06<00:00,  8.01it/s]Capturing batches (bs=120 avail_mem=47.30 GB):  78%|███████▊  | 18/23 [00:06<00:00,  8.16it/s]Capturing batches (bs=128 avail_mem=47.18 GB):  78%|███████▊  | 18/23 [00:06<00:00,  8.16it/s]Capturing batches (bs=128 avail_mem=47.18 GB):  83%|████████▎ | 19/23 [00:06<00:00,  8.38it/s]Capturing batches (bs=136 avail_mem=47.06 GB):  83%|████████▎ | 19/23 [00:06<00:00,  8.38it/s]Capturing batches (bs=136 avail_mem=47.06 GB):  87%|████████▋ | 20/23 [00:06<00:00,  8.30it/s]Capturing batches (bs=144 avail_mem=46.93 GB):  87%|████████▋ | 20/23 [00:06<00:00,  8.30it/s]Capturing batches (bs=144 avail_mem=46.93 GB):  91%|█████████▏| 21/23 [00:06<00:00,  8.45it/s]Capturing batches (bs=152 avail_mem=46.80 GB):  91%|█████████▏| 21/23 [00:06<00:00,  8.45it/s]Capturing batches (bs=152 avail_mem=46.80 GB):  96%|█████████▌| 22/23 [00:06<00:00,  8.41it/s]Capturing batches (bs=160 avail_mem=46.65 GB):  96%|█████████▌| 22/23 [00:06<00:00,  8.41it/s]Capturing batches (bs=160 avail_mem=46.65 GB): 100%|██████████| 23/23 [00:06<00:00,  8.50it/s]Capturing batches (bs=160 avail_mem=46.65 GB): 100%|██████████| 23/23 [00:06<00:00,  3.39it/s]
+[2026-07-14 06:34:43] Received output for rid='ff1d4bd580a346c4abac4756b02a3886' but the state was deleted in AsyncLLM.
+[2026-07-14 07:16:15] Received output for rid='2a777bd9d18141c49595193c85daa0c0' but the state was deleted in AsyncLLM.
+[2026-07-14 07:50:21] Received output for rid='0272182ac113481ea11590277aeb8949' but the state was deleted in AsyncLLM.
+[2026-07-14 08:09:41.150] [warning] scheduleRetract: alloc_count mismatch for request 2a5dff1884e6499d985be754ba0f817c (full_paged_tokens=1890 prefix_pages=1890 total_available=1891 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 08:11:59.219] [warning] FinishEvent: alloc_count (1641) exceeds local allocator page count (6); skipping prefix-cache publish for this request
+[2026-07-14 08:24:40.857] [warning] scheduleRetract: alloc_count mismatch for request 3eabab4d45514938ade079f3dbe053dc (full_paged_tokens=1944 prefix_pages=1944 total_available=1945 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 08:28:14.571] [warning] FinishEvent: alloc_count (1702) exceeds local allocator page count (9); skipping prefix-cache publish for this request
+[2026-07-14 08:32:05] Received output for rid='5762c23fb0bd4dd5b56d2aa95b51d2ba' but the state was deleted in AsyncLLM.
+[2026-07-14 08:38:24] Received output for rid='226f7b7592b9468c984bea48220b8a7f' but the state was deleted in AsyncLLM.
+[2026-07-14 08:42:23] Received output for rid='6bc07a882c324c76ba02cbfbf5259b00' but the state was deleted in AsyncLLM.
+[2026-07-14 08:50:23] Received output for rid='efa8a5403eca4bf8847ec73922e0abeb' but the state was deleted in AsyncLLM.
+[2026-07-14 08:53:07] Received output for rid='5389d8a0bb5a41c2bdb4a470937db5f2' but the state was deleted in AsyncLLM.
+[2026-07-14 09:01:26] Received output for rid='34b739a72b9144f588884ca8d7e8b8d2' but the state was deleted in AsyncLLM.
+[2026-07-14 09:09:23] Received output for rid='60941b68d9e54b4aacbc1ead8be7df99' but the state was deleted in AsyncLLM.
+[2026-07-14 09:14:21.559] [warning] scheduleRetract: alloc_count mismatch for request a8eca360027742a3872d9e1e09a9d85c (full_paged_tokens=2105 prefix_pages=2105 total_available=2106 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 09:14:21.674] [warning] scheduleRetract: alloc_count mismatch for request 43fb84745c2341abb4e49fcfe34e7b38 (full_paged_tokens=1920 prefix_pages=1920 total_available=1921 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 09:14:39] Received output for rid='b4dd6839a876450eb939d1e06f4a69b8' but the state was deleted in AsyncLLM.
+[2026-07-14 09:14:59.452] [warning] FinishEvent: alloc_count (1856) exceeds local allocator page count (2); skipping prefix-cache publish for this request
+[2026-07-14 09:23:32.090] [warning] FinishEvent: alloc_count (1690) exceeds local allocator page count (21); skipping prefix-cache publish for this request
+[2026-07-14 09:31:09] Received output for rid='522afb6a01de43c1b393d24e7e898fa1' but the state was deleted in AsyncLLM.
+[2026-07-14 09:33:57] Received output for rid='052f9c73cf994a51b717c2ee0b0728c7' but the state was deleted in AsyncLLM.
+[2026-07-14 09:34:04] Received output for rid='644a3bc1e92e43378103df03b441d3ce' but the state was deleted in AsyncLLM.
+[2026-07-14 09:36:18] Received output for rid='0a45f1211a0b424fa22fee8108a14274' but the state was deleted in AsyncLLM.
+[2026-07-14 09:41:08] Received output for rid='a5ccdb92a44e48019a28b5012e9aaa37' but the state was deleted in AsyncLLM.
+[2026-07-14 09:41:48] Received output for rid='66652c0fe47346778a92747ff5948ad8' but the state was deleted in AsyncLLM.
+[2026-07-14 09:45:49] Received output for rid='a74c3a06815f47498b3b2a319a0cf465' but the state was deleted in AsyncLLM.
+[2026-07-14 09:47:23] Received output for rid='2b8d052ae53745b39d25a229c1961b11' but the state was deleted in AsyncLLM.
+[2026-07-14 09:48:38] Received output for rid='b69263f5427941629ae99af67c7d0f03' but the state was deleted in AsyncLLM.
+[2026-07-14 09:51:07] Received output for rid='297caa0360bb464cb9d686a4422f6a8b' but the state was deleted in AsyncLLM.
+[2026-07-14 09:53:20] Received output for rid='fb2957be77a34557b4432c06210cfc1e' but the state was deleted in AsyncLLM.
+[2026-07-14 09:56:23] Received output for rid='a50f9b84ebd64c0dadfde92ad4764046' but the state was deleted in AsyncLLM.
+[2026-07-14 09:58:16] Received output for rid='4347f71411e04cf7a4ad0f39248b1a4a' but the state was deleted in AsyncLLM.
+[2026-07-14 09:58:34] Received output for rid='1a8f3356d3204311be35f175ae40437c' but the state was deleted in AsyncLLM.
+[2026-07-14 10:00:46] Received output for rid='6629d7af92aa44668ebe814fc083be53' but the state was deleted in AsyncLLM.
+[2026-07-14 10:00:46] Received output for rid='66a2284798e1475ba399d7ca60a45363' but the state was deleted in AsyncLLM.
+[2026-07-14 10:04:47] Received output for rid='b07021f4fc044969af9df31f35c01c94' but the state was deleted in AsyncLLM.
+[2026-07-14 10:05:24.342] [warning] scheduleRetract: alloc_count mismatch for request b0b35cee291f4dae9588a61e07089849 (full_paged_tokens=2123 prefix_pages=2123 total_available=2124 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 10:05:24.506] [warning] scheduleRetract: alloc_count mismatch for request 5d3685fc8b3546e99e5293897a24be7f (full_paged_tokens=1803 prefix_pages=1803 total_available=1804 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 10:05:35] Received output for rid='d94ba2a31ed24b268e3bd5ce9e4f845d' but the state was deleted in AsyncLLM.
+[2026-07-14 10:06:02] Received output for rid='5a0e2d1b89984cc39203b999ccc14b45' but the state was deleted in AsyncLLM.
+[2026-07-14 10:06:55] Received output for rid='a50c1ea7573343549fbb117fa76106cf' but the state was deleted in AsyncLLM.
+[2026-07-14 10:15:43] Received output for rid='99219d4c00ed49e091cf9a3124e1783d' but the state was deleted in AsyncLLM.
+[2026-07-14 10:18:34] Received output for rid='15e2c534205147f8a211fb15e761032e' but the state was deleted in AsyncLLM.
+[2026-07-14 10:20:41] Received output for rid='12385237d5cc48d59e3a3a77bed58e9e' but the state was deleted in AsyncLLM.
+[2026-07-14 10:20:50.288] [warning] FinishEvent: alloc_count (1266) exceeds local allocator page count (14); skipping prefix-cache publish for this request
+[2026-07-14 10:23:39] Received output for rid='5d3685fc8b3546e99e5293897a24be7f' but the state was deleted in AsyncLLM.
+[2026-07-14 10:23:39.488] [warning] FinishEvent: alloc_count (169) exceeds local allocator page count (28); skipping prefix-cache publish for this request
+[2026-07-14 10:29:14] Received output for rid='16ec985638f34d61a6d0c10f1f85d336' but the state was deleted in AsyncLLM.
+[2026-07-14 10:31:09] Received output for rid='ffb4eaa0bc1649189fa04ab6d4f13927' but the state was deleted in AsyncLLM.
+[2026-07-14 10:33:13] Received output for rid='7f72c3d9e5634d4d9d74b2aef11cfe22' but the state was deleted in AsyncLLM.
+[2026-07-14 10:35:38.700] [warning] scheduleRetract: alloc_count mismatch for request 22d84fea129942c0953d1674af686eac (full_paged_tokens=1808 prefix_pages=1808 total_available=1809 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 10:37:13] Received output for rid='64b374bc0d414a7e9fb9adb05332e946' but the state was deleted in AsyncLLM.
+[2026-07-14 10:37:24.129] [warning] FinishEvent: alloc_count (230) exceeds local allocator page count (5); skipping prefix-cache publish for this request
+[2026-07-14 10:37:24] Received output for rid='610d02f0628f4ce0bc86867f65d66a63' but the state was deleted in AsyncLLM.
+[2026-07-14 10:50:32] Received output for rid='80a3de219d2a4828808ed8b6a3b88a23' but the state was deleted in AsyncLLM.
+[2026-07-14 10:54:15] Received output for rid='d47f6337c2ae47da8a2df105dae14cb6' but the state was deleted in AsyncLLM.
+[2026-07-14 10:54:30] Received output for rid='a21208a965bb4358bedf7b540d64d6e1' but the state was deleted in AsyncLLM.
+[2026-07-14 10:57:01] Received output for rid='6e9d9faad46b4715996499b31e596202' but the state was deleted in AsyncLLM.
+[2026-07-14 10:59:12.893] [warning] scheduleRetract: alloc_count mismatch for request 688e53882b4f47e8a3e17e6bfd4873f8 (full_paged_tokens=1725 prefix_pages=1725 total_available=1726 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 11:00:46] Received output for rid='492c7ac179cf471fa13c0c8a18d6365e' but the state was deleted in AsyncLLM.
+[2026-07-14 11:01:07.299] [warning] FinishEvent: alloc_count (221) exceeds local allocator page count (5); skipping prefix-cache publish for this request
+[2026-07-14 11:01:48] Received output for rid='5907711c650c42e896ba2755869067db' but the state was deleted in AsyncLLM.
+[2026-07-14 11:02:55] Received output for rid='86bd4e65f9a24045b59c0ddc115225ba' but the state was deleted in AsyncLLM.
+[2026-07-14 11:05:50] Received output for rid='84699ca45f17440798c1ad926bb54707' but the state was deleted in AsyncLLM.
+[2026-07-14 11:08:37] Received output for rid='3f78e57897764a3bb16bc7c38d96c9eb' but the state was deleted in AsyncLLM.
+[2026-07-14 11:10:17] Received output for rid='5240e062cd4d4efb981720f7c962822b' but the state was deleted in AsyncLLM.
+[2026-07-14 11:14:30] Received output for rid='63b57fee59a345deac78827143fea4d1' but the state was deleted in AsyncLLM.
+[2026-07-14 11:18:56] Received output for rid='831ad735d68a44e4956eba637276e4a4' but the state was deleted in AsyncLLM.
+[2026-07-14 11:20:46] Received output for rid='5c470ef3b85f42ae824c881a4f17a53a' but the state was deleted in AsyncLLM.
+[2026-07-14 11:21:48] Received output for rid='d907c68ee40c49d8ab1169601bb930a8' but the state was deleted in AsyncLLM.
+[2026-07-14 11:23:23] Received output for rid='6c725bc01e6e4169bc3e75a0ce7916fe' but the state was deleted in AsyncLLM.
+[2026-07-14 11:24:38.705] [warning] scheduleRetract: alloc_count mismatch for request 272263fa89ad4c179e1826d12d6a0d5d (full_paged_tokens=1893 prefix_pages=1893 total_available=1894 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 11:24:39.002] [warning] scheduleRetract: alloc_count mismatch for request 725a94e82d564974872287ee90cd190e (full_paged_tokens=1871 prefix_pages=1871 total_available=1872 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 11:26:38.006] [warning] FinishEvent: alloc_count (1647) exceeds local allocator page count (5); skipping prefix-cache publish for this request
+[2026-07-14 11:27:00] Received output for rid='3e1071b2570041178e29baff28540f76' but the state was deleted in AsyncLLM.
+[2026-07-14 11:28:34] Received output for rid='725a94e82d564974872287ee90cd190e' but the state was deleted in AsyncLLM.
+[2026-07-14 11:28:34.481] [warning] FinishEvent: alloc_count (211) exceeds local allocator page count (8); skipping prefix-cache publish for this request
+[2026-07-14 11:32:31] Received output for rid='5887bb7ebba346d6ba424656987b9a45' but the state was deleted in AsyncLLM.
+[2026-07-14 11:33:02] Received output for rid='2e52bf5598ec4997ba8b2bc6ba01cc60' but the state was deleted in AsyncLLM.
+[2026-07-14 11:34:50] Received output for rid='a89121142b79447daabab1be8410cbd3' but the state was deleted in AsyncLLM.
+[2026-07-14 11:37:11] Received output for rid='4c1d82640e584194b2c057304137ef3d' but the state was deleted in AsyncLLM.
+[2026-07-14 11:37:48] Received output for rid='1e82b6723f2b4530bbc6c5efc3304fbf' but the state was deleted in AsyncLLM.
+[2026-07-14 11:39:13] Received output for rid='bc523048d35e4654a579c93845d81283' but the state was deleted in AsyncLLM.
+[2026-07-14 11:40:09] Received output for rid='74e3664f5b254f41a21db18fe872a93c' but the state was deleted in AsyncLLM.
+[2026-07-14 11:40:39] Received output for rid='84a1788212c64e1c9b24042c2200094e' but the state was deleted in AsyncLLM.
+[2026-07-14 11:41:48] Received output for rid='4902e3dc7d0b4bd991c9982ea5631c66' but the state was deleted in AsyncLLM.
+[2026-07-14 11:41:56] Received output for rid='7679574704fe4a009568c0e0c1ed28b7' but the state was deleted in AsyncLLM.
+[2026-07-14 11:48:19] Received output for rid='8ba5f8107ad845658a9b168c9b41f185' but the state was deleted in AsyncLLM.
+[2026-07-14 11:50:36] Received output for rid='36e99254de4147a7bb80ef9a62e6ddd7' but the state was deleted in AsyncLLM.
+[2026-07-14 11:51:20] Received output for rid='2c012bb3134942a2aa6712755c70f395' but the state was deleted in AsyncLLM.
+[2026-07-14 11:53:11] Received output for rid='08d5d1bfd2224308a03b2391662dbed3' but the state was deleted in AsyncLLM.
+[2026-07-14 11:54:14] Received output for rid='2c2f2bc46685444c9f28f786882718cb' but the state was deleted in AsyncLLM.
+[2026-07-14 11:55:11] Received output for rid='6036c9c3f0984d1f83c8fde41ad4b39d' but the state was deleted in AsyncLLM.
+[2026-07-14 11:57:17] Received output for rid='8bfd0f0754f0433e903c0e35c258f004' but the state was deleted in AsyncLLM.
+[2026-07-14 11:57:32] Received output for rid='fbc82ecff99a482e8377037af22e38c5' but the state was deleted in AsyncLLM.
+[2026-07-14 12:00:23] Received output for rid='8e8fff9deb6e4be48e651397c1a77550' but the state was deleted in AsyncLLM.
+[2026-07-14 12:01:48] Received output for rid='106cc21a68b8437eaa42c522db80fdf8' but the state was deleted in AsyncLLM.
+[2026-07-14 12:03:32] Received output for rid='ae08ec67c6e84475b1c27528286bf864' but the state was deleted in AsyncLLM.
+[2026-07-14 12:07:15] Received output for rid='0bf39ab63eb94522b7bf26f14d1311b5' but the state was deleted in AsyncLLM.
+[2026-07-14 12:07:44] Received output for rid='33e8e75a9cc34a059d13fe2c4f3fbbed' but the state was deleted in AsyncLLM.
+[2026-07-14 12:08:19] Received output for rid='bfe7e84dd11f48feb30b8f9a3bce80d8' but the state was deleted in AsyncLLM.
+[2026-07-14 12:19:55.513] [warning] scheduleRetract: alloc_count mismatch for request b3f06e7d962b49d6927fccc5264216c8 (full_paged_tokens=1919 prefix_pages=1919 total_available=1920 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 12:21:28.285] [warning] FinishEvent: alloc_count (71) exceeds local allocator page count (5); skipping prefix-cache publish for this request
+[2026-07-14 12:21:48] Received output for rid='37a72d3bb6e945d3ab19339007b72f21' but the state was deleted in AsyncLLM.
+[2026-07-14 12:23:49] Received output for rid='15a91395d49044acb57a97895f4b81bb' but the state was deleted in AsyncLLM.
+[2026-07-14 12:23:53] Received output for rid='8c7b674d968a491aa844e2c77a3c7354' but the state was deleted in AsyncLLM.
+[2026-07-14 12:25:48] Received output for rid='895b220cf23948d185565a928bece239' but the state was deleted in AsyncLLM.
+[2026-07-14 12:27:19] Received output for rid='cc7f18c3684b4f5fb36fed2d5538e1e1' but the state was deleted in AsyncLLM.
+[2026-07-14 12:29:13] Received output for rid='1275e6ea21464eb4ac46d013c23bbdca' but the state was deleted in AsyncLLM.
+[2026-07-14 12:29:47] Received output for rid='7130e5ad00f04195854c4c0aac1e3067' but the state was deleted in AsyncLLM.
+[2026-07-14 12:31:56.562] [warning] scheduleRetract: alloc_count mismatch for request 64f2ba35e1d54a5cb71a170bb70118c8 (full_paged_tokens=1824 prefix_pages=1824 total_available=1825 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 12:31:56.881] [warning] scheduleRetract: alloc_count mismatch for request 38e782f58ea84d94a31038bb64236c57 (full_paged_tokens=1811 prefix_pages=1811 total_available=1812 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 12:32:18] Received output for rid='6fb2b4295f1c453ca010f8fb19f487a0' but the state was deleted in AsyncLLM.
+[2026-07-14 12:33:52] Received output for rid='64422b1b65d2422588c1d8fbf4b4f83a' but the state was deleted in AsyncLLM.
+[2026-07-14 12:34:23.597] [warning] scheduleRetract: alloc_count mismatch for request 5a574fb4e15e4298ace8d997954fb18a (full_paged_tokens=1751 prefix_pages=1751 total_available=1752 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 12:39:17.328] [warning] scheduleRetract: alloc_count mismatch for request 6dea40723ff0490bb748bb0a1b9b2879 (full_paged_tokens=1631 prefix_pages=1631 total_available=1632 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 12:40:43] Received output for rid='4807a458503e4fe59639e3b8909a7988' but the state was deleted in AsyncLLM.
+[2026-07-14 12:40:58] Received output for rid='a6ab8104ca6d4bf59df49aa5c0c7325a' but the state was deleted in AsyncLLM.
+[2026-07-14 12:42:49] Received output for rid='197053ebd5cd41feaabae1b0b8248712' but the state was deleted in AsyncLLM.
+[2026-07-14 12:44:24] Received output for rid='83855361c2fe49ddab022707e1978e32' but the state was deleted in AsyncLLM.
+[2026-07-14 12:44:55.906] [warning] FinishEvent: alloc_count (26) exceeds local allocator page count (2); skipping prefix-cache publish for this request
+[2026-07-14 12:45:40] Received output for rid='5ac0f99f7b5e42499bbd4e514581cd69' but the state was deleted in AsyncLLM.
+[2026-07-14 12:45:40.832] [warning] FinishEvent: alloc_count (529) exceeds local allocator page count (2); skipping prefix-cache publish for this request
+[2026-07-14 12:46:01] Received output for rid='7af07ece57fd4c90bde362b9e92175c2' but the state was deleted in AsyncLLM.
+[2026-07-14 12:49:07] Received output for rid='5078769b32e745ffbd7fbd944052111c' but the state was deleted in AsyncLLM.
+[2026-07-14 12:52:01.129] [warning] FinishEvent: alloc_count (1510) exceeds local allocator page count (10); skipping prefix-cache publish for this request
+[2026-07-14 12:52:36] Received output for rid='b30f1f4fd4244c13927a2df88055a5e7' but the state was deleted in AsyncLLM.
+[2026-07-14 12:59:29.776] [warning] FinishEvent: alloc_count (1382) exceeds local allocator page count (2); skipping prefix-cache publish for this request
+[2026-07-14 13:00:34] Received output for rid='c4050ed8a4724876be79e40436407925' but the state was deleted in AsyncLLM.
+[2026-07-14 13:01:11] Received output for rid='cafcb1cc8dc4470291af1a848c1e4a29' but the state was deleted in AsyncLLM.
+[2026-07-14 13:01:57] Received output for rid='2dac1d739d3a4a9eb85b7f0588bc686f' but the state was deleted in AsyncLLM.
+[2026-07-14 13:03:07] Received output for rid='6ec0658b768c4dbf8fd6f9d4e233b202' but the state was deleted in AsyncLLM.
+[2026-07-14 13:03:18] Received output for rid='a2eaefe0ec7d4319a4fd6a5eaaf88493' but the state was deleted in AsyncLLM.
+[2026-07-14 13:06:01] Received output for rid='5801602c3fde4092b9f4783a0d1a2bb5' but the state was deleted in AsyncLLM.
+[2026-07-14 13:12:39] Received output for rid='5d8b538ee8784418abe7dcdf91c86852' but the state was deleted in AsyncLLM.
+[2026-07-14 13:12:43] Received output for rid='4ac2961cc153474a906a63eab9aa7be9' but the state was deleted in AsyncLLM.
+[2026-07-14 13:15:17] Received output for rid='8fff43fe27404eb8ac42f8e70e805249' but the state was deleted in AsyncLLM.
+[2026-07-14 13:19:24] Received output for rid='5c303531498f473eb661419b8ba22b3b' but the state was deleted in AsyncLLM.
+[2026-07-14 13:19:39] Received output for rid='5a1be9641b244fa7b84028ba1528e874' but the state was deleted in AsyncLLM.
+[2026-07-14 13:21:09] Received output for rid='8f8fe90da81f4e3ba3c75dfa47caf4bb' but the state was deleted in AsyncLLM.
+[2026-07-14 13:21:11] Received output for rid='251f0d4ca492462fb9f80d2e710fe118' but the state was deleted in AsyncLLM.
+[2026-07-14 13:21:19] Received output for rid='ef1923fca77743029b8b16ef7fab7899' but the state was deleted in AsyncLLM.
+[2026-07-14 13:25:26] Received output for rid='afbe0aac5eb243faaee655126b06b660' but the state was deleted in AsyncLLM.
+[2026-07-14 13:26:29] Received output for rid='1ace41e5b76e48b7a10bbe1350764969' but the state was deleted in AsyncLLM.
+[2026-07-14 13:26:30] Received output for rid='388fa6f5091e4183b24bdcc3a4a75cf5' but the state was deleted in AsyncLLM.
+[2026-07-14 13:33:09] Received output for rid='9dbb5d5706d94542b403bab9d1e18e61' but the state was deleted in AsyncLLM.
+[2026-07-14 13:35:58] Received output for rid='760ef8c6370e48bebf67cf1cf09608c7' but the state was deleted in AsyncLLM.
+[2026-07-14 13:39:23] Received output for rid='317080b704b94b5eaa76899f683e7a56' but the state was deleted in AsyncLLM.
+[2026-07-14 13:39:27] Received output for rid='eeacea1d328a4704910c8e90fe5ef37e' but the state was deleted in AsyncLLM.
+[2026-07-14 13:42:11] Received output for rid='4d199ef8e34b425eb65d677f3bac27e9' but the state was deleted in AsyncLLM.
+[2026-07-14 13:44:51] Received output for rid='273b3bc617684ccf8c5237ec81817b83' but the state was deleted in AsyncLLM.
+[2026-07-14 13:47:48] Received output for rid='7ef398fa7f38400f9f651b39f0304d5a' but the state was deleted in AsyncLLM.
+[2026-07-14 13:48:29.738] [warning] scheduleRetract: alloc_count mismatch for request 4de83c38ea2d401e95445e08b0b4b8f1 (full_paged_tokens=1986 prefix_pages=1986 total_available=1987 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 13:50:52.928] [warning] FinishEvent: alloc_count (1740) exceeds local allocator page count (5); skipping prefix-cache publish for this request
+[2026-07-14 13:52:03] Received output for rid='22d22ea00fc848a1b0189701c17f47d8' but the state was deleted in AsyncLLM.
+[2026-07-14 13:55:07] Received output for rid='89f72a498ccc41e1838d0b348239f8fb' but the state was deleted in AsyncLLM.
+[2026-07-14 13:56:41] Received output for rid='6ca039311a174efeb906e9ab2581dabb' but the state was deleted in AsyncLLM.
+[2026-07-14 13:56:51] Received output for rid='6b15df3ae3fa438c8ec6da0925cfdf16' but the state was deleted in AsyncLLM.
+[2026-07-14 13:58:58] Received output for rid='476c6e058c9740f68403e7e375058657' but the state was deleted in AsyncLLM.
+[2026-07-14 13:59:23] Received output for rid='ae8813acd7284827bc3dedafed8d4e55' but the state was deleted in AsyncLLM.
+[2026-07-14 14:01:39] Received output for rid='2306c2ea759043e385a33a68d1fe618e' but the state was deleted in AsyncLLM.
+[2026-07-14 14:05:01] Received output for rid='71ec4b036eea4f7a8d3d2f4c3cf7d13b' but the state was deleted in AsyncLLM.
+[2026-07-14 14:06:27] Received output for rid='66decbdfbcf04acf9dac05a5364c765e' but the state was deleted in AsyncLLM.
+[2026-07-14 14:09:22] Received output for rid='2490cc6b9346431b87bf19c6f12ea662' but the state was deleted in AsyncLLM.
+[2026-07-14 14:11:09] Received output for rid='8824f365f7ce441bb61590fc857936e3' but the state was deleted in AsyncLLM.
+[2026-07-14 14:12:03] Received output for rid='054d77049f004801b41a33078f802c01' but the state was deleted in AsyncLLM.
+[2026-07-14 14:15:52] Received output for rid='91ddceaa4ba24fd2b6ba4631d63b44fb' but the state was deleted in AsyncLLM.
+[2026-07-14 14:17:16] Received output for rid='6e3ae283717f4624b242f1259aaf7dda' but the state was deleted in AsyncLLM.
+[2026-07-14 14:19:54] Received output for rid='643641ea17ed44088a95d5b3ca9ee941' but the state was deleted in AsyncLLM.
+[2026-07-14 14:20:07] Received output for rid='16cf638552b34421ad5cee835ad8569e' but the state was deleted in AsyncLLM.
+[2026-07-14 14:21:11] Received output for rid='4cf64e41991944ad8edc966c1fa47e31' but the state was deleted in AsyncLLM.
+[2026-07-14 14:22:02] Received output for rid='2ad6069f516042408e5a466787d88659' but the state was deleted in AsyncLLM.
+[2026-07-14 14:28:26] Received output for rid='4907cf8edd8a49a5a679b5cf9f868ddf' but the state was deleted in AsyncLLM.
+[2026-07-14 14:29:48] Received output for rid='33e4fb7586804fa9a598ca6cbbd2dd02' but the state was deleted in AsyncLLM.
+[2026-07-14 14:31:24] Received output for rid='1a6de3c600fd4f74b8a081aa4cbb1106' but the state was deleted in AsyncLLM.
+[2026-07-14 14:34:55] Received output for rid='71ec6c397b214a378e7fb95b8c3da243' but the state was deleted in AsyncLLM.
+[2026-07-14 14:36:31.181] [warning] scheduleRetract: alloc_count mismatch for request 248aeb1128b74c0dadc595dd10aa048c (full_paged_tokens=2142 prefix_pages=2142 total_available=2143 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 14:37:05] Received output for rid='1481e1f2a6b74672a9063f82b0f2224d' but the state was deleted in AsyncLLM.
+[2026-07-14 14:37:10] Received output for rid='a11e804242444dcb8d00c28a8714697d' but the state was deleted in AsyncLLM.
+[2026-07-14 14:37:46.494] [warning] FinishEvent: alloc_count (848) exceeds local allocator page count (3); skipping prefix-cache publish for this request
+[2026-07-14 14:42:18] Received output for rid='7fccae05e161462b960fb8ba43e136b3' but the state was deleted in AsyncLLM.
+[2026-07-14 14:46:26] Received output for rid='0d066c8b33294fb6b95a7e0f38de4dfc' but the state was deleted in AsyncLLM.
+[2026-07-14 14:47:42] Received output for rid='71e9c071e6504545af63e57370481e3d' but the state was deleted in AsyncLLM.
+[2026-07-14 14:50:10] Received output for rid='48635f5602304463952308e4500681d9' but the state was deleted in AsyncLLM.
+[2026-07-14 14:50:57] Received output for rid='db4a5b505c5d42238aa4177eba76995d' but the state was deleted in AsyncLLM.
+[2026-07-14 14:51:28] Received output for rid='51b1d6fe9192462c8a799cb3565144d0' but the state was deleted in AsyncLLM.
+[2026-07-14 14:53:52] Received output for rid='768b6f76430746748dcb93a8fe92de81' but the state was deleted in AsyncLLM.
+[2026-07-14 14:56:41] Received output for rid='9a3c33ea7e2c42d3989f76dee0148f4b' but the state was deleted in AsyncLLM.
+[2026-07-14 14:57:17] Received output for rid='8b22d74f94b84e30ab2c02573562d179' but the state was deleted in AsyncLLM.
+[2026-07-14 14:57:46] Received output for rid='07b21a140e844eb8953eee7ef2f2cf57' but the state was deleted in AsyncLLM.
+[2026-07-14 14:58:34] Received output for rid='94ffac9883cf41028754037490a26de4' but the state was deleted in AsyncLLM.
+[2026-07-14 15:03:12] Received output for rid='50e63c4fb424452b91938ce19137a9bf' but the state was deleted in AsyncLLM.
+[2026-07-14 15:06:20] Received output for rid='92e0ba5ca039411ea97cbd4a4e1908d8' but the state was deleted in AsyncLLM.
+[2026-07-14 15:07:04] Received output for rid='9c3be98f64634ff28fb280d4dc51cae9' but the state was deleted in AsyncLLM.
+[2026-07-14 15:08:02] Received output for rid='54998b871a34489e8102adacf8b45d9e' but the state was deleted in AsyncLLM.
+[2026-07-14 15:12:50] Received output for rid='b22bf6d246474a5a987ff9db640a6f48' but the state was deleted in AsyncLLM.
+[2026-07-14 15:16:28] Received output for rid='7825cd9239df48da9eef697f364e566e' but the state was deleted in AsyncLLM.
+[2026-07-14 15:17:46] Received output for rid='09072d4ba1e142269bf1dc7d1980c8ea' but the state was deleted in AsyncLLM.
+[2026-07-14 15:18:08] Received output for rid='afe0fefabc184b8caa33fc0e8d932fb4' but the state was deleted in AsyncLLM.
+[2026-07-14 15:20:23] Received output for rid='1eb9b7b07bd84e6abe9543287f9d18f3' but the state was deleted in AsyncLLM.
+[2026-07-14 15:26:23] Received output for rid='bc0f56de8e974ceaaf95a349838d8c80' but the state was deleted in AsyncLLM.
+[2026-07-14 15:27:04] Received output for rid='6821dea4e9f24f49883d3783c8e542d3' but the state was deleted in AsyncLLM.
+[2026-07-14 15:28:05] Received output for rid='4599beb461b94970a6c11e23732f6dca' but the state was deleted in AsyncLLM.
+[2026-07-14 15:29:20] Received output for rid='e0a54065a3e04b27b9ab4fcb03448255' but the state was deleted in AsyncLLM.
+[2026-07-14 15:29:27] Received output for rid='4cc1c33c2ae142178ec6dbe80aec4286' but the state was deleted in AsyncLLM.
+[2026-07-14 15:30:56] Received output for rid='4a08958d3edc4015b28a5b92fa415067' but the state was deleted in AsyncLLM.
+[2026-07-14 15:32:41] Received output for rid='069cc4d738e44d30a985a74027de8840' but the state was deleted in AsyncLLM.
+[2026-07-14 15:42:15] Received output for rid='0f60c97ca5dd45859c839f1ede4e1b53' but the state was deleted in AsyncLLM.
+[2026-07-14 15:43:38] Received output for rid='c7ce5690c34b467f9f83e3d1b912b781' but the state was deleted in AsyncLLM.
+[2026-07-14 15:44:57] Received output for rid='50eec406a6074c94aec6cc60658c65f6' but the state was deleted in AsyncLLM.
+[2026-07-14 15:45:54] Received output for rid='97a1b2d5192d4019801557fbecba671a' but the state was deleted in AsyncLLM.
+[2026-07-14 15:47:04] Received output for rid='3a0b8fc8d4134e4fa2c6d99ce841e46c' but the state was deleted in AsyncLLM.
+[2026-07-14 15:48:56] Received output for rid='0b646ce01d5747f3b69f4074e15eb44c' but the state was deleted in AsyncLLM.
+[2026-07-14 15:50:32] Received output for rid='096bf46a3b5448b3803f144baa4a1e83' but the state was deleted in AsyncLLM.
+[2026-07-14 15:52:40] Received output for rid='db25caa06adf48b0affb73eb391e4a4a' but the state was deleted in AsyncLLM.
+[2026-07-14 15:55:13] Received output for rid='bebec07ca90e425782c02d688182864a' but the state was deleted in AsyncLLM.
+[2026-07-14 15:55:28] Received output for rid='d735e9ac365f4bfea58f11504e7ed94c' but the state was deleted in AsyncLLM.
+[2026-07-14 15:55:38] Received output for rid='8038b559f6ba4c68b46c8f315874e899' but the state was deleted in AsyncLLM.
+[2026-07-14 15:55:49] Received output for rid='741d7a0e0e80412a9d3fa6eff6bcc0d5' but the state was deleted in AsyncLLM.
+[2026-07-14 15:57:20] Received output for rid='0cdb9edeac944157a70b74c4e57d0fb6' but the state was deleted in AsyncLLM.
+[2026-07-14 16:02:36] Received output for rid='7b69b298da1e42eab93fd405c3c425d9' but the state was deleted in AsyncLLM.
+[2026-07-14 16:03:33] Received output for rid='728af39153db4b13af1a64a7b7a7e426' but the state was deleted in AsyncLLM.
+[2026-07-14 16:06:05] Received output for rid='89367684b5d64aa79b34f87b5e3c08bb' but the state was deleted in AsyncLLM.
+[2026-07-14 16:07:04] Received output for rid='77e4333d528443218c9598ea22d53604' but the state was deleted in AsyncLLM.
+[2026-07-14 16:11:39] Received output for rid='a3ab93600f68454bb4487e91eeab660b' but the state was deleted in AsyncLLM.
+[2026-07-14 16:13:50] Received output for rid='43a2a5b83979447ebde8df8b2f6d2166' but the state was deleted in AsyncLLM.
+[2026-07-14 16:15:16] Received output for rid='88083b550a81491597e01c89fa5b4077' but the state was deleted in AsyncLLM.
+[2026-07-14 16:16:13] Received output for rid='6a719bfd54f04495b71c63354119626e' but the state was deleted in AsyncLLM.
+[2026-07-14 16:19:02] Received output for rid='b75bb118ce7a45d5817a59dce21a8806' but the state was deleted in AsyncLLM.
+[2026-07-14 16:29:58] Received output for rid='12064694923948e3bf080c8af81835d2' but the state was deleted in AsyncLLM.
+[2026-07-14 16:33:05] Received output for rid='c50d080dfb59480a93fd27c12e4937c6' but the state was deleted in AsyncLLM.
+[2026-07-14 16:34:26] Received output for rid='8c0c8a042c0a47c594f95c7f3d9c0ead' but the state was deleted in AsyncLLM.
+[2026-07-14 16:35:22] Received output for rid='3f5d7af574554a69b40bca4cc9cd3792' but the state was deleted in AsyncLLM.
+[2026-07-14 16:35:34] Received output for rid='445474295cb84a798f2a9129f6cad390' but the state was deleted in AsyncLLM.
+[2026-07-14 16:39:09] Received output for rid='11ebb2cd5be240d7b10f079af3217dfa' but the state was deleted in AsyncLLM.
+[2026-07-14 16:41:14] Received output for rid='971cf27c1ee6417e81186af96e3d4a96' but the state was deleted in AsyncLLM.
+[2026-07-14 16:41:23] Received output for rid='1ca49d5b26064ed28ce6ac96e98c22dc' but the state was deleted in AsyncLLM.
+[2026-07-14 16:43:31] Received output for rid='19997d59651b42f09ce28b2697fbc38c' but the state was deleted in AsyncLLM.
+[2026-07-14 16:52:07] Received output for rid='c2856969fe35438fa7c6d5d8a0d8ce5c' but the state was deleted in AsyncLLM.
+[2026-07-14 16:56:56] Received output for rid='125cc11c766e44459c755a1dd4b89d0a' but the state was deleted in AsyncLLM.
+[2026-07-14 17:00:42] Received output for rid='bd106d81dd8343f586f2daf6504f4a33' but the state was deleted in AsyncLLM.
+[2026-07-14 17:03:55] Received output for rid='6dddaf9f0b26424eb5efe68b2b3a8dfb' but the state was deleted in AsyncLLM.
+[2026-07-14 17:05:21] Received output for rid='934069ebf3754bda9b4f6c7974c161b3' but the state was deleted in AsyncLLM.
+[2026-07-14 17:11:14] Received output for rid='ad60573d7460419ba1e0014d7238eb34' but the state was deleted in AsyncLLM.
+[2026-07-14 17:24:06] Received output for rid='86c3ad65547a45bd96ae21a08804877a' but the state was deleted in AsyncLLM.
+[2026-07-14 17:27:57] Received output for rid='0c069534697948aa9c960ab930068979' but the state was deleted in AsyncLLM.
+[2026-07-14 17:28:34] Received output for rid='ce432660b856458da9f1f89fd766c591' but the state was deleted in AsyncLLM.
+[2026-07-14 17:34:52.908] [warning] scheduleRetract: alloc_count mismatch for request 59ef6fa52a5a4ce79dd784af82efcdb3 (full_paged_tokens=3584 prefix_pages=3584 total_available=3585 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 17:34:53.259] [warning] scheduleRetract: alloc_count mismatch for request 9b63c5ac49ec4e6999349049cd4b7efb (full_paged_tokens=2324 prefix_pages=2324 total_available=2325 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 17:35:10] Received output for rid='63682276c9074ed4a0d7cc1420c5ff8e' but the state was deleted in AsyncLLM.
+[2026-07-14 17:35:27] Received output for rid='cea20973b828433cad8b55bc05c4860a' but the state was deleted in AsyncLLM.
+[2026-07-14 17:36:18] Received output for rid='cf000326e2fe4e9284b43b5a03909bce' but the state was deleted in AsyncLLM.
+[2026-07-14 17:41:05] Received output for rid='88b5ccd154f14508bdd3dc3837ab6233' but the state was deleted in AsyncLLM.
+[2026-07-14 17:41:15] Received output for rid='d471d528a66a42e8b60a925a40765afa' but the state was deleted in AsyncLLM.
+[2026-07-14 17:42:46] Received output for rid='5a886b494b0e43368c830b163b9cdf00' but the state was deleted in AsyncLLM.
+[2026-07-14 17:44:50] Received output for rid='0b8781dc1f2641a4984ccce5d1281108' but the state was deleted in AsyncLLM.
+[2026-07-14 17:45:52] Received output for rid='bbca53f0391e44e6a637cfed554f5e1b' but the state was deleted in AsyncLLM.
+[2026-07-14 17:45:55] Received output for rid='1bdb75ed0a3a4ec5b6c5911e37940a49' but the state was deleted in AsyncLLM.
+[2026-07-14 17:46:14] Received output for rid='9c206e0d0dc64a12aad94f7a32bcd987' but the state was deleted in AsyncLLM.
+[2026-07-14 17:47:57] Received output for rid='538beb04382041428d9dbfa17ebb3948' but the state was deleted in AsyncLLM.
+[2026-07-14 17:48:36] Received output for rid='613e5cab10ca4d6e9149f24d256b745f' but the state was deleted in AsyncLLM.
+[2026-07-14 17:52:02] Received output for rid='256cede8b0d049c5a82b8df795452a82' but the state was deleted in AsyncLLM.
+[2026-07-14 17:52:45] Received output for rid='89124961f9e34c00826fc648c05d03ee' but the state was deleted in AsyncLLM.
+[2026-07-14 17:53:39] Received output for rid='179cac7bfd044f2d890e7d59748cf27b' but the state was deleted in AsyncLLM.
+[2026-07-14 17:53:59] Received output for rid='9e2ebfdebad247a798c170c48e7b5fbb' but the state was deleted in AsyncLLM.
+[2026-07-14 17:55:27] Received output for rid='63298b75019b431e85a5a873951735e6' but the state was deleted in AsyncLLM.
+[2026-07-14 17:55:48] Received output for rid='d22a863e3ef7427d9465549bffd9eb5f' but the state was deleted in AsyncLLM.
+[2026-07-14 17:56:34] Received output for rid='d1e8ae52f948463792b42613f32e26d8' but the state was deleted in AsyncLLM.
+[2026-07-14 17:57:46] Received output for rid='2bb289376ecd4d28998d9f513c74fe25' but the state was deleted in AsyncLLM.
+[2026-07-14 17:58:00] Received output for rid='2e6615529cdb4322add208e7d5b01d05' but the state was deleted in AsyncLLM.
+[2026-07-14 18:00:25] Received output for rid='aee60ee4821d489cbb37cb0f75129ee5' but the state was deleted in AsyncLLM.
+[2026-07-14 18:08:27] Received output for rid='84a4c585ece84c75be3b81228f3e1e7c' but the state was deleted in AsyncLLM.
+[2026-07-14 18:12:13] Received output for rid='62019ddf130a414d87f0c6052b50b28a' but the state was deleted in AsyncLLM.
+[2026-07-14 18:12:30] Received output for rid='0e074d3be87144ca8d33dbc84d59acc6' but the state was deleted in AsyncLLM.
+[2026-07-14 18:15:01] Received output for rid='38d988926b3e4c9e819bd288197ec3de' but the state was deleted in AsyncLLM.
+[2026-07-14 18:17:31] Received output for rid='7d309fcac7db49168657ab0be749f491' but the state was deleted in AsyncLLM.
+[2026-07-14 18:18:00] Received output for rid='71942ac689d7446eafee24ab23fd9e78' but the state was deleted in AsyncLLM.
+[2026-07-14 18:24:24] Received output for rid='6bc1f6a0a4ff4a78b0cc428fbdb6788c' but the state was deleted in AsyncLLM.
+[2026-07-14 18:25:41] Received output for rid='740de114f26d4e408b10fcf48016bbae' but the state was deleted in AsyncLLM.
+[2026-07-14 18:31:38] Received output for rid='16d550838caa428bb65787bf33d86150' but the state was deleted in AsyncLLM.
+[2026-07-14 18:35:49] Received output for rid='74cd141408324aedaf033829f6fa292b' but the state was deleted in AsyncLLM.
+[2026-07-14 18:36:39] Received output for rid='b2d9fdf8b8044c7ea722072e576690c1' but the state was deleted in AsyncLLM.
+[2026-07-14 18:37:03] Received output for rid='1225044dfad342f882dcc2c0a48ac9d7' but the state was deleted in AsyncLLM.
+[2026-07-14 18:38:05] Received output for rid='b8d1c40a4be644739f43d53c5d275c8e' but the state was deleted in AsyncLLM.
+[2026-07-14 18:40:14] Received output for rid='891fe98aadd24a5db878ea6f3deaa4d8' but the state was deleted in AsyncLLM.
+[2026-07-14 18:40:39] Received output for rid='c70187e45a604d279c776a75ff7253d8' but the state was deleted in AsyncLLM.
+[2026-07-14 18:41:45] Received output for rid='81748d9e927043afa6bee9e13917b4a5' but the state was deleted in AsyncLLM.
+[2026-07-14 18:43:32] Received output for rid='587f76c09b4b4809b65804dd02ac0046' but the state was deleted in AsyncLLM.
+[2026-07-14 18:45:52] Received output for rid='66516ceb290a43839c127c5fa32bba77' but the state was deleted in AsyncLLM.
+[2026-07-14 18:48:02] Received output for rid='0d98213a994444b1a0d64d3dd8fedcc1' but the state was deleted in AsyncLLM.
+[2026-07-14 18:54:13] Received output for rid='b7877a6b82fa4fa3b8dc0d524779b31c' but the state was deleted in AsyncLLM.
+[2026-07-14 18:54:13] Received output for rid='b7877a6b82fa4fa3b8dc0d524779b31c' but the state was deleted in AsyncLLM.
+[2026-07-14 18:59:30] Received output for rid='b5d8fef88d1e401aa0c50af7e30b81d6' but the state was deleted in AsyncLLM.
+[2026-07-14 19:00:30] Received output for rid='5ca172a722664ddc993e300f14f03a96' but the state was deleted in AsyncLLM.
+[2026-07-14 19:00:52] Received output for rid='bcd21c800e1b4153a52ae854a0cf0928' but the state was deleted in AsyncLLM.
+[2026-07-14 19:01:29] Received output for rid='bfeb54e7ac76495eb403d9bf3ba63dd2' but the state was deleted in AsyncLLM.
+[2026-07-14 19:07:41] Received output for rid='d50125b8e0da4080b9a1e4c1701a4c7e' but the state was deleted in AsyncLLM.
+[2026-07-14 19:07:46] Received output for rid='e4de1cb649f6484fad09e939ff7b6fc0' but the state was deleted in AsyncLLM.
+[2026-07-14 19:12:36] Received output for rid='9cfab73a8c7b4748aeb07ea27681dce2' but the state was deleted in AsyncLLM.
+[2026-07-14 19:12:46] Received output for rid='4aaf43a307c84297bc6767cd807f5ecf' but the state was deleted in AsyncLLM.
+[2026-07-14 19:14:28] Received output for rid='e30d5920d51a4770959e0e1ee615aa7c' but the state was deleted in AsyncLLM.
+[2026-07-14 19:18:43] Received output for rid='bcb0d917191e4d15a9870cebefd5ee8f' but the state was deleted in AsyncLLM.
+[2026-07-14 19:22:50] Received output for rid='8aa662af5ef0428e91a69a9e8f8a06b8' but the state was deleted in AsyncLLM.
+[2026-07-14 19:26:50] Received output for rid='41e428fcf35749f5b8912ee200a87dce' but the state was deleted in AsyncLLM.
+[2026-07-14 19:27:31] Received output for rid='24c67983803648d8b53f778be8b73aca' but the state was deleted in AsyncLLM.
+[2026-07-14 19:28:33] Received output for rid='aa47106ef7db4fb0b2dce71a049d5f95' but the state was deleted in AsyncLLM.
+[2026-07-14 19:29:42] Received output for rid='dc360d2ba00745fb8777305e3d78bc62' but the state was deleted in AsyncLLM.
+[2026-07-14 19:31:26] Received output for rid='b87d2d16209c4c6185b30b1120a08eff' but the state was deleted in AsyncLLM.
+[2026-07-14 19:33:36] Received output for rid='d4c29c3ac6ab402cadabaeaf099ed6e6' but the state was deleted in AsyncLLM.
+[2026-07-14 19:37:57] Received output for rid='5692af9d3c6e4e1a9a527bef4680f259' but the state was deleted in AsyncLLM.
+[2026-07-14 19:49:55] Received output for rid='98a8be47b67d4a3db6ae9f70bc19fc35' but the state was deleted in AsyncLLM.
+[2026-07-14 19:50:13] Received output for rid='e699ae8b08ea40f89dd2cd21cfe43d54' but the state was deleted in AsyncLLM.
+[2026-07-14 19:53:01] Received output for rid='4c4ffba89b78421da4e44d08e7f8897f' but the state was deleted in AsyncLLM.
+[2026-07-14 19:53:36] Received output for rid='9379219df7c849cc8dba27e43345166b' but the state was deleted in AsyncLLM.
+[2026-07-14 19:54:41] Received output for rid='c4f0eec8549949a08ac6bfca1c42e898' but the state was deleted in AsyncLLM.
+[2026-07-14 19:55:26] Received output for rid='6ad9d1d8459c4692b05f5738b8802578' but the state was deleted in AsyncLLM.
+[2026-07-14 20:07:51] Received output for rid='4c1e3de09974405183c9ef11505accfe' but the state was deleted in AsyncLLM.
+[2026-07-14 20:12:57] Received output for rid='5858f3b289bc431c968abef1c6b4778d' but the state was deleted in AsyncLLM.
+[2026-07-14 20:17:12] Received output for rid='73b085dc22c245e8b43895041dce68e1' but the state was deleted in AsyncLLM.
+[2026-07-14 20:21:45] Received output for rid='7c111f4244ec48c9bbb409be45bec1a2' but the state was deleted in AsyncLLM.
+[2026-07-14 20:28:05] Received output for rid='842dfb00597c4837a7b834bf66dcf803' but the state was deleted in AsyncLLM.
+[2026-07-14 20:28:26] Received output for rid='c022181de09e419d8fbebbc406503e78' but the state was deleted in AsyncLLM.
+[2026-07-14 20:37:12] Received output for rid='f68db90364434ba39a93e1291cd9f08a' but the state was deleted in AsyncLLM.
+[2026-07-14 20:37:33] Received output for rid='0602a7aadc1d4ca9ac361687d7665128' but the state was deleted in AsyncLLM.
+[2026-07-14 20:46:54] Received output for rid='7717a0433d8c47a287143b4cb7ed15a3' but the state was deleted in AsyncLLM.
+[2026-07-14 20:48:26] Received output for rid='094f38d6571c4e4084ee9a10776f7e42' but the state was deleted in AsyncLLM.
+[2026-07-14 20:56:10.074] [warning] FinishEvent: alloc_count (23) exceeds local allocator page count (2); skipping prefix-cache publish for this request
+[2026-07-14 20:56:10.076] [warning] FinishEvent: alloc_count (10) exceeds local allocator page count (2); skipping prefix-cache publish for this request
+[2026-07-14 20:57:33] Received output for rid='95e4dc86684b4a2ea0b221fdb49a9a93' but the state was deleted in AsyncLLM.

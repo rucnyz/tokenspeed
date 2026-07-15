@@ -1,0 +1,7 @@
+[three_arm_v2_par] launched base(pid=492894) sys(pid=492895) sys_lru(pid=492896)
+[three_arm_v2_par] sys on GPU 3 -> runs/hima_pressure_three_arm_v2_20260714/sys/rep0
+[three_arm_v2_par] base on GPU 2 -> runs/hima_pressure_three_arm_v2_20260714/base/rep0
+[three_arm_v2_par] sys_lru on GPU 4 -> runs/hima_pressure_three_arm_v2_20260714/sys_lru/rep0
+scripts/run_pressure_three_arm_v2_parallel.sh: line 31: 492902 User defined signal 1   "${cmd[@]}" > "${OUT}/${sub}/rep0/run.log" 2>&1
+[three_arm_v2_par] sys done exit=0
+[three_arm_v2_par] base done exit=0

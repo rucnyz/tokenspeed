@@ -1,0 +1,238 @@
+2026-07-14 06:10:08,405 INFO tokenspeed.agentreplay: booting engine with preset=sys_lru
+[38;20m[2026-07-14 06:10:08,405 None] - INFO - Inferred world_size (1) from attn_tp_size (None) x attn_cp_size (1) x attn_dp_size (None) (server_args.py:499)[0m
+[38;20m[2026-07-14 06:10:08,405 None] - INFO - Parallelism configuration:
+Mapping(rank=?, world_size=1)
+  Cluster : 1 node(s) x 1 proc(s)
+  Attention: tp=1  cp=1  dp=1
+    Vision: tp=1
+  Dense   : tp=1  dp=1
+  MoE     : tp=1  ep=1  dp=1 (server_args.py:554)[0m
+[38;20m[2026-07-14 06:10:08,590 None] - INFO - EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured. (server_args.py:701)[0m
+[38;20m[2026-07-14 06:10:08,590 None] - INFO - server_args=ServerArgs(model='/scratch/yuzhou/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a', tokenizer='/scratch/yuzhou/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a', tokenizer_mode='auto', skip_tokenizer_init=False, load_format='auto', trust_remote_code=True, dtype='bfloat16', kv_cache_dtype='auto', kv_cache_quant_method='none', quantization=None, quantization_param_path=None, max_model_len=None, device='cuda', served_model_name='/scratch/yuzhou/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a', revision=None, language_model_only=False, host='127.0.0.1', port=11620, gpu_memory_utilization=0.88, max_num_seqs=160, max_total_tokens=1940000, chunked_prefill_size=8192, max_prefill_tokens=8192, enable_mixed_batch=False, block_size=64, mamba_ssm_dtype='float32', mamba_track_interval=256, max_mamba_cache_size=None, mamba_full_memory_ratio=0.15, enable_mamba_l2=False, mamba_l2_host_slots=0, mamba_l2_ratio=2.0, mamba_l2_layout='layer_first', mamba_l2_io_backend='kernel', mamba_l2_host_gb=0, stream_interval=1, stream_output=False, enable_inline_detokenizer=True, seed=276725540, distributed_timeout_seconds=None, download_dir=None, ext_yaml=None, base_gpu_id=4, gpu_id_step=1, log_level='error', log_level_http=None, enable_log_requests=False, log_requests_level=0, enable_metrics=False, decode_log_interval=40, metrics_reporters=None, app_key=None, api_key=None, enable_cache_report=False, kv_events_config=None, data_parallel_size=None, load_balance_method='shortest_queue', load_watch_interval=0.02, ep_size=1, init_expert_location='trivial', ep_num_redundant_experts=0, ep_dispatch_algorithm='static', eplb_algorithm='auto', expert_distribution_recorder_mode=None, expert_distribution_recorder_buffer_size=None, enable_expert_distribution_metrics=False, enable_eplb=False, moe_backend='auto', draft_moe_backend=None, all2all_backend='none', deepep_mode='auto', disable_flashinfer_cutlass_moe_fp4_allgather=False, enable_kvstore=True, kvstore_ratio=2.0, kvstore_size=0, kvstore_io_backend='kernel', kvstore_mem_layout='layer_first', kvstore_storage_backend=None, kvstore_storage_backend_extra_config=None, enable_mla_l1_5_cache=False, dist_init_addr=None, nnodes=1, node_rank=0, hf_overrides='{}', preferred_sampling_params=None, attention_backend='triton', drafter_attention_backend=None, sampling_backend='flashinfer', dp_sampling=False, dp_sampling_min_bs=None, attention_use_fp4_indexer_cache=None, use_trtllm_ragged_deepseek_prefill=None, deepseek_v4_mega_moe_max_num_tokens=0, deepseek_v4_indexer_prefill_max_logits_mb=512, deepseek_v4_prefill_chunk_size=4, grammar_backend='none', reasoning_parser=None, grammar_compile_timeout_secs=30.0, grammar_compile_max_retries=2, disable_any_whitespace=False, disable_capturable_grammar=False, draft_model_path_use_base=False, speculative_config=None, speculative_algorithm=None, speculative_draft_model_path=None, speculative_draft_model_quantization=None, speculative_num_steps=3, speculative_eagle_topk=1, speculative_num_draft_tokens=4, eagle3_layers_to_capture=None, enable_output_logprobs=False, disable_pdl=False, enable_prefix_caching=True, radix_eviction_policy='lru', lpb_window_s=60.0, lpb_hit_deque_maxlen=4096, csigma_kv_alpha=1.02e-07, csigma_kv_beta=0.0246, csigma_kv_gamma=5.97, csigma_m=0.0, enable_budgeter=True, enable_admitter=True, enable_xpool_dynamic_capacity=True, budgeter_tick_s=1.0, budgeter_pages_per_fire=64, admitter_mamba_need_slots=0, xpool_nb_margin=0.05, xpool_ewma_tau_s=1.0, xpool_saturation_low=0.4, xpool_reverse_cooldown_s=2.0, xpool_mamba_headroom_slots=0, xpool_w_queue=0.25, xpool_w_retract=0.2, xpool_w_paused=0.0, xpool_queue_ref=0, xpool_retract_ref=0, xpool_paused_ref=0, enable_dynamic_admission_cap=True, disable_kvstore=False, enforce_eager=False, disable_cuda_graph_padding=False, enable_cudagraph_gc=False, enable_nccl_nvls=False, enable_symm_mem=False, disable_custom_all_reduce=False, disable_overlap_schedule=False, disable_tf32=False, force_deterministic_rsag=False, disable_sampling_tp_sync=False, low_latency_max_num_tokens_per_gpu=256, max_cudagraph_capture_size=160, disable_prefill_graph=False, prefill_graph_max_tokens=128, cudagraph_capture_sizes=None, enable_nan_detection=False, enable_nvtx=False, enable_p2p_check=False, triton_attention_reduce_in_fp32=False, delete_ckpt_after_loading=False, weight_loader_prefetch_checkpoints=False, weight_loader_prefetch_num_threads=4, enable_memory_saver=False, enable_custom_logit_processor=False, mla_disable_ragged=False, warmups=None, nprocs_per_node=None, world_size=None, attn_tp_size=None, dense_tp_size=None, moe_tp_size=None, mapping=Mapping(rank=?, world_size=1)
+  Cluster : 1 node(s) x 1 proc(s)
+  Attention: tp=1  cp=1  dp=1
+    Vision: tp=1
+  Dense   : tp=1  dp=1
+  MoE     : tp=1  ep=1  dp=1, mla_chunk_multiplier=4, mm_attention_backend=None, disaggregation_mode='null', disaggregation_bootstrap_port=8998, disaggregation_transfer_backend='mooncake', disaggregation_ib_device=None, disaggregation_layerwise_interval=1, pdlb_url=None, skip_server_warmup=False, comm_fusion_max_num_tokens=2048, enable_allreduce_fusion=False, enable_expert_parallel=False) (engine.py:130)[0m
+/data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/transformers/modeling_rope_utils.py:1036: FutureWarning: `rope_config_validation` is deprecated and has been removed. Its functionality has been moved to RotaryEmbeddingConfigMixin.validate_rope method. PreTrainedConfig inherits this class, so please call self.validate_rope() instead. Also, make sure to use the new rope_parameters syntax. You can call self.standardize_rope_params() in the meantime.
+  warnings.warn(
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_section', 'mrope_interleaved'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_section', 'mrope_interleaved'}
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+/data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/transformers/modeling_rope_utils.py:1036: FutureWarning: `rope_config_validation` is deprecated and has been removed. Its functionality has been moved to RotaryEmbeddingConfigMixin.validate_rope method. PreTrainedConfig inherits this class, so please call self.validate_rope() instead. Also, make sure to use the new rope_parameters syntax. You can call self.standardize_rope_params() in the meantime.
+  warnings.warn(
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_interleaved', 'mrope_section'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_interleaved', 'mrope_section'}
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[W714 06:10:16.623588229 ProcessGroupNCCL.cpp:932] Warning: TORCH_NCCL_AVOID_RECORD_STREAMS is the default now, this environment variable is thus deprecated. (function operator())
+Loading safetensors checkpoint shards:   0% Completed | 0/4 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:  25% Completed | 1/4 [00:01<00:04,  1.54s/it]
+Loading safetensors checkpoint shards:  50% Completed | 2/4 [00:03<00:03,  1.54s/it]
+Loading safetensors checkpoint shards:  75% Completed | 3/4 [00:04<00:01,  1.28s/it]
+Loading safetensors checkpoint shards: 100% Completed | 4/4 [00:05<00:00,  1.36s/it]
+Loading safetensors checkpoint shards: 100% Completed | 4/4 [00:05<00:00,  1.38s/it]
+
+  0%|          | 0/23 [00:00<?, ?it/s]Capturing batches (bs=1 avail_mem=46.72 GB):   0%|          | 0/23 [00:00<?, ?it/s]/data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+[rank0]:[W714 06:10:31.114273346 ProcessGroupNCCL.cpp:5188] Guessing device ID based on global rank. This can cause a hang if rank to GPU mapping is heterogeneous. You can specify device_id in init_process_group()
+/data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+Capturing batches (bs=1 avail_mem=46.72 GB):   4%|▍         | 1/23 [00:05<01:58,  5.36s/it]Capturing batches (bs=2 avail_mem=46.59 GB):   4%|▍         | 1/23 [00:05<01:58,  5.36s/it]/data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+Capturing batches (bs=2 avail_mem=46.59 GB):   9%|▊         | 2/23 [00:05<00:52,  2.51s/it]Capturing batches (bs=4 avail_mem=46.57 GB):   9%|▊         | 2/23 [00:05<00:52,  2.51s/it]Capturing batches (bs=4 avail_mem=46.57 GB):  13%|█▎        | 3/23 [00:06<00:28,  1.42s/it]Capturing batches (bs=8 avail_mem=46.57 GB):  13%|█▎        | 3/23 [00:06<00:28,  1.42s/it]Capturing batches (bs=8 avail_mem=46.57 GB):  17%|█▋        | 4/23 [00:06<00:17,  1.11it/s]Capturing batches (bs=16 avail_mem=46.57 GB):  17%|█▋        | 4/23 [00:06<00:17,  1.11it/s]Capturing batches (bs=16 avail_mem=46.57 GB):  22%|██▏       | 5/23 [00:06<00:11,  1.62it/s]Capturing batches (bs=24 avail_mem=46.55 GB):  22%|██▏       | 5/23 [00:06<00:11,  1.62it/s]Capturing batches (bs=24 avail_mem=46.55 GB):  26%|██▌       | 6/23 [00:06<00:07,  2.25it/s]Capturing batches (bs=32 avail_mem=46.52 GB):  26%|██▌       | 6/23 [00:06<00:07,  2.25it/s]Capturing batches (bs=32 avail_mem=46.52 GB):  30%|███       | 7/23 [00:06<00:05,  2.98it/s]Capturing batches (bs=40 avail_mem=46.49 GB):  30%|███       | 7/23 [00:06<00:05,  2.98it/s]Capturing batches (bs=40 avail_mem=46.49 GB):  35%|███▍      | 8/23 [00:06<00:03,  3.79it/s]Capturing batches (bs=48 avail_mem=46.45 GB):  35%|███▍      | 8/23 [00:06<00:03,  3.79it/s]Capturing batches (bs=48 avail_mem=46.45 GB):  39%|███▉      | 9/23 [00:06<00:03,  4.64it/s]Capturing batches (bs=56 avail_mem=46.41 GB):  39%|███▉      | 9/23 [00:06<00:03,  4.64it/s]Capturing batches (bs=56 avail_mem=46.41 GB):  43%|████▎     | 10/23 [00:06<00:02,  5.47it/s]Capturing batches (bs=64 avail_mem=46.35 GB):  43%|████▎     | 10/23 [00:06<00:02,  5.47it/s]Capturing batches (bs=64 avail_mem=46.35 GB):  48%|████▊     | 11/23 [00:06<00:01,  6.25it/s]Capturing batches (bs=72 avail_mem=46.29 GB):  48%|████▊     | 11/23 [00:06<00:01,  6.25it/s]Capturing batches (bs=72 avail_mem=46.29 GB):  52%|█████▏    | 12/23 [00:06<00:01,  6.90it/s]Capturing batches (bs=80 avail_mem=46.22 GB):  52%|█████▏    | 12/23 [00:06<00:01,  6.90it/s]Capturing batches (bs=80 avail_mem=46.22 GB):  57%|█████▋    | 13/23 [00:07<00:01,  7.46it/s]Capturing batches (bs=88 avail_mem=46.14 GB):  57%|█████▋    | 13/23 [00:07<00:01,  7.46it/s]Capturing batches (bs=88 avail_mem=46.14 GB):  61%|██████    | 14/23 [00:07<00:01,  7.89it/s]Capturing batches (bs=96 avail_mem=46.06 GB):  61%|██████    | 14/23 [00:07<00:01,  7.89it/s]Capturing batches (bs=96 avail_mem=46.06 GB):  65%|██████▌   | 15/23 [00:07<00:00,  8.24it/s]Capturing batches (bs=104 avail_mem=45.97 GB):  65%|██████▌   | 15/23 [00:07<00:00,  8.24it/s]Capturing batches (bs=104 avail_mem=45.97 GB):  70%|██████▉   | 16/23 [00:07<00:00,  8.44it/s]Capturing batches (bs=112 avail_mem=45.87 GB):  70%|██████▉   | 16/23 [00:07<00:00,  8.44it/s]Capturing batches (bs=112 avail_mem=45.87 GB):  74%|███████▍  | 17/23 [00:07<00:00,  8.62it/s]Capturing batches (bs=120 avail_mem=45.76 GB):  74%|███████▍  | 17/23 [00:07<00:00,  8.62it/s]Capturing batches (bs=120 avail_mem=45.76 GB):  78%|███████▊  | 18/23 [00:07<00:00,  8.76it/s]Capturing batches (bs=128 avail_mem=45.65 GB):  78%|███████▊  | 18/23 [00:07<00:00,  8.76it/s]Capturing batches (bs=128 avail_mem=45.65 GB):  83%|████████▎ | 19/23 [00:07<00:00,  9.01it/s]Capturing batches (bs=136 avail_mem=45.53 GB):  83%|████████▎ | 19/23 [00:07<00:00,  9.01it/s]Capturing batches (bs=136 avail_mem=45.53 GB):  87%|████████▋ | 20/23 [00:07<00:00,  8.95it/s]Capturing batches (bs=144 avail_mem=45.40 GB):  87%|████████▋ | 20/23 [00:07<00:00,  8.95it/s]Capturing batches (bs=144 avail_mem=45.40 GB):  91%|█████████▏| 21/23 [00:08<00:00,  7.20it/s]Capturing batches (bs=152 avail_mem=45.26 GB):  91%|█████████▏| 21/23 [00:08<00:00,  7.20it/s]Capturing batches (bs=152 avail_mem=45.26 GB):  96%|█████████▌| 22/23 [00:08<00:00,  5.71it/s]Capturing batches (bs=160 avail_mem=45.12 GB):  96%|█████████▌| 22/23 [00:08<00:00,  5.71it/s]Capturing batches (bs=160 avail_mem=45.12 GB): 100%|██████████| 23/23 [00:08<00:00,  6.44it/s]Capturing batches (bs=160 avail_mem=45.12 GB): 100%|██████████| 23/23 [00:08<00:00,  2.73it/s]
+[2026-07-14 06:13:58.548] [warning] scheduleRetract: alloc_count mismatch for request 3f5a2847aa5248279547cab00644926f (full_paged_tokens=250 prefix_pages=128 total_available=251 alloc_count=122 local_available=123); taking token-aligned alloc_count this tick
+[2026-07-14 06:13:59.416] [warning] scheduleRetract: alloc_count mismatch for request 3f5a2847aa5248279547cab00644926f (full_paged_tokens=250 prefix_pages=250 total_available=251 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:01.422] [warning] scheduleRetract: alloc_count mismatch for request 3f5a2847aa5248279547cab00644926f (full_paged_tokens=253 prefix_pages=253 total_available=254 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:01.842] [warning] scheduleRetract: alloc_count mismatch for request 3f5a2847aa5248279547cab00644926f (full_paged_tokens=253 prefix_pages=253 total_available=254 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:03.846] [warning] scheduleRetract: alloc_count mismatch for request 3f5a2847aa5248279547cab00644926f (full_paged_tokens=256 prefix_pages=256 total_available=257 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:04.270] [warning] scheduleRetract: alloc_count mismatch for request 3f5a2847aa5248279547cab00644926f (full_paged_tokens=256 prefix_pages=256 total_available=257 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:05.536] [warning] scheduleRetract: alloc_count mismatch for request 7297920f08024a6e9e9e564e86bc641b (full_paged_tokens=271 prefix_pages=250 total_available=272 alloc_count=21 local_available=22); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:05.999] [warning] scheduleRetract: alloc_count mismatch for request 7297920f08024a6e9e9e564e86bc641b (full_paged_tokens=271 prefix_pages=271 total_available=272 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:06.048] [warning] scheduleRetract: alloc_count mismatch for request e6912f946d9c49738dc6d321bbaeb068 (full_paged_tokens=252 prefix_pages=250 total_available=253 alloc_count=2 local_available=3); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:08.004] [warning] scheduleRetract: alloc_count mismatch for request 7297920f08024a6e9e9e564e86bc641b (full_paged_tokens=274 prefix_pages=274 total_available=275 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:08.326] [warning] FinishEvent: alloc_count (5) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:14:09.780] [warning] FinishEvent: alloc_count (25) exceeds local allocator page count (2); skipping prefix-cache publish for this request
+[2026-07-14 06:14:10.334] [warning] scheduleRetract: alloc_count mismatch for request 2b64eda7b1eb4f9fadf68b804f2fd85a (full_paged_tokens=254 prefix_pages=250 total_available=255 alloc_count=4 local_available=5); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:11.547] [warning] FinishEvent: alloc_count (5) exceeds local allocator page count (2); skipping prefix-cache publish for this request
+[2026-07-14 06:14:12.875] [warning] scheduleRetract: alloc_count mismatch for request f6ebd138511d4425b4b329c35feb3203 (full_paged_tokens=256 prefix_pages=251 total_available=257 alloc_count=5 local_available=6); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:14.553] [warning] scheduleRetract: alloc_count mismatch for request d86e9e6fea7942ca8560ba4b4c6f5d30 (full_paged_tokens=252 prefix_pages=250 total_available=253 alloc_count=2 local_available=3); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:15.632] [warning] FinishEvent: alloc_count (6) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:14:18.822] [warning] scheduleRetract: alloc_count mismatch for request 108fccf0656a47ad93c2799486e02477 (full_paged_tokens=285 prefix_pages=251 total_available=286 alloc_count=34 local_available=35); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:19.052] [warning] scheduleRetract: alloc_count mismatch for request 297d5305108941b49b6570eceb1716e8 (full_paged_tokens=281 prefix_pages=253 total_available=282 alloc_count=28 local_available=29); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:20.662] [warning] FinishEvent: alloc_count (10) exceeds local allocator page count (0); skipping prefix-cache publish for this request
+[2026-07-14 06:14:21.089] [warning] FinishEvent: alloc_count (37) exceeds local allocator page count (3); skipping prefix-cache publish for this request
+[2026-07-14 06:14:21.719] [warning] scheduleRetract: alloc_count mismatch for request f55852ada99146249705b736fb6c833a (full_paged_tokens=253 prefix_pages=250 total_available=254 alloc_count=3 local_available=4); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:21.733] [warning] FinishEvent: alloc_count (30) exceeds local allocator page count (0); skipping prefix-cache publish for this request
+[2026-07-14 06:14:22.446] [warning] scheduleRetract: alloc_count mismatch for request 65cdb5a02f6141a7a53469845a2e97f1 (full_paged_tokens=290 prefix_pages=251 total_available=292 alloc_count=39 local_available=41); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:23.580] [warning] scheduleRetract: alloc_count mismatch for request adcb0f53ed034dceab5a911f19952cc5 (full_paged_tokens=262 prefix_pages=250 total_available=263 alloc_count=12 local_available=13); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:25.014] [warning] FinishEvent: alloc_count (39) exceeds local allocator page count (0); skipping prefix-cache publish for this request
+[2026-07-14 06:14:26.703] [warning] scheduleRetract: alloc_count mismatch for request bad83e8698724bc090cde2c57b832460 (full_paged_tokens=608 prefix_pages=510 total_available=609 alloc_count=98 local_available=99); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:28.671] [warning] FinishEvent: alloc_count (7) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:14:28.928] [warning] scheduleRetract: alloc_count mismatch for request 8f173ce16fa245ed8c69db9d4557379a (full_paged_tokens=370 prefix_pages=254 total_available=371 alloc_count=116 local_available=117); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:29.732] [warning] scheduleRetract: alloc_count mismatch for request 8d52a0765e4d4a6eb23e1935764fbe56 (full_paged_tokens=259 prefix_pages=252 total_available=260 alloc_count=7 local_available=8); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:30.474] [warning] FinishEvent: alloc_count (357) exceeds local allocator page count (0); skipping prefix-cache publish for this request
+[2026-07-14 06:14:30.890] [warning] FinishEvent: alloc_count (12) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:14:33.389] [warning] scheduleRetract: alloc_count mismatch for request 3c3f57566b95414ca6c5f69da8f5bd1b (full_paged_tokens=642 prefix_pages=636 total_available=643 alloc_count=6 local_available=7); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:33.536] [warning] scheduleRetract: alloc_count mismatch for request c3b50d654add43488f2bc5344db3a67d (full_paged_tokens=277 prefix_pages=277 total_available=278 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:38.103] [warning] scheduleRetract: alloc_count mismatch for request 7d1dcd6fc1d54f298caed48bf322debb (full_paged_tokens=711 prefix_pages=639 total_available=712 alloc_count=72 local_available=73); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:39.425] [warning] FinishEvent: alloc_count (119) exceeds local allocator page count (0); skipping prefix-cache publish for this request
+[2026-07-14 06:14:41.642] [warning] scheduleRetract: alloc_count mismatch for request 4c06ea28e1164486aef9270699c00455 (full_paged_tokens=264 prefix_pages=253 total_available=265 alloc_count=11 local_available=12); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:43.065] [warning] FinishEvent: alloc_count (461) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:14:44.443] [warning] scheduleRetract: alloc_count mismatch for request bc7b1c10f3ac4011a59caed742d4dc7e (full_paged_tokens=537 prefix_pages=512 total_available=538 alloc_count=25 local_available=26); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:45.009] [warning] FinishEvent: alloc_count (8) exceeds local allocator page count (0); skipping prefix-cache publish for this request
+[2026-07-14 06:14:45.296] [warning] FinishEvent: alloc_count (26) exceeds local allocator page count (0); skipping prefix-cache publish for this request
+[2026-07-14 06:14:45.404] [warning] FinishEvent: alloc_count (391) exceeds local allocator page count (0); skipping prefix-cache publish for this request
+[2026-07-14 06:14:46.076] [warning] scheduleRetract: alloc_count mismatch for request 8c6856c2f54a4434bf1789372caf3a53 (full_paged_tokens=279 prefix_pages=259 total_available=280 alloc_count=20 local_available=21); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:48.168] [warning] scheduleRetract: alloc_count mismatch for request e293ec0aa4e74e0284b9a98db26672d4 (full_paged_tokens=644 prefix_pages=640 total_available=645 alloc_count=4 local_available=5); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:51.409] [warning] scheduleRetract: alloc_count mismatch for request 0f320bd88f354bcf85892dc55cd282c3 (full_paged_tokens=910 prefix_pages=891 total_available=911 alloc_count=19 local_available=20); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:52.607] [warning] scheduleRetract: alloc_count mismatch for request e8be7c3c1e4942d9949cf986d70f8a9f (full_paged_tokens=273 prefix_pages=273 total_available=274 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:53.037] [warning] FinishEvent: alloc_count (286) exceeds local allocator page count (0); skipping prefix-cache publish for this request
+[2026-07-14 06:14:53.957] [warning] FinishEvent: alloc_count (654) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:14:53.980] [warning] FinishEvent: alloc_count (10) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:14:54.888] [warning] scheduleRetract: alloc_count mismatch for request 02a339935f10415499011dc22edbae8a (full_paged_tokens=287 prefix_pages=257 total_available=288 alloc_count=30 local_available=31); taking token-aligned alloc_count this tick
+[2026-07-14 06:14:58.047] [warning] scheduleRetract: alloc_count mismatch for request a97d6d11c7ff4753aeabb58bacf175bb (full_paged_tokens=912 prefix_pages=897 total_available=913 alloc_count=15 local_available=16); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:00.365] [warning] scheduleRetract: alloc_count mismatch for request f0e9a46fdb2d4290ad25887fd8b4e43b (full_paged_tokens=688 prefix_pages=620 total_available=689 alloc_count=68 local_available=69); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:02.115] [warning] scheduleRetract: alloc_count mismatch for request 61d275f02f2f459298151b48222b8e5a (full_paged_tokens=660 prefix_pages=566 total_available=661 alloc_count=94 local_available=95); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:03.395] [warning] scheduleRetract: alloc_count mismatch for request 8241f405ad384522ad06317b285f805c (full_paged_tokens=262 prefix_pages=262 total_available=263 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:03.558] [warning] FinishEvent: alloc_count (654) exceeds local allocator page count (0); skipping prefix-cache publish for this request
+[2026-07-14 06:15:03.734] [warning] FinishEvent: alloc_count (394) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:15:07.593] [warning] scheduleRetract: alloc_count mismatch for request 1b07879360a54a348c1df0e99a534f66 (full_paged_tokens=912 prefix_pages=900 total_available=913 alloc_count=12 local_available=13); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:10.118] [warning] scheduleRetract: alloc_count mismatch for request 12fc0f6bbd67407a97e19732fd834db2 (full_paged_tokens=759 prefix_pages=751 total_available=760 alloc_count=8 local_available=9); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:10.157] [warning] scheduleRetract: alloc_count mismatch for request 1b07879360a54a348c1df0e99a534f66 (full_paged_tokens=912 prefix_pages=912 total_available=913 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:11.113] [warning] scheduleRetract: alloc_count mismatch for request a6807741b7e54fc09a1fbc0ddeea80e4 (full_paged_tokens=251 prefix_pages=251 total_available=252 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:15.239] [warning] scheduleRetract: alloc_count mismatch for request 72fdb8aa5e0042ac8500dfafe4b7deff (full_paged_tokens=913 prefix_pages=900 total_available=914 alloc_count=13 local_available=14); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:16.296] [warning] FinishEvent: alloc_count (37) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:15:16.600] [warning] FinishEvent: alloc_count (23) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:15:17.722] [warning] FinishEvent: alloc_count (438) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:15:17.724] [warning] scheduleRetract: alloc_count mismatch for request 3493921cd6dc42a58854ad34c48cd2d0 (full_paged_tokens=251 prefix_pages=250 total_available=252 alloc_count=1 local_available=2); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:18.849] [warning] scheduleRetract: alloc_count mismatch for request 700d7153bbf446a2897e6746efe5ee93 (full_paged_tokens=421 prefix_pages=421 total_available=422 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:20.104] [warning] FinishEvent: alloc_count (509) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:15:22.832] [warning] scheduleRetract: alloc_count mismatch for request 3028b61380604d3db964682b979337f4 (full_paged_tokens=854 prefix_pages=766 total_available=855 alloc_count=88 local_available=89); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:26.822] [warning] scheduleRetract: alloc_count mismatch for request 87021b84421f448e831b0c478d2d3c9b (full_paged_tokens=969 prefix_pages=932 total_available=970 alloc_count=37 local_available=38); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:29.788] [warning] scheduleRetract: alloc_count mismatch for request fa5a139c59e1464c8f040970a91e0967 (full_paged_tokens=833 prefix_pages=726 total_available=834 alloc_count=107 local_available=108); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:31.462] [warning] scheduleRetract: alloc_count mismatch for request 94aaeaa5d5bf45b798cf5a210a504196 (full_paged_tokens=270 prefix_pages=270 total_available=271 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:31.486] [warning] FinishEvent: alloc_count (5) exceeds local allocator page count (0); skipping prefix-cache publish for this request
+[2026-07-14 06:15:32.779] [warning] FinishEvent: alloc_count (653) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:15:34.050] [warning] FinishEvent: alloc_count (401) exceeds local allocator page count (0); skipping prefix-cache publish for this request
+[2026-07-14 06:15:34.314] [warning] FinishEvent: alloc_count (583) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:15:35.036] [warning] FinishEvent: alloc_count (3) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:15:37.036] [warning] scheduleRetract: alloc_count mismatch for request 69399359c884438295c6477833fe1b36 (full_paged_tokens=602 prefix_pages=516 total_available=603 alloc_count=86 local_available=87); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:39.383] [warning] scheduleRetract: alloc_count mismatch for request 7adbfff2fedd4c779dfb5716ea26d2fc (full_paged_tokens=859 prefix_pages=805 total_available=860 alloc_count=54 local_available=55); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:42.704] [warning] scheduleRetract: alloc_count mismatch for request 8c616027ad024f60b4bb2c17e2792e52 (full_paged_tokens=916 prefix_pages=849 total_available=917 alloc_count=67 local_available=68); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:46.055] [warning] scheduleRetract: alloc_count mismatch for request c92d222baf454bff9bd7d0ef6ee2038b (full_paged_tokens=956 prefix_pages=837 total_available=957 alloc_count=119 local_available=120); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:48.130] [warning] scheduleRetract: alloc_count mismatch for request caaeefee6f6e478c8694f3a17f3d7e27 (full_paged_tokens=251 prefix_pages=251 total_available=252 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:48.155] [warning] scheduleRetract: alloc_count mismatch for request 32dafe1868844a9f801537d7c8f4a2a5 (full_paged_tokens=251 prefix_pages=251 total_available=252 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:48.180] [warning] scheduleRetract: alloc_count mismatch for request de4a904271ca4f7aa5950260c2ac4a8f (full_paged_tokens=250 prefix_pages=250 total_available=251 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:48.877] [warning] FinishEvent: alloc_count (171) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:15:49.621] [warning] FinishEvent: alloc_count (656) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:15:50.147] [warning] scheduleRetract: alloc_count mismatch for request caaeefee6f6e478c8694f3a17f3d7e27 (full_paged_tokens=252 prefix_pages=252 total_available=254 alloc_count=0 local_available=2); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:50.252] [warning] scheduleRetract: alloc_count mismatch for request de4a904271ca4f7aa5950260c2ac4a8f (full_paged_tokens=252 prefix_pages=252 total_available=253 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:54.406] [warning] scheduleRetract: alloc_count mismatch for request 5dd407c74770445faa3e71628eb53128 (full_paged_tokens=919 prefix_pages=901 total_available=920 alloc_count=18 local_available=19); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:56.158] [warning] scheduleRetract: alloc_count mismatch for request 7f4ab2d4acd043e5ac36857f70484d1b (full_paged_tokens=462 prefix_pages=462 total_available=463 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:15:56.215] [warning] FinishEvent: alloc_count (608) exceeds local allocator page count (0); skipping prefix-cache publish for this request
+[2026-07-14 06:15:56.510] [warning] scheduleRetract: alloc_count mismatch for request 26dedf1470ba41d9913f0b6097cbe5cc (full_paged_tokens=276 prefix_pages=276 total_available=277 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:16:00.322] [warning] scheduleRetract: alloc_count mismatch for request 7693729a939040b3a5d2948bb6eb1f77 (full_paged_tokens=874 prefix_pages=874 total_available=875 alloc_count=0 local_available=1); taking token-aligned alloc_count this tick
+[2026-07-14 06:16:01.642] [warning] FinishEvent: alloc_count (6) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:16:02.280] [warning] FinishEvent: alloc_count (2) exceeds local allocator page count (1); skipping prefix-cache publish for this request
+[2026-07-14 06:16:03.668] [warning] FinishEvent: alloc_count (4) exceeds local allocator page count (2); skipping prefix-cache publish for this request
+[2026-07-14 06:16:04.903] [warning] FinishEvent: alloc_count (720) exceeds local allocator page count (2); skipping prefix-cache publish for this request
+[2026-07-14 06:16:04.983] [warning] FinishEvent: alloc_count (660) exceeds local allocator page count (2); skipping prefix-cache publish for this request
+[2026-07-14 06:16:05.231] [warning] FinishEvent: alloc_count (214) exceeds local allocator page count (3); skipping prefix-cache publish for this request
+[2026-07-14 06:16:05.722] [warning] FinishEvent: alloc_count (22) exceeds local allocator page count (3); skipping prefix-cache publish for this request
+[2026-07-14 06:16:14.150] [warning] FinishEvent: alloc_count (607) exceeds local allocator page count (4); skipping prefix-cache publish for this request
+[2026-07-14 06:16:24.851] [warning] FinishEvent: alloc_count (30) exceeds local allocator page count (5); skipping prefix-cache publish for this request
+[2026-07-14 06:16:26.970] [warning] FinishEvent: alloc_count (700) exceeds local allocator page count (5); skipping prefix-cache publish for this request
+[2026-07-14 06:16:29.380] [warning] FinishEvent: alloc_count (347) exceeds local allocator page count (6); skipping prefix-cache publish for this request
+[2026-07-14 06:25:53.337] [warning] FinishEvent: alloc_count (671) exceeds local allocator page count (48); skipping prefix-cache publish for this request
+[2026-07-14 06:34:48.311] [warning] FinishEvent: alloc_count (111) exceeds local allocator page count (83); skipping prefix-cache publish for this request
+[31;20m[2026-07-14 06:51:34,246  ATTN TP RANK 0] - ERROR - Scheduler hit an exception: Traceback (most recent call last):
+  File "/data/yuzhou/projects/tokenspeed/python/tokenspeed/runtime/engine/event_loop.py", line 2288, in run_event_loop
+    event_loop.event_loop_overlap()
+  File "/data/yuzhou/projects/tokenspeed/python/tokenspeed/runtime/engine/event_loop.py", line 2221, in event_loop_overlap
+    self._commit_forward_results(prev_forward_op, prev_results)
+  File "/data/yuzhou/projects/tokenspeed/python/tokenspeed/runtime/utils/nvtx.py", line 101, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/data/yuzhou/projects/tokenspeed/python/tokenspeed/runtime/engine/event_loop.py", line 1789, in _commit_forward_results
+    request_changes = self.output_processor.post_process_forward_op(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/yuzhou/projects/tokenspeed/python/tokenspeed/runtime/engine/generation_output_processor.py", line 505, in post_process_forward_op
+    model_execution_results.sync()
+  File "/data/yuzhou/projects/tokenspeed/python/tokenspeed/runtime/execution/types.py", line 65, in sync
+    self.copy_event.synchronize()
+  File "/data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/torch/cuda/streams.py", line 254, in synchronize
+    super().synchronize()
+torch.AcceleratorError: CUDA error: an illegal memory access was encountered
+Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+ (event_loop.py:2294)[0m
+terminate called after throwing an instance of 'c10::AcceleratorError'
+  what():  CUDA error: an illegal memory access was encountered
+Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+Exception raised from currentStreamCaptureStatusMayInitCtx at /pytorch/c10/cuda/CUDAGraphsC10Utils.h:71 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x9d (0x77997597305d in /data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0xc114 (0x779975d73114 in /data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/torch/lib/libc10_cuda.so)
+frame #2: <unknown function> + 0xcc775e (0x7798c16c775e in /data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: <unknown function> + 0x7f8e4 (0x7799759548e4 in /data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #4: c10::TensorImpl::~TensorImpl() + 0x9 (0x77997594e279 in /data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #5: <unknown function> + 0x869d55 (0x7798ee869d55 in /data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #6: <unknown function> + 0x869df1 (0x7798ee869df1 in /data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #7: tokenspeed::scheduler_0() [0x59ef53]
+frame #8: tokenspeed::scheduler_0() [0x579982]
+frame #9: tokenspeed::scheduler_0() [0x59edf9]
+frame #10: tokenspeed::scheduler_0() [0x558cc5]
+frame #11: tokenspeed::scheduler_0() [0x610665]
+frame #12: tokenspeed::scheduler_0() [0x610675]
+frame #13: tokenspeed::scheduler_0() [0x55331b]
+frame #14: tokenspeed::scheduler_0() [0x59ef53]
+frame #15: _PyEval_EvalFrameDefault + 0x502d (0x5db4ad in tokenspeed::scheduler_0)
+frame #16: PyEval_EvalCode + 0x15b (0x5d543b in tokenspeed::scheduler_0)
+frame #17: PyRun_StringFlags + 0xd3 (0x6084b3 in tokenspeed::scheduler_0)
+frame #18: PyRun_SimpleStringFlags + 0x3e (0x6b3d0e in tokenspeed::scheduler_0)
+frame #19: Py_RunMain + 0x481 (0x6bc9d1 in tokenspeed::scheduler_0)
+frame #20: Py_BytesMain + 0x2d (0x6bc3ed in tokenspeed::scheduler_0)
+frame #21: <unknown function> + 0x2a1ca (0x779976c2a1ca in /lib/x86_64-linux-gnu/libc.so.6)
+frame #22: __libc_start_main + 0x8b (0x779976c2a28b in /lib/x86_64-linux-gnu/libc.so.6)
+frame #23: _start + 0x25 (0x6576c5 in tokenspeed::scheduler_0)
+
+Fatal Python error: Aborted
+
+Thread 0x0000778f2bffe6c0 (most recent call first):
+  File "/data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/torch/_inductor/compile_worker/subproc_pool.py", line 76 in _recv_msg
+  File "/data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/torch/_inductor/compile_worker/subproc_pool.py", line 271 in _read_thread
+  File "/usr/lib/python3.12/threading.py", line 1010 in run
+  File "/usr/lib/python3.12/threading.py", line 1073 in _bootstrap_inner
+  File "/usr/lib/python3.12/threading.py", line 1030 in _bootstrap
+
+Thread 0x0000778fb7fff6c0 (most recent call first):
+  File "/usr/lib/python3.12/threading.py", line 359 in wait
+  File "/usr/lib/python3.12/threading.py", line 655 in wait
+  File "/data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/tqdm/_monitor.py", line 69 in run
+  File "/usr/lib/python3.12/threading.py", line 1073 in _bootstrap_inner
+  File "/usr/lib/python3.12/threading.py", line 1030 in _bootstrap
+
+Thread 0x0000778fd7fff6c0 (most recent call first):
+  File "/usr/lib/python3.12/threading.py", line 359 in wait
+  File "/usr/lib/python3.12/threading.py", line 655 in wait
+  File "/data/yuzhou/projects/tokenspeed/tokenspeed/lib/python3.12/site-packages/tqdm/_monitor.py", line 69 in run
+  File "/usr/lib/python3.12/threading.py", line 1073 in _bootstrap_inner
+  File "/usr/lib/python3.12/threading.py", line 1030 in _bootstrap
+
+Current thread 0x0000779977217740 (most recent call first):
+  File "/data/yuzhou/projects/tokenspeed/python/tokenspeed/runtime/engine/event_loop.py", line 2295 in run_event_loop
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108 in run
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314 in _bootstrap
+  File "/usr/lib/python3.12/multiprocessing/spawn.py", line 135 in _main
+  File "/usr/lib/python3.12/multiprocessing/spawn.py", line 122 in spawn_main
+  File "<string>", line 1 in <module>
+
+Extension modules: psutil._psutil_linux, setproctitle._setproctitle, numpy._core._multiarray_umath, numpy.linalg._umath_linalg, torch._C, torch._C._dynamo.autograd_compiler, torch._C._dynamo.eval_frame, torch._C._dynamo.guards, torch._C._dynamo.utils, torch._C._fft, torch._C._linalg, torch._C._nested, torch._C._nn, torch._C._sparse, torch._C._special, zmq.backend.cython._zmq, cuda.bindings._bindings.cydriver, cuda.bindings.cydriver, cuda.bindings.driver, tvm_ffi.core, markupsafe._speedups, cuda.bindings._bindings.cyruntime_ptds, cuda.bindings._bindings.cyruntime, cuda.bindings.cyruntime, cuda.bindings.runtime, cuda.bindings._internal.utils, cuda.bindings._internal.nvrtc, cuda.bindings.cynvrtc, cuda.bindings.nvrtc, charset_normalizer.md, charset_normalizer.cd, requests.packages.charset_normalizer.md, requests.packages.chardet.md, requests.packages.charset_normalizer.cd, requests.packages.chardet.cd, regex._regex, yaml._yaml, PIL._imaging, numpy.random._common, numpy.random.bit_generator, numpy.random._bounded_integers, numpy.random._pcg64, numpy.random._generator, numpy.random._mt19937, numpy.random._philox, numpy.random._sfc64, numpy.random.mtrand, pybase64._pybase64, cuda_utils, PIL._imagingft, nvtx._lib.lib, nvtx._lib.profiler, multidict._multidict, yarl._quoting_c, propcache._helpers_c, aiohttp._http_writer, aiohttp._http_parser, aiohttp._websocket.mask, aiohttp._websocket.reader_c, frozenlist._frozenlist, msgspec._core (total: 61)
+/usr/lib/python3.12/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
