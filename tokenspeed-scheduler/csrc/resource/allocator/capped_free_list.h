@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <set>
 #include <unordered_set>
 #include <vector>
 
@@ -44,8 +45,13 @@ public:
     void SetCap(std::int32_t tail_lo);
 
     bool IsCapped(std::int32_t page_id) const;
+    // True when page_id is capped and has already been freed by its owner
+    // (present in the drained set). Capped pages NOT drained are still owned
+    // by an in-flight request.
+    bool IsDrained(std::int32_t page_id) const { return capped_drained_.count(page_id) > 0; }
     std::int32_t Live() const;
     std::int32_t Available() const { return static_cast<std::int32_t>(free_ids_.size()); }
+    // (kept O(log n): free_ids_ is an ordered set, so size() is O(1).)
     std::int32_t NumCapped() const { return n_capped_; }
     std::int32_t Size() const { return size_; }
 
@@ -59,7 +65,18 @@ private:
     std::int32_t size_{0};
     std::int32_t n_capped_{0};
     std::int32_t tail_lo_{kNoTail};
-    std::vector<std::int32_t> free_ids_{};
+    // Ordered set of allocatable (uncapped, free) ids. An ordered set keeps the
+    // "smallest id first" allocation policy -- which lets Shrink() cap the high
+    // tail without hitting in-flight pages, so fires drain quickly -- while
+    // making Allocate/Deallocate/MarkCapped all O(log n). The previous sorted
+    // std::vector paid O(n) per erase-from-front and O(n log n) per Deallocate
+    // (push_back + full std::sort); with pools of tens of thousands of pages
+    // that sort ran on the single-threaded scheduler hot path for every page
+    // freed (each decode step, cache eviction, and request completion),
+    // dominating throughput and scaling with pool size. This is why the
+    // dynamic-capacity path regressed vs. the static O(1) free list even when
+    // no cross-pool fire was ever issued (idle overhead).
+    std::set<std::int32_t> free_ids_{};
     std::unordered_set<std::int32_t> marks_{};
     // Tracks capped pages that have been returned via Deallocate (drained).
     // InFlightCappedCount = n_capped_ - capped_drained_.size().

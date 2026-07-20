@@ -551,6 +551,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              &tokenspeed::Scheduler::HasCappedKvInflight,
              "True while any capped KV page is held by an in-flight request. "
              "Poll until False before unmapping (shrink-and-drain step 2).")
+        .def("capped_kv_inflight_count",
+             &tokenspeed::Scheduler::CappedKvInflightCount,
+             "Count of capped KV pages still held by in-flight requests (0 when "
+             "drained).  Lets the actuator detect a no-progress drain (count "
+             "stalled) and abandon a pinned fire without holding the tail-cap "
+             "for the full drain timeout.")
         .def("prepare_mamba_to_kv_fire",
              &tokenspeed::Scheduler::PrepareMambaToKvFire,
              nb::arg("n_mamba_slots"),
@@ -560,6 +566,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              &tokenspeed::Scheduler::HasCappedMambaInflight,
              "True while any capped mamba slot is held by an in-flight request. "
              "Poll until False before unmapping (shrink-and-drain step 2).")
+        .def("capped_mamba_inflight_count",
+             &tokenspeed::Scheduler::CappedMambaInflightCount,
+             "Count of capped mamba slots still held by in-flight requests (0 "
+             "when drained).  See capped_kv_inflight_count.")
         .def("cancel_xpool_fire", &tokenspeed::Scheduler::CancelXPoolFire,
              "Clear the pending fire latch without updating allocator capacities. "
              "Call when the Python actuator skips the physical VMM step (e.g. arena "
@@ -593,5 +603,16 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "Clear the migration plan latch without incrementing the counter.")
         .def("best_migrate_candidate", &tokenspeed::Scheduler::BestMigrateCandidate,
              "Return the request_id of the best KV retraction candidate, "
-             "or empty string if none is available.");
+             "or empty string if none is available.")
+        // Overlap-scheduling retract safety.
+        .def("set_inflight_requests", &tokenspeed::Scheduler::SetInflightRequests,
+             nb::arg("request_ids"),
+             "Report the request ids of the dispatched-but-uncommitted forward "
+             "batch. Retract/migrate victim selection skips these requests until "
+             "the next call replaces the set. Pass an empty list when nothing is "
+             "in flight.")
+        .def("is_request_inflight", &tokenspeed::Scheduler::IsRequestInflight,
+             nb::arg("request_id"),
+             "True if the request id was reported by the latest "
+             "set_inflight_requests() call.");
 }

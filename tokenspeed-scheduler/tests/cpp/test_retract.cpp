@@ -163,6 +163,36 @@ TEST_F(RetractTestSuite, Retract_RetractedRequestRecoversToDecoding) {
     EXPECT_EQ(scheduler_->RetractedSize(), 0u);
 }
 
+// Regression (2026-07-18): under overlap scheduling the Python event loop
+// plans tick N+1 while tick N's forward batch is still executing on the GPU.
+// Retracting a victim from that batch frees its mamba working slot / KV
+// working page while the kernel still writes through them, surfacing as a
+// CUDA illegal-memory-access (long_horizon sys reps). The event loop reports
+// the uncommitted batch via SetInflightRequests(); every retract path must
+// skip those requests this tick and retry once the batch has committed.
+TEST_F(RetractTestSuite, Retract_SkippedWhileVictimInflight) {
+    BringToDecoding("r1");
+    SendReserveNumTokens("r1", 3);
+
+    // r1 is in the dispatched-but-uncommitted forward batch: the OOM
+    // fallback must not emit a retract write-back for it this tick.
+    scheduler_->SetInflightRequests({"r1"});
+    EXPECT_TRUE(scheduler_->IsRequestInflight("r1"));
+    auto plan1 = PlanOnce();
+    EXPECT_EQ(GetWriteBack(plan1), nullptr);
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+
+    // The batch commits; the next planning call sees an empty in-flight set
+    // and the deferred retract proceeds normally.
+    scheduler_->SetInflightRequests({});
+    EXPECT_FALSE(scheduler_->IsRequestInflight("r1"));
+    SendReserveNumTokens("r1", 3);
+    auto plan2 = PlanOnce();
+    const auto* wb = GetWriteBack(plan2);
+    ASSERT_NE(wb, nullptr);
+    EXPECT_FALSE(wb->op_ids.empty());
+}
+
 // ============================================================
 //  Retract from PrefillDone: PrefillDone → Retracting → Retracted → Decoding
 // ============================================================

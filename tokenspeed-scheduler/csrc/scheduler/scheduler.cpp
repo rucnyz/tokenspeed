@@ -555,20 +555,28 @@ bool IsProactiveRetractFeasible(const Request* request) {
 
     const std::int32_t alloc_count = static_cast<std::int32_t>(full_paged_tokens.size()) -
                                      static_cast<std::int32_t>(prefix_pages.size());
-    if (alloc_count == local_available) {
-        return true;
-    }
-
-    // scheduleRetract() never fabricates `prefix_pages` when it over-counts
-    // relative to token-derived full pages (doing so corrupts the shared
-    // tree, see the 2026-07-12 note in forward.cpp's scheduleRetract). The
-    // only other feasible case is the safe one: local_available > alloc_count,
-    // where scheduleRetract keeps the real prefix_pages and just takes fewer
-    // local pages this tick.
-    return local_available > alloc_count && alloc_count >= 0;
+    // local_available > alloc_count is tolerated: scheduleRetract keeps the
+    // token-aligned alloc_count and takes only that many local pages this
+    // tick without touching prefix_pages. The mid-kernel variant of this
+    // signature (the victim's previous-tick decode kernel has not committed,
+    // so its working page is local but absent from full_paged_tokens) is
+    // excluded upstream by the SetInflightRequests() gate in the victim
+    // loops and in scheduleRetract() itself, so it no longer needs to be
+    // conservatively rejected here. Only prefix_pages over-counting
+    // (alloc_count < 0) remains infeasible -- scheduleRetract would throw.
+    return local_available >= alloc_count && alloc_count >= 0;
 }
 
 }  // namespace
+
+void Scheduler::SetInflightRequests(const std::vector<std::string>& request_ids) {
+    inflight_request_ids_.clear();
+    inflight_request_ids_.insert(request_ids.begin(), request_ids.end());
+}
+
+bool Scheduler::IsRequestInflight(const std::string& request_id) const {
+    return inflight_request_ids_.count(request_id) > 0;
+}
 
 bool Scheduler::IsXPoolProactiveRetractInBackoff(const std::string& request_id) const {
     const auto it = xpool_proactive_retract_backoff_until_.find(request_id);
@@ -608,9 +616,39 @@ std::vector<WriteBackOperation> Scheduler::newXPoolCappedDrainRetractOperations(
     Request* victim = nullptr;
     std::int32_t best_score = 0;
 
-    if (HasCappedKvInflight()) {
+    // Proactive "capped-drain" retraction exists solely to vacate the capped
+    // tail pages/slots that a *currently pending* XPool fire is waiting to
+    // drain before its physical unmap.  Gate each branch on there being a
+    // pending fire in the matching direction (kv_to_mamba caps KV tail pages ->
+    // HasCappedKvInflight; mamba_to_kv caps mamba tail slots ->
+    // HasCappedMambaInflight).  Without this gate, capped tail pages/slots that
+    // merely *linger* after a fire already committed keep driving this retract
+    // loop indefinitely -- pointless (no drain is waiting on them) and
+    // dangerous (retracting an in-flight decoder is the
+    // alloc_count=0/local_available=1 race that crashes the engine under the
+    // shifting regime's conc=128 pressure).  This became load-bearing once
+    // static (logical-only) mamba_to_kv fires started COMMITTING instead of
+    // cancelling on drain skip (see xpool_actuator.py's static-mamba drain
+    // skip): a committed fire leaves its capped mamba tail slots pinned by
+    // long-running decoders, so HasCappedMambaInflight() stays true for minutes
+    // after the fire is already done, and the un-gated loop then retracted
+    // in-flight decoders on every subsequent tick.
+    //
+    // A prepared-but-not-yet-applied fire is signalled by the pre-shrunk
+    // counters: PrepareKvToMambaFire caps KV tail pages (kv_pre_shrunk_pages_ >
+    // 0) and PrepareMambaToKvFire caps mamba tail slots (mamba_pre_shrunk_slots_
+    // > 0); both are cleared by ApplyXPoolFire and CancelXPoolFire, so they are
+    // non-zero exactly across the prepare -> drain -> apply/cancel window during
+    // which a drain is actually outstanding.
+    const bool pending_kv = kv_pre_shrunk_pages_ > 0;
+    const bool pending_mamba = mamba_pre_shrunk_slots_ > 0;
+
+    if (pending_kv && HasCappedKvInflight()) {
         PruneExpiredXPoolProactiveRetractBackoff();
         for (const auto& [id, req] : requests_) {
+            if (IsRequestInflight(id)) {
+                continue;
+            }
             if (IsXPoolProactiveRetractInBackoff(id)) {
                 continue;
             }
@@ -634,11 +672,14 @@ std::vector<WriteBackOperation> Scheduler::newXPoolCappedDrainRetractOperations(
                 victim = req.get();
             }
         }
-    } else if (HasCappedMambaInflight() && mamba_allocator_) {
+    } else if (pending_mamba && HasCappedMambaInflight() && mamba_allocator_) {
         // Mamba slots live on radix-tree nodes; retracting the largest active
         // decoder is the same heuristic as S2.6 BestMigrateCandidate.
         PruneExpiredXPoolProactiveRetractBackoff();
         for (const auto& [id, req] : requests_) {
+            if (IsRequestInflight(id)) {
+                continue;
+            }
             if (IsXPoolProactiveRetractInBackoff(id)) {
                 continue;
             }
@@ -714,10 +755,34 @@ void Scheduler::check_device_mem() {
 
     std::int32_t free_device = device_allocator_.AvailablePages();
 
-    if (tree_device_total + req_device_total + free_device != total_device) {
-        spdlog::error("[check_mem] DEVICE PAGE ACCOUNTING MISMATCH: tree={} req={} free={} sum={} total={}",
-                      tree_device_total, req_device_total, free_device,
-                      tree_device_total + req_device_total + free_device, total_device);
+    // Expected accounting total.
+    //
+    // Static mode: every usable page (all but reserved id 0) is always mapped,
+    // so free + tree + req must equal TotalPages() - 1.
+    //
+    // Dynamic-capacity (XPool) mode: only MappedPages() are physically backed;
+    // the never-mapped VA headroom and any pages lent to the peer pool via
+    // Shrink are neither free nor allocated, so they must NOT be counted.  A
+    // page that was allocated to a request and then tail-capped mid-flight
+    // (Shrink during a kv_to_mamba fire) is still held by that request (counted
+    // in `req`) but no longer in MappedPages(); CappedInflightPages() adds it
+    // back so the identity balances:
+    //     free + tree + req == MappedPages() + CappedInflightPages()
+    // Using TotalPages()-1 here (the old static assumption) false-positives on
+    // sys/sys_lru at startup by exactly the headroom size, which is why
+    // DEBUG_MEM was never usable with dynamic capacity.
+    const std::int32_t expected_total =
+        config_.enable_xpool_dynamic_capacity
+            ? device_allocator_.MappedPages() + device_allocator_.CappedInflightPages()
+            : total_device;
+
+    if (tree_device_total + req_device_total + free_device != expected_total) {
+        spdlog::error(
+            "[check_mem] DEVICE PAGE ACCOUNTING MISMATCH: tree={} req={} free={} sum={} expected={} "
+            "(mapped={} capped_inflight={} va_total={})",
+            tree_device_total, req_device_total, free_device,
+            tree_device_total + req_device_total + free_device, expected_total, device_allocator_.MappedPages(),
+            device_allocator_.CappedInflightPages(), total_device);
         ok = false;
     }
 
@@ -846,6 +911,9 @@ std::string Scheduler::BestMigrateCandidate() const {
     // intentionally mirror the retraction victim-selection in forward.cpp.
     Request* best = nullptr;
     for (const auto& [id, req] : requests_) {
+        if (IsRequestInflight(id)) {
+            continue;
+        }
         if (!req->Is<fsm::Decoding>() &&
             !(req->Is<fsm::PrefillDone>() && config_.role != Role::kD)) {
             continue;
@@ -869,6 +937,10 @@ void Scheduler::PrepareKvToMambaFire(std::int32_t n_kv_pages) {
 
 bool Scheduler::HasCappedKvInflight() const {
     return device_allocator_.CappedInflightPages() > 0;
+}
+
+std::int32_t Scheduler::CappedKvInflightCount() const {
+    return device_allocator_.CappedInflightPages();
 }
 
 void Scheduler::PrepareMambaToKvFire(std::int32_t n_mamba_chunks) {
@@ -915,6 +987,13 @@ bool Scheduler::HasCappedMambaInflight() const {
         return false;
     }
     return mamba_allocator_->CappedInflightSlots() > 0;
+}
+
+std::int32_t Scheduler::CappedMambaInflightCount() const {
+    if (!mamba_allocator_) {
+        return 0;
+    }
+    return mamba_allocator_->CappedInflightSlots();
 }
 
 void Scheduler::ApplyXPoolFire(const XPoolFirePlan& plan) {

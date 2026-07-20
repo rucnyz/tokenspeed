@@ -153,6 +153,45 @@ def test_static_mamba_to_kv_grows_kv_only() -> None:
     assert sched.applied == [cpp_plan]
 
 
+def test_static_mamba_to_kv_commits_without_draining_pinned_tail() -> None:
+    """Static (logical-only) mamba never unmaps physical slots, so a
+    mamba_to_kv fire has no kernel-vs-unmap race to drain against.  Draining
+    was not just wasted work: PrepareMambaToKvFire caps the *tail* mamba slots,
+    which under smallest-id-first allocation are pinned by long-running decode
+    sessions, so has_capped_mamba_inflight never cleared and EVERY mamba_to_kv
+    fire was cancelled on the no-progress abort -- silently disabling the
+    KV<-mamba rebalance the budgeter direction-fix enables and starving
+    KV-bound regimes (swarm/shifting) of tail relief.  With a static mamba
+    arena the fire must commit (grow KV) even while the capped mamba tail is
+    still 'in flight': the physical pages stay resident and the CappedFreeList
+    barrier removes the slot from the pool once its owner frees it.
+    """
+    kv = _KvArena(mapped_chunks=5, max_chunks=20)  # has slack to grow
+    mamba = _StaticMambaArena()
+    sched = _FakeScheduler()
+    # Drain would NEVER clear (tail pinned by long-running decodes): proves we
+    # do not wait on it for a static arena.
+    sched.has_capped_mamba_inflight = lambda: True  # type: ignore[assignment]
+    sched.capped_mamba_inflight_count = lambda: 2  # type: ignore[attr-defined]
+
+    actuator = XPoolActuator(kv_arena=kv, mamba_arena=mamba, scheduler=sched)
+    cpp_plan = SimpleNamespace(op_id=3, direction="mamba_to_kv", page_ids=[1, 2])
+    plan = FirePlan(
+        direction="mamba_to_kv", page_ids=[1, 2], op_id=3, cpp_plan=cpp_plan
+    )
+    actuator._execute_locked(plan)
+
+    assert kv.calls == [("grow", 2)]  # KV grew despite the pinned mamba tail
+    assert mamba.calls == []
+    assert sched.applied == [cpp_plan]  # committed, not cancelled
+    assert sched.cancelled == 0
+    assert actuator.committed_mamba_to_kv == 1
+    assert actuator.cancelled_mamba_to_kv == 0
+    # Drain stage was skipped entirely -> no drain timings recorded.
+    assert actuator.last_fire_drain_poll_us == 0.0
+    assert actuator.last_fire_drain_sync_us == 0.0
+
+
 def test_mamba_to_kv_cancels_when_kv_full() -> None:
     """mamba_to_kv must cancel when KV arena cannot grow further."""
     kv = _KvArena(mapped_chunks=20, max_chunks=20)  # no slack
@@ -270,10 +309,20 @@ def test_scheduler_not_called_when_none() -> None:
 
 
 def _actuator_with_recorder():
-    """Return (actuator, fired) where fired records launched op_ids."""
+    """Return (actuator, fired) where fired records launched op_ids.
+
+    The stub stands in for the whole background worker, so it also releases
+    the outstanding-fire gate that the real worker decrements on completion
+    (otherwise every plan after the first would be skipped as "busy").
+    """
     actuator = XPoolActuator(kv_arena=_KvArena(), mamba_arena=_StaticMambaArena())
     fired: list[int] = []
-    actuator.execute_async = lambda plan: fired.append(plan.op_id)  # type: ignore[method-assign]
+
+    def _record_and_finish(plan: FirePlan) -> None:
+        fired.append(plan.op_id)
+        actuator._outstanding_fires = max(0, actuator._outstanding_fires - 1)
+
+    actuator.execute_async = _record_and_finish  # type: ignore[method-assign]
     return actuator, fired
 
 

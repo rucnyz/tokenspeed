@@ -220,8 +220,26 @@ std::optional<XPoolFirePlan> BudgetAgent::Tick(const PoolSnapshot& snapshot) {
         return std::nullopt;
     }
 
+    // Reclaimable mamba capacity = free + evictable (cached-but-unused prefix
+    // states the eviction manager can drop on demand), mirroring the
+    // Admitter::kCrossEvict feasibility check in admitter.cpp. Gating on raw
+    // mamba_free_slots alone is wrong: under steady load the mamba pool's
+    // free list is nearly always near-empty (LPB keeps finished decodes'
+    // slots "evictable" rather than immediately freeing them -- observed
+    // median raw mamba_free=3 vs. mean effective-free (free+evictable)
+    // ~300 on the capped long_horizon regime), so the raw-free floor check
+    // structurally blocked mamba_to_kv on ~95% of the ticks where KV was
+    // genuinely the more-pressured pool. The direction comparison above
+    // (adj_kv/adj_mamba) already discounts evictable slots from mamba
+    // pressure for the same reason (see AdjustedPressureMamba's caller); the
+    // floor gate must use the same accounting or it silently overrides that
+    // comparison, leaving kv_to_mamba as the only fire direction ever
+    // committed even when KV is tighter -- observed in production as 43/43
+    // committed fires going kv_to_mamba on a regime where KV utilisation
+    // exceeded mamba's on 56% of ticks, worsening KV-bound p99 TTFT.
+    const std::int32_t mamba_reclaimable = snapshot.mamba_free_slots + snapshot.mamba_evictable_slots;
     if (adj_kv > adj_mamba + config_.xpool_nb_margin &&
-        snapshot.mamba_free_slots > config_.xpool_mamba_floor_slots) {
+        mamba_reclaimable > config_.xpool_mamba_floor_slots) {
         // Guard: only fire if KV has physical VMM headroom to receive handles.
         if (n_kv > 0 && snapshot.kv_headroom_pages < n_kv) {
             if (BudgetLogEnabled()) {
@@ -315,7 +333,16 @@ double BudgetAgent::AdjustedPressureKv(double base_pressure) const {
     const double adjusted = base_pressure
                           + config_.xpool_w_queue * q_norm
                           + config_.xpool_w_retract * r_norm;
-    return std::clamp(adjusted, 0.0, 1.0);
+    // Deliberately unclamped above 1.0: the whole point of the queue/retract
+    // boost is to let backpressure win the direction comparison
+    // (adj_kv > adj_mamba + nb_margin) even when *both* pools' raw
+    // utilisation EWMA is already pinned near 1.0 under sustained load. A
+    // symmetric clamp(...,1.0) here would tie adj_kv back to adj_mamba at
+    // exactly the moment the signal is most needed, permanently masking a
+    // real, still-growing queue. Only the lower bound matters for the S2.1
+    // saturation gate (`adj < xpool_saturation_low`), which is unaffected by
+    // an unbounded upper side.
+    return std::max(adjusted, 0.0);
 }
 
 double BudgetAgent::AdjustedPressureMamba(double base_pressure) const {
@@ -330,7 +357,10 @@ double BudgetAgent::AdjustedPressureMamba(double base_pressure) const {
                : (config_.max_batch_size > 0 ? config_.max_batch_size / 4 : 1)));
     const double p_norm = std::clamp(ewma_paused_ / paused_ref, 0.0, 1.0);
     const double adjusted = base_pressure + config_.xpool_w_paused * p_norm;
-    return std::clamp(adjusted, 0.0, 1.0);
+    // See AdjustedPressureKv: intentionally unclamped above 1.0 for the same
+    // reason (keep the paused-backlog signal effective even when raw mamba
+    // utilisation is already saturated).
+    return std::max(adjusted, 0.0);
 }
 
 bool BudgetAgent::ReverseDirectionGated(

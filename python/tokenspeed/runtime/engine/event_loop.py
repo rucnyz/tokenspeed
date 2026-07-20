@@ -113,6 +113,43 @@ def calc_l3_query_hashes(scheduler, tokens: list[int]) -> list[str]:
     return scheduler.calc_rolling_hash(tokens, apply_match=True)
 
 
+# Environment variables that override XPoolActuator drain/cooldown tunables.
+# Each maps an env var name to the XPoolActuator constructor kwarg.  Kept as a
+# module constant so both the runtime wiring and tests reference one source of
+# truth.  All are floats (seconds); a blank/absent/invalid value is ignored so
+# the actuator's class default stands.
+_XPOOL_ENV_TUNABLES = {
+    "XPOOL_DRAIN_TIMEOUT_S": "drain_timeout_s",
+    "XPOOL_DRAIN_POLL_S": "drain_poll_s",
+    "XPOOL_TIMEOUT_COOLDOWN_S": "timeout_cooldown_s",
+    "XPOOL_DRAIN_NOPROGRESS_ABORT_S": "drain_noprogress_abort_s",
+}
+
+
+def _xpool_actuator_env_tunables() -> dict[str, float]:
+    """Collect XPoolActuator drain/cooldown overrides from the environment.
+
+    Returns a kwargs dict (subset of ``drain_timeout_s``, ``drain_poll_s``,
+    ``timeout_cooldown_s``, ``drain_noprogress_abort_s``) for every env var in
+    :data:`_XPOOL_ENV_TUNABLES` that is set to a parseable float.  Lets the
+    regime-matrix driver sweep these per arm without recompiling or touching
+    the external server_args parser.  Unset/blank/invalid vars are skipped so
+    the actuator keeps its class default.
+    """
+    tunables: dict[str, float] = {}
+    for env_name, kwarg in _XPOOL_ENV_TUNABLES.items():
+        raw = os.environ.get(env_name)
+        if raw is None or not raw.strip():
+            continue
+        try:
+            tunables[kwarg] = float(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Ignoring %s=%r: not a float", env_name, raw
+            )
+    return tunables
+
+
 # Sleep between iterations while frozen (PAUSED_ALL) so the keep-mode pause does
 # not busy-spin a CPU core waiting for /resume.
 _PAUSED_IDLE_SLEEP_S = 0.001
@@ -507,6 +544,7 @@ class EventLoop:
             xpool_ewma_tau_s=server_args.xpool_ewma_tau_s,
             xpool_saturation_low=server_args.xpool_saturation_low,
             xpool_reverse_cooldown_s=server_args.xpool_reverse_cooldown_s,
+            xpool_mamba_floor_slots=server_args.xpool_mamba_floor_slots,
             # PressureAdapter (S2.3): forward-looking signal weights.
             xpool_w_queue=server_args.xpool_w_queue,
             xpool_w_retract=server_args.xpool_w_retract,
@@ -1465,6 +1503,15 @@ class EventLoop:
                 1, int(getattr(server_args, "budgeter_pages_per_fire", 64))
             )
 
+            # Drain/cooldown tunables sourced from the environment so the
+            # regime-matrix driver can sweep them per arm without recompiling
+            # or threading a new flag through the external server_args parser
+            # (see docs/guides/hima_phase3.md).  Absent/blank env vars leave
+            # the XPoolActuator class defaults in place.
+            xpool_tunables = _xpool_actuator_env_tunables()
+            if xpool_tunables:
+                logger.info("XPool actuator env tunables: %s", xpool_tunables)
+
             # ----------------------------------------------------------------
             # Fast path: pre-construction arenas were built by the factory
             # before pool construction and CUDA graph capture.  Pool tensors
@@ -1479,6 +1526,7 @@ class EventLoop:
                     mamba_arena=mamba_arena,
                     scheduler=self.scheduler,
                     kv_bytes_per_page=kv_bytes_per_page,
+                    **xpool_tunables,
                 )
                 logger.info(
                     "XPool dynamic capacity enabled (pre-construction path): "
@@ -1671,6 +1719,7 @@ class EventLoop:
                 mamba_arena=mamba_arena,
                 scheduler=self.scheduler,
                 kv_bytes_per_page=kv_bytes_per_page,
+                **xpool_tunables,
             )
             logger.info(
                 "XPool dynamic capacity enabled (legacy post-capture path): "
@@ -2456,6 +2505,17 @@ class EventLoop:
                 prev_results = None
                 prev_forward_op = None
                 continue
+            # Report the dispatched-but-uncommitted batch before planning:
+            # its kernels are still running on the GPU, so retract/migrate
+            # victim selection must skip those requests this tick (retracting
+            # one frees its mamba working slot / KV pages while the kernel
+            # still writes through them -- CUDA illegal memory access). See
+            # Scheduler::SetInflightRequests.
+            self.scheduler.set_inflight_requests(
+                list(prev_forward_op.request_ids)
+                if prev_forward_op is not None
+                else []
+            )
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
             self._handle_flat_oom_terminals(execution_plan)

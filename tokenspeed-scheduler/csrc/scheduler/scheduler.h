@@ -29,6 +29,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "resource/types.h"
@@ -68,6 +69,39 @@ public:
     std::vector<std::string> CalcRollingHash(const std::vector<std::int32_t>& input_tokens, bool apply_match = false);
 
     ExecutionPlan NextExecutionPlan();
+
+    // Overlap-scheduling retract safety (2026-07-18).
+    //
+    // The Python overlap event loop dispatches forward batch N, then plans
+    // batch N+1 (this NextExecutionPlan call) BEFORE committing batch N's
+    // results. Any retract decided during that planning races batch N's
+    // still-running kernels if the victim is part of batch N: applyRetract
+    // frees the victim's mamba working slot (reallocated to another request
+    // while the kernel still writes its recurrent state) and WriteBackDone
+    // later drops its device tree ref (pages evicted/reused, or with XPool
+    // fires physically cuMemUnmap-ed, while the kernel still reads its KV
+    // prefix). Observed repeatedly as CUDA illegal-memory-access seconds
+    // after retracting an actively-decoding victim (long_horizon sys reps,
+    // 2026-07-18).
+    //
+    // The event loop therefore reports the still-uncommitted batch's request
+    // ids immediately before each NextExecutionPlan() call, and every
+    // retract victim-selection path (S2.1 OOM fallback, S2.5-followup-2
+    // proactive drain retract, S2.6 migrate candidate) skips these requests.
+    // This defers a retract by at most one iteration: if OOM leaves this
+    // plan with no forward op, nothing new gets dispatched, batch N commits
+    // at the end of the current iteration, and the NEXT planning call sees
+    // an empty in-flight set so the victim can be retracted with no kernel
+    // in flight -- the same ordering a non-overlap loop provides.
+    //
+    // Args:
+    //   request_ids: request ids in the dispatched-but-uncommitted forward
+    //     batch; pass an empty vector when nothing is in flight.
+    void SetInflightRequests(const std::vector<std::string>& request_ids);
+
+    // True if the request is in the dispatched-but-uncommitted forward batch
+    // reported by the latest SetInflightRequests() call.
+    bool IsRequestInflight(const std::string& request_id) const;
 
     void Advance(const ExecutionEvent& event);
     std::vector<KvCacheEvent> DrainKvEvents();
@@ -128,6 +162,13 @@ public:
     // The Python actuator polls this until it returns false before unmapping.
     bool HasCappedKvInflight() const;
 
+    // Count of capped KV pages still held by in-flight requests (0 when
+    // drained).  Exposes the underlying signal behind HasCappedKvInflight()
+    // so the Python actuator's _wait_drain can detect *no-progress* (count
+    // stopped decreasing) and abandon a pinned fire in sub-second time,
+    // instead of holding the prepare tail-cap for the full drain timeout.
+    std::int32_t CappedKvInflightCount() const;
+
     // Symmetric shrink-and-drain helpers for mamba_to_kv direction.
     //
     // PrepareMambaToKvFire() caps the tail mamba slots BEFORE physical unmap so
@@ -135,6 +176,10 @@ public:
     // HasCappedMambaInflight() polls until all capped slots are freed.
     void PrepareMambaToKvFire(std::int32_t n_mamba_slots);
     bool HasCappedMambaInflight() const;
+
+    // Count of capped mamba slots still held by in-flight requests (0 when
+    // drained).  See CappedKvInflightCount() for the rationale.
+    std::int32_t CappedMambaInflightCount() const;
 
     // Record a wall-clock backoff for proactive retract after scheduleRetract
     // page-accounting mismatch on this request (S2.5-followup-2).
@@ -268,6 +313,10 @@ private:
 
     bool IsXPoolProactiveRetractInBackoff(const std::string& request_id) const;
     void PruneExpiredXPoolProactiveRetractBackoff();
+
+    // See SetInflightRequests(). Requests in this set must not be selected
+    // as retract/migrate victims during the current planning call.
+    std::unordered_set<std::string> inflight_request_ids_;
 
 private:
     PageAllocator device_allocator_;

@@ -42,6 +42,22 @@ FIRE_BREAKDOWN_DRAIN_SYNC = "drain_sync_us"
 FIRE_BREAKDOWN_VMM = "vmm_us"
 
 
+class _NoProgress(Exception):
+    """Raised inside ``_wait_drain`` when the capped in-flight count has
+    stalled (stopped strictly decreasing) for DRAIN_NOPROGRESS_ABORT_S.
+
+    Signals that the fire's drain will not complete soon (the capped tail is
+    pinned by long-running requests), so it should be cancelled now to
+    release the prepare tail-cap instead of holding depressed capacity until
+    the full DRAIN_TIMEOUT_S.  Carries the last observed in-flight count for
+    the cancellation log line.
+    """
+
+    def __init__(self, count: int) -> None:
+        super().__init__(f"drain made no progress with {count} still in flight")
+        self.count = int(count)
+
+
 def _empty_fire_breakdown() -> dict[str, float]:
     return {
         FIRE_BREAKDOWN_PREPARE: 0.0,
@@ -77,10 +93,41 @@ class XPoolActuator:
     """
 
     #: Maximum seconds to wait for in-flight capped pages to drain before
-    #: proceeding with the physical unmap.  A warning is emitted on timeout.
-    DRAIN_TIMEOUT_S: float = 30.0
+    #: cancelling the fire.  Keep this SHORT: for the entire drain window the
+    #: prepare_*_fire tail-cap holds real KV pages / mamba slots out of the
+    #: allocator, so a long wait on a fire that will never drain (long-running
+    #: decode sessions pinning the capped tail) is a direct capacity --
+    #: therefore throughput -- loss.  The pre-2026-07-18 value of 30 s meant a
+    #: single doomed mamba_to_kv fire depressed capacity for 30 s at a time.
+    DRAIN_TIMEOUT_S: float = 5.0
     #: Poll interval (seconds) while waiting for drain to complete.
     DRAIN_POLL_S: float = 0.005
+    #: After a fire in some direction is cancelled because its drain timed
+    #: out, skip new plans in that same direction for this many seconds.
+    #: Rationale: a drain timeout means the capped tail is pinned by
+    #: long-running requests; retrying the very next budget tick just re-caps
+    #: the tail and burns another DRAIN_TIMEOUT_S of depressed capacity.  The
+    #: workload has to change (requests finish / get evicted) before the same
+    #: direction can succeed, and that happens on a seconds timescale.
+    TIMEOUT_COOLDOWN_S: float = 30.0
+    #: No-progress early-abort window (seconds).  When the C++ scheduler
+    #: exposes a *count* of capped pages/slots still in flight (via
+    #: ``capped_kv_inflight_count`` / ``capped_mamba_inflight_count``),
+    #: ``_wait_drain`` bails out as soon as that count stops strictly
+    #: decreasing for this long, instead of holding the prepare tail-cap for
+    #: the full DRAIN_TIMEOUT_S.  This is the primary fix for the fire-churn
+    #: throughput/tail regression (2026-07-19): 40-66% of fires never drain
+    #: (the capped tail is pinned by long-running decode sessions), and under
+    #: the old bool-only path each one held real KV pages / mamba slots out
+    #: of the allocator for the entire DRAIN_TIMEOUT_S before cancelling --
+    #: depressed capacity that cost sys ~1-3% throughput and inflated p90/p99
+    #: TTFT.  A truly-draining fire keeps decrementing the count and is
+    #: unaffected; a pinned fire (count flat) is abandoned in sub-second time
+    #: so its capacity is released back immediately.  0.0 disables the
+    #: early-abort (fall back to DRAIN_TIMEOUT_S only).  Inert when the count
+    #: method is absent (older scheduler build): the bool drain path is used
+    #: unchanged.
+    DRAIN_NOPROGRESS_ABORT_S: float = 0.75
 
     def __init__(
         self,
@@ -89,9 +136,26 @@ class XPoolActuator:
         mamba_arena: ChunkArena,
         scheduler: Any | None = None,
         kv_bytes_per_page: int = 0,
+        drain_timeout_s: float | None = None,
+        drain_poll_s: float | None = None,
+        timeout_cooldown_s: float | None = None,
+        drain_noprogress_abort_s: float | None = None,
     ) -> None:
         self.kv_arena = kv_arena
         self.mamba_arena = mamba_arena
+        # Per-instance overrides of the drain/cooldown tunables (the class
+        # constants are the defaults).  Wired from environment variables in
+        # EngineCore._init_xpool_actuator so the regime-matrix driver can
+        # sweep them per arm without recompiling or touching the external
+        # server_args parser.  None means "use the class default".
+        if drain_timeout_s is not None:
+            self.DRAIN_TIMEOUT_S = float(drain_timeout_s)
+        if drain_poll_s is not None:
+            self.DRAIN_POLL_S = float(drain_poll_s)
+        if timeout_cooldown_s is not None:
+            self.TIMEOUT_COOLDOWN_S = float(timeout_cooldown_s)
+        if drain_noprogress_abort_s is not None:
+            self.DRAIN_NOPROGRESS_ABORT_S = float(drain_noprogress_abort_s)
         # Optional: if provided, apply_xpool_fire is called after each
         # successful VMM operation to update C++ allocator capacities.
         self._scheduler = scheduler
@@ -140,6 +204,20 @@ class XPoolActuator:
         self.last_fire_vmm_us: float = 0.0
         self._ewma_xfer_alpha: float = 0.25
         self._fires_observed: int = 0
+        # Backpressure bookkeeping (2026-07-18): plans skipped because a fire
+        # was still in flight, and per-direction cooldown deadlines armed by
+        # drain-timeout cancellations.  See maybe_execute for why both exist.
+        self.skipped_busy: int = 0
+        self.skipped_cooldown: int = 0
+        self._direction_cooldown_until: dict[str, float] = {}
+        # Count of fires dispatched (prepare done, background thread spawned)
+        # whose worker has not finished yet.  Unlike _inflight (set only once
+        # the worker acquires the lock), this covers the spawn->lock window,
+        # so maybe_execute can tell "a fire is genuinely outstanding" apart
+        # from "idle".  Incremented on the event-loop thread, decremented on
+        # the worker thread; int +=/-= under the GIL is atomic enough for a
+        # >0 check.
+        self._outstanding_fires: int = 0
         # S2.6: committed migration count (Stage-0: directed retraction).
         self.committed_migrate: int = 0
         self._last_migrate_op_id: int = 0
@@ -211,8 +289,44 @@ class XPoolActuator:
         if op_id == self._last_op_id:
             return False
         self._last_op_id = op_id
+        direction = str(plan.direction)
+
+        # Backpressure (2026-07-18): the C++ budgeter emits a fresh plan every
+        # tick (~1 s) with no notion of whether the previous one was actuated,
+        # while a single drain wait can take up to DRAIN_TIMEOUT_S.  Without
+        # this gate every tick ran prepare_*_fire (capping another tail slice
+        # of KV pages / mamba slots on the spot) and queued another worker
+        # thread on self._lock — observed in the 2026-07-18 long_horizon run
+        # as 1375 dispatched / 0 committed fires, an unbounded thread queue,
+        # and chronically depressed allocator capacity that put the HiMA arm
+        # BELOW baseline throughput.  Skipping is safe: we only record the
+        # op_id (dedup) and touch no scheduler state, and the budgeter
+        # replaces the latched plan on its next tick anyway.  We must NOT call
+        # cancel_xpool_fire here: it would undo the outstanding fire's
+        # prepare caps mid-drain and re-expose the unmap race.
+        if self._outstanding_fires > 0:
+            self.skipped_busy += 1
+            logger.debug(
+                "XPool fire skipped (busy): op_id=%d direction=%s", op_id, direction
+            )
+            return True
+
+        # Per-direction cooldown after a cancelled fire: a drain timeout means
+        # the capped tail is pinned by long-running requests, so retrying next
+        # tick just re-caps the tail and burns another DRAIN_TIMEOUT_S of
+        # depressed capacity for a fire that cannot succeed yet.
+        cooldown_until = self._direction_cooldown_until.get(direction, 0.0)
+        if time.monotonic() < cooldown_until:
+            self.skipped_cooldown += 1
+            logger.debug(
+                "XPool fire skipped (cooldown): op_id=%d direction=%s",
+                op_id,
+                direction,
+            )
+            return True
+
         fire_plan = FirePlan(
-            direction=str(plan.direction),
+            direction=direction,
             page_ids=list(plan.page_ids),
             op_id=op_id,
             cpp_plan=plan,
@@ -231,6 +345,7 @@ class XPoolActuator:
 
         fire_plan.prepare_us = prepare_us
         fire_plan.already_prepared = True
+        self._outstanding_fires += 1
         self.execute_async(fire_plan)
         return True
 
@@ -259,6 +374,19 @@ class XPoolActuator:
             self.cancelled_kv_to_mamba += 1
         elif plan.direction == "mamba_to_kv":
             self.cancelled_mamba_to_kv += 1
+        self._arm_direction_cooldown(plan.direction)
+
+    def _arm_direction_cooldown(self, direction: str) -> None:
+        """Suppress new fires in *direction* for TIMEOUT_COOLDOWN_S seconds.
+
+        Armed whenever a fire is cancelled (drain timeout, headroom
+        exhausted, prepare failure): none of those conditions clear within a
+        single budget tick, so an immediate retry only re-caps allocator
+        tail capacity for another doomed drain wait.
+        """
+        self._direction_cooldown_until[direction] = (
+            time.monotonic() + self.TIMEOUT_COOLDOWN_S
+        )
 
     def _check_and_prepare(self, plan: FirePlan) -> float | None:
         """CPU-only headroom check + C++ tail-cap (no GPU sync involved).
@@ -503,6 +631,7 @@ class XPoolActuator:
                             self.cancelled_kv_to_mamba += 1
                         elif plan.direction == "mamba_to_kv":
                             self.cancelled_mamba_to_kv += 1
+                        self._arm_direction_cooldown(plan.direction)
             except Exception as exc:  # noqa: BLE001
                 # Background threads silently swallow uncaught exceptions.
                 # Log explicitly so failures are always visible.
@@ -514,6 +643,9 @@ class XPoolActuator:
                 )
             finally:
                 self._inflight = False
+                # max() keeps direct _execute_locked callers (tests/tools that
+                # bypass maybe_execute's increment) from driving this negative.
+                self._outstanding_fires = max(0, self._outstanding_fires - 1)
 
     def _kv_pages_to_mamba_chunks(self, n_kv_pages: int) -> int:
         """Convert a KV page count to the corresponding mamba chunk count.
@@ -553,17 +685,89 @@ class XPoolActuator:
                 ``has_capped_mamba_inflight`` for mamba_to_kv direction.
 
         Returns:
-            ``(poll_us, sync_us)`` — cumulative microseconds spent in the
-            scheduler poll/sleep loop and in ``torch.cuda.synchronize()``
-            calls respectively.
+            ``(drained, poll_us, sync_us)`` — *drained* is True when the
+            capped pages/slots were fully vacated (safe to unmap) and False
+            when :attr:`DRAIN_TIMEOUT_S` expired with in-flight requests
+            still occupying them; *poll_us*/*sync_us* are the cumulative
+            microseconds spent in the scheduler poll/sleep loop and in
+            ``torch.cuda.synchronize()`` calls respectively.
+
+            A False return means the fire MUST be cancelled, not forced:
+            under sustained KV scarcity the capped pages belong to
+            long-running decode requests that will keep issuing kernels
+            against them, so unmapping anyway (the pre-2026-07-18 behavior)
+            turns the timeout into a guaranteed ``CUDA error: an illegal
+            memory access`` one decode step later — this was the
+            reproducible crash that killed every HiMA arm mid-rep on the
+            cc_qwen_t6 @ max_total_tokens=640000 workload (see
+            docs/guides/hima_phase3.md).
         """
         poll_us = 0.0
         sync_us = 0.0
         if self._scheduler is None:
-            return poll_us, sync_us
+            return True, poll_us, sync_us
         drain_fn = getattr(self._scheduler, drain_fn_name, None)
         if drain_fn is None:
-            return poll_us, sync_us
+            return True, poll_us, sync_us
+
+        # No-progress early abort (2026-07-19): prefer a *count* of capped
+        # pages/slots still in flight over the bare bool so a pinned fire can
+        # be abandoned in sub-second time instead of holding its prepare
+        # tail-cap for the full DRAIN_TIMEOUT_S.  Map the bool drain-fn name
+        # to its count sibling; fall back to the bool (no early abort) when
+        # the scheduler build predates the count binding.
+        count_fn_name = {
+            "has_capped_kv_inflight": "capped_kv_inflight_count",
+            "has_capped_mamba_inflight": "capped_mamba_inflight_count",
+        }.get(drain_fn_name)
+        count_fn = (
+            getattr(self._scheduler, count_fn_name, None)
+            if count_fn_name is not None
+            else None
+        )
+        noprogress_s = self.DRAIN_NOPROGRESS_ABORT_S
+        # Progress tracking for the count-based abort: the smallest in-flight
+        # count seen so far and the monotonic timestamp it last improved.
+        best_count = math.inf
+        last_improve_t = time.monotonic()
+
+        def _still_draining() -> bool:
+            """True while capped pages/slots remain in flight.
+
+            When the count sibling is available it also drives the
+            no-progress abort: raises :class:`_NoProgress` once the count has
+            failed to strictly decrease for ``noprogress_s`` seconds.  If the
+            count method is missing or returns a non-numeric value (e.g. an
+            older scheduler build, or a test double), it self-heals by
+            clearing ``count_fn`` and falling back to the plain bool drain
+            check for the remainder of the wait.
+            """
+            nonlocal best_count, last_improve_t, count_fn
+            if count_fn is not None:
+                try:
+                    raw = count_fn()
+                except Exception:  # noqa: BLE001
+                    raw = None
+                # Require a genuine int (the nanobind binding returns a Python
+                # int).  bool is an int subclass but is the bool-drain signal,
+                # not a count; anything else (a test double / older build that
+                # lacks the method) disables the count path for this wait.  We
+                # test the raw value's type rather than int()-coercing it,
+                # because objects like unittest.mock.MagicMock define __int__
+                # and would silently coerce to 1 and mimic a stalled count.
+                if isinstance(raw, bool) or not isinstance(raw, int):
+                    count_fn = None
+                else:
+                    if raw <= 0:
+                        return False
+                    now = time.monotonic()
+                    if raw < best_count:
+                        best_count = raw
+                        last_improve_t = now
+                    elif noprogress_s > 0.0 and (now - last_improve_t) > noprogress_s:
+                        raise _NoProgress(raw)
+                    return True
+            return bool(drain_fn())
 
         try:
             import torch.cuda  # noqa: PLC0415
@@ -594,41 +798,55 @@ class XPoolActuator:
         # our poll and our sync call.  We close that window by re-polling
         # after every sync and looping until a sync is immediately followed
         # by a clean (still-zero) drain check.
-        while True:
-            while drain_fn():
+        try:
+            while True:
+                while _still_draining():
+                    if time.monotonic() > deadline:
+                        logger.warning(
+                            "XPool drain timeout after %.1f s (fn=%s); "
+                            "cancelling fire (in-flight requests still hold "
+                            "capped pages; unmapping them would cause an "
+                            "illegal memory access)",
+                            self.DRAIN_TIMEOUT_S,
+                            drain_fn_name,
+                        )
+                        return False, poll_us, sync_us
+                    t_sleep_ns = time.perf_counter_ns()
+                    time.sleep(self.DRAIN_POLL_S)
+                    poll_us += (time.perf_counter_ns() - t_sleep_ns) / 1000.0
+                # Phase 2: flush all pending GPU kernels on the correct device
+                # so that no asynchronous CUDA work in flight at the moment the
+                # poll above returned False can still touch the pages we're
+                # about to unmap.  torch.cuda.synchronize(device) is equivalent
+                # to cudaSetDevice(device) + cudaDeviceSynchronize() — it blocks
+                # until every stream on that device (regardless of which CPU
+                # thread submitted the work) is idle.
+                _sync()
+                # Re-check: if new capped-inflight usage appeared while we were
+                # synchronizing, loop back to drain+sync again instead of
+                # racing ahead with the unmap.
+                if not _still_draining():
+                    return True, poll_us, sync_us
                 if time.monotonic() > deadline:
                     logger.warning(
-                        "XPool drain timeout after %.1f s (fn=%s); proceeding "
-                        "with unmap (some in-flight pages may still be in use)",
+                        "XPool drain timeout after %.1f s (fn=%s) on recheck; "
+                        "cancelling fire",
                         self.DRAIN_TIMEOUT_S,
                         drain_fn_name,
                     )
-                    _sync()
-                    return poll_us, sync_us
-                t_sleep_ns = time.perf_counter_ns()
-                time.sleep(self.DRAIN_POLL_S)
-                poll_us += (time.perf_counter_ns() - t_sleep_ns) / 1000.0
-            # Phase 2: flush all pending GPU kernels on the correct device so
-            # that no asynchronous CUDA work in flight at the moment the poll
-            # above returned False can still touch the pages we're about to
-            # unmap.  torch.cuda.synchronize(device) is equivalent to
-            # cudaSetDevice(device) + cudaDeviceSynchronize() — it blocks
-            # until every stream on that device (regardless of which CPU
-            # thread submitted the work) is idle.
-            _sync()
-            # Re-check: if new capped-inflight usage appeared while we were
-            # synchronizing, loop back to drain+sync again instead of racing
-            # ahead with the unmap.
-            if not drain_fn():
-                return poll_us, sync_us
-            if time.monotonic() > deadline:
-                logger.warning(
-                    "XPool drain timeout after %.1f s (fn=%s) on recheck; "
-                    "proceeding with unmap",
-                    self.DRAIN_TIMEOUT_S,
-                    drain_fn_name,
-                )
-                return poll_us, sync_us
+                    return False, poll_us, sync_us
+        except _NoProgress as exc:
+            # Count-based early abort: the capped tail is pinned by
+            # long-running requests (count stalled), so cancel now rather than
+            # holding the prepare tail-cap until DRAIN_TIMEOUT_S.
+            logger.warning(
+                "XPool drain no progress after %.2f s (fn=%s, %d still "
+                "in flight); cancelling fire early to release capped capacity",
+                self.DRAIN_NOPROGRESS_ABORT_S,
+                drain_fn_name,
+                exc.count,
+            )
+            return False, poll_us, sync_us
 
     # ------------------------------------------------------------------
     # Helper: decide whether the kv_arena supports physical handle transfer
@@ -756,9 +974,38 @@ class XPoolActuator:
             breakdown[FIRE_BREAKDOWN_PREPARE] = prepare_us
 
         if plan.direction == "mamba_to_kv":
-            drain_poll_us, drain_sync_us = self._wait_drain("has_capped_mamba_inflight")
-            breakdown[FIRE_BREAKDOWN_DRAIN_POLL] = drain_poll_us
-            breakdown[FIRE_BREAKDOWN_DRAIN_SYNC] = drain_sync_us
+            # Draining the capped mamba tail is ONLY needed when this fire will
+            # physically cuMemUnmap mamba slots (the non-static handle-transfer
+            # path): unmapping memory a running SSM kernel still reads would
+            # fault.  When the mamba arena is *static* (pre-mapped at full
+            # extent — the production pre-construction path), no mamba memory is
+            # ever unmapped: ``apply_xpool_fire`` only lowers the allocator's
+            # logical slot bound while the physical pages stay resident, and the
+            # CappedFreeList cap barrier keeps any still-in-use capped tail slot
+            # out of the free list once its owner frees it.  There is therefore
+            # no kernel-vs-unmap race to drain against.  Worse, draining here is
+            # not just wasted work: PrepareMambaToKvFire caps the *tail* (highest
+            # -index) mamba slots, which under smallest-id-first allocation are
+            # exactly the ones pinned by long-running decode sessions, so the
+            # capped in-flight count stalls (observed stuck at 2) and the drain
+            # NEVER completes.  Every mamba_to_kv fire was then cancelled on the
+            # no-progress abort, silently disabling the KV<-mamba rebalance the
+            # budgeter direction-fix enables and starving KV-bound regimes
+            # (swarm/shifting) of the tail-latency relief it should provide.
+            # Only pay the drain when we actually unmap mamba physical memory.
+            if not mamba_static:
+                drained, drain_poll_us, drain_sync_us = self._wait_drain(
+                    "has_capped_mamba_inflight"
+                )
+                breakdown[FIRE_BREAKDOWN_DRAIN_POLL] = drain_poll_us
+                breakdown[FIRE_BREAKDOWN_DRAIN_SYNC] = drain_sync_us
+                if not drained:
+                    logger.warning(
+                        "mamba_to_kv fire cancelled (op_id=%d): drain timed out "
+                        "with capped mamba slots still in flight",
+                        plan.op_id,
+                    )
+                    return False, breakdown
 
             t_vmm_ns = time.perf_counter_ns()
             if mamba_static:
@@ -812,9 +1059,16 @@ class XPoolActuator:
             return True, breakdown
 
         elif plan.direction == "kv_to_mamba":
-            drain_poll_us, drain_sync_us = self._wait_drain()
+            drained, drain_poll_us, drain_sync_us = self._wait_drain()
             breakdown[FIRE_BREAKDOWN_DRAIN_POLL] = drain_poll_us
             breakdown[FIRE_BREAKDOWN_DRAIN_SYNC] = drain_sync_us
+            if not drained:
+                logger.warning(
+                    "kv_to_mamba fire cancelled (op_id=%d): drain timed out "
+                    "with capped kv pages still in flight",
+                    plan.op_id,
+                )
+                return False, breakdown
 
             t_vmm_ns = time.perf_counter_ns()
             if mamba_static:

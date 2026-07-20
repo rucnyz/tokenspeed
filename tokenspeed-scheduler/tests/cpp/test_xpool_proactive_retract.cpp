@@ -84,6 +84,44 @@ TEST_F(XPoolProactiveRetractSuite, NoProactiveRetractWhenXpoolDisabled) {
     EXPECT_EQ(GetWriteBack(plan), nullptr);
 }
 
+// Gate regression (2026-07-20): proactive capped-drain retraction must only
+// fire while a prepared fire is still pending its drain (signalled by the
+// pre-shrunk counters).  Once ApplyXPoolFire commits, the counter is cleared;
+// if the committed request still holds the capped tail (e.g. a static
+// logical-only mamba_to_kv fire whose capped tail slots are pinned by
+// long-running decoders, or -- as reproduced here on the KV path -- a
+// kv_to_mamba apply that leaves the capped tail mapped), HasCapped*Inflight()
+// stays TRUE for a long time.  The un-gated loop then retracted an in-flight
+// decoder on every subsequent tick, with no drain waiting on it: pointless and
+// the source of the alloc_count=0/local_available=1 crash under the shifting
+// regime's conc=128 pressure.  After commit, no proactive retract may be
+// emitted even though HasCappedKvInflight() is still true.
+TEST_F(XPoolProactiveRetractSuite, NoProactiveRetractAfterCommitWhenCappedTailLingers) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/9, /*start=*/1));
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    PlanOnce();
+    ASSERT_EQ(scheduler_->DecodingSize(), 1u);
+
+    scheduler_->PrepareKvToMambaFire(/*n_kv_pages=*/2);
+    ASSERT_TRUE(scheduler_->HasCappedKvInflight());
+    // Sanity: while the fire is pending its drain, the retract DOES fire.
+    ASSERT_NE(GetWriteBack(PlanOnce()), nullptr);
+
+    // Commit the fire.  ApplyXPoolFire clears kv_pre_shrunk_pages_ but the
+    // already-prepared shrink is not re-grown, so r1's capped tail pages stay
+    // capped -> HasCappedKvInflight remains true with NO pending drain.
+    XPoolFirePlan plan;
+    plan.direction = "kv_to_mamba";
+    plan.page_ids = {0, 0};  // size == n_kv_pages prepared above
+    plan.op_id = 1;
+    scheduler_->ApplyXPoolFire(plan);
+    ASSERT_TRUE(scheduler_->HasCappedKvInflight());  // capped tail lingers
+
+    // Gate must now suppress the (pointless, crash-prone) proactive retract.
+    EXPECT_EQ(GetWriteBack(PlanOnce()), nullptr);
+}
+
 // After PrepareFire, repeated plans should not spam retract attempts on the
 // same tick cadence when the first attempt already latched a victim.
 TEST_F(XPoolProactiveRetractSuite, RepeatedPlansDoNotRequireTickCooldownId) {

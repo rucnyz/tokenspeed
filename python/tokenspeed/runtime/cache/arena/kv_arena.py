@@ -79,6 +79,20 @@ class KvLayerArenaGroup:
             page_size * head_num * head_dim * dtype_itemsize
         )
         self.initial_live_rows = initial_live_rows
+        # Sub-chunk carry (bytes) for grow/shrink.  Physical VMM maps in whole
+        # CHUNK_SIZE_BYTES chunks, but the C++ page allocator caps/frees at
+        # single-page granularity.  If shrink() unmapped ceil(pages→chunks)
+        # every call it would unmap MORE physical pages than the C++ side
+        # capped whenever a fire's page count is not a whole number of chunks
+        # (e.g. an 8-page fire with 16 pages/chunk unmaps a full chunk while
+        # C++ only caps 8 pages).  Those over-unmapped pages stay allocatable
+        # in C++ but have no physical backing → a later KV-store kernel writes
+        # unmapped VA once the pool fills to them → CUDA illegal memory access
+        # (only surfaces at true KV exhaustion on sys/sys_lru).  We instead
+        # carry the leftover bytes here and only unmap a chunk once a full
+        # chunk's worth of pages has actually been released, so the arena's
+        # physically-mapped extent is *always* ≥ the C++ allocatable extent.
+        self._shrink_debt_bytes = 0
 
     # ------------------------------------------------------------------
     # Accessors
@@ -101,10 +115,34 @@ class KvLayerArenaGroup:
     # ------------------------------------------------------------------
 
     def _pages_to_chunks(self, n_pages: int) -> int:
-        """Convert a KV page count to a per-layer chunk count (rounds up)."""
+        """Convert a KV page count to a per-layer chunk count (rounds up).
+
+        Used only by the handle-transfer variants
+        (:meth:`shrink_with_handles` / :meth:`grow_with_handles`) whose
+        contract is "return/consume the handles for whole chunks".  The
+        logical :meth:`grow` / :meth:`shrink` path uses the debt-carried
+        :meth:`_grow_chunks_for` / :meth:`_shrink_chunks_for` instead so it
+        never over-unmaps pages the C++ allocator still owns.
+        """
         return max(
             1, math.ceil(n_pages * self._bytes_per_page_per_layer / CHUNK_SIZE_BYTES)
         )
+
+    def _apply_chunk_delta(self, n_chunks: int, op: str) -> None:
+        """Grow or shrink every per-layer sub-arena by ``n_chunks``."""
+        if n_chunks <= 0:
+            return
+        errors: list[str] = []
+        for arena in self._k_arenas + self._v_arenas:
+            try:
+                getattr(arena, op)(n_chunks)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{arena.name}: {exc}")
+        if errors:
+            raise RuntimeError(
+                f"KvLayerArenaGroup.{op} failed on {len(errors)} arenas: "
+                + "; ".join(errors)
+            )
 
     def grow(self, n_kv_pages: int) -> None:
         """Map ``n_kv_pages`` worth of additional per-layer physical chunks.
@@ -112,56 +150,74 @@ class KvLayerArenaGroup:
         Called after a ``mamba_to_kv`` fire: physical pages are added to the
         tail of every per-layer k/v arena so that the C++ allocator can
         distribute them to new requests.
+
+        Sub-chunk carry: a prior sub-chunk shrink may have left up to
+        ``CHUNK_SIZE_BYTES - 1`` bytes still physically mapped but logically
+        released (``_shrink_debt_bytes``).  Those bytes back the first pages of
+        this grow for free, so we only map new chunks for the shortfall.  This
+        keeps the arena's mapped extent ≥ the C++ allocatable extent at all
+        times while never permanently leaking a partial chunk.
         """
         if n_kv_pages <= 0:
             return
-        n_chunks = self._pages_to_chunks(n_kv_pages)
-        errors: list[str] = []
-        for arena in self._k_arenas + self._v_arenas:
-            try:
-                arena.grow(n_chunks)
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{arena.name}: {exc}")
-        if errors:
-            raise RuntimeError(
-                f"KvLayerArenaGroup.grow failed on {len(errors)} arenas: "
-                + "; ".join(errors)
+        need_bytes = n_kv_pages * self._bytes_per_page_per_layer
+        if need_bytes <= self._shrink_debt_bytes:
+            # Entirely covered by carried-over (still-mapped) slack.
+            self._shrink_debt_bytes -= need_bytes
+            logger.debug(
+                "KvLayerArenaGroup grew %d pages from carry (0 chunks, "
+                "debt_bytes=%d)",
+                n_kv_pages,
+                self._shrink_debt_bytes,
             )
+            return
+        shortfall = need_bytes - self._shrink_debt_bytes
+        n_chunks = math.ceil(shortfall / CHUNK_SIZE_BYTES)
+        self._apply_chunk_delta(n_chunks, "grow")
+        # New slack = mapped chunk bytes beyond the shortfall.
+        self._shrink_debt_bytes = n_chunks * CHUNK_SIZE_BYTES - shortfall
         logger.debug(
-            "KvLayerArenaGroup grew %d pages (%d chunks/layer × %d arenas)",
+            "KvLayerArenaGroup grew %d pages (%d chunks/layer × %d arenas, "
+            "debt_bytes=%d)",
             n_kv_pages,
             n_chunks,
             2 * self._layer_num,
+            self._shrink_debt_bytes,
         )
 
     def shrink(self, n_kv_pages: int) -> None:
-        """Unmap ``n_kv_pages`` worth of tail per-layer physical chunks.
+        """Unmap tail per-layer physical chunks for ``n_kv_pages`` released.
 
         Called before a ``kv_to_mamba`` fire (after drain completes): physical
         backing is removed from the tail of every per-layer k/v arena.
         Physical handles are kept in each sub-arena's ``shared_pool``; use
         :meth:`shrink_with_handles` to additionally extract the raw handles
         for cross-pool donation.
+
+        Sub-chunk carry: the C++ allocator frees pages one at a time, but VMM
+        can only unmap whole chunks.  Unmapping ``ceil(pages→chunks)`` per call
+        would remove more physical backing than C++ actually capped whenever
+        the fire is not a whole number of chunks, stranding still-allocatable
+        C++ pages with no physical memory (the sys/sys_lru KV-store illegal
+        access at exhaustion).  We only unmap the whole chunks that a *full*
+        chunk's worth of released bytes has accumulated to, carrying the
+        remainder in ``_shrink_debt_bytes`` so the arena stays ≥ the C++
+        allocatable extent while still reclaiming memory over successive fires.
         """
         if n_kv_pages <= 0:
             return
-        n_chunks = self._pages_to_chunks(n_kv_pages)
-        errors: list[str] = []
-        for arena in self._k_arenas + self._v_arenas:
-            try:
-                arena.shrink(n_chunks)
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{arena.name}: {exc}")
-        if errors:
-            raise RuntimeError(
-                f"KvLayerArenaGroup.shrink failed on {len(errors)} arenas: "
-                + "; ".join(errors)
-            )
+        released_bytes = n_kv_pages * self._bytes_per_page_per_layer
+        total = released_bytes + self._shrink_debt_bytes
+        n_chunks = total // CHUNK_SIZE_BYTES
+        self._shrink_debt_bytes = total % CHUNK_SIZE_BYTES
+        self._apply_chunk_delta(int(n_chunks), "shrink")
         logger.debug(
-            "KvLayerArenaGroup shrank %d pages (%d chunks/layer × %d arenas)",
+            "KvLayerArenaGroup shrank %d pages (%d chunks/layer × %d arenas, "
+            "debt_bytes=%d)",
             n_kv_pages,
             n_chunks,
             2 * self._layer_num,
+            self._shrink_debt_bytes,
         )
 
     def shrink_with_handles(self, n_kv_pages: int) -> list[int]:

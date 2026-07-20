@@ -84,13 +84,30 @@ std::vector<std::int32_t> MambaChunkAllocator::Grow(std::int32_t num_slots) {
     }
     const std::int32_t old_mapped = mapped_slots_;
     mapped_slots_ += num_slots;
+    // Double-allocation guard, mirroring PageAllocator::Grow: when this Grow
+    // undoes a PrepareMambaToKvFire Shrink whose fire was cancelled on drain
+    // timeout, slots in the re-grown range can still be owned by in-flight
+    // requests (capped but not drained). Returning them to the free list here
+    // would hand the same recurrent-state slot to a second request. Snapshot
+    // ownership BEFORE SetCap erases the range's drained markers, and skip
+    // in-flight slots: their owners release them via the regular Free() path
+    // once done, at which point the raised cap barrier lets them re-enter the
+    // free list naturally.
+    std::vector<bool> in_flight(static_cast<std::size_t>(num_slots), false);
+    for (std::int32_t i = 0; i < num_slots; ++i) {
+        const std::int32_t id = old_mapped + i;
+        in_flight[static_cast<std::size_t>(i)] =
+            capped_free_list_.IsCapped(id) && !capped_free_list_.IsDrained(id);
+    }
     // Raise the cap barrier above the newly mapped range so slots that were
     // previously capped by a Shrink become allocatable again.
     capped_free_list_.SetCap(mapped_slots_);
     std::vector<std::int32_t> grown;
     grown.reserve(static_cast<std::size_t>(num_slots));
     for (std::int32_t id = old_mapped; id < mapped_slots_; ++id) {
-        capped_free_list_.Deallocate(id);
+        if (!in_flight[static_cast<std::size_t>(id - old_mapped)]) {
+            capped_free_list_.Deallocate(id);
+        }
         grown.push_back(id);
     }
     return grown;

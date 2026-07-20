@@ -268,6 +268,14 @@ class ServerArgs:
     # Same-direction fires are never gated. 0.0 disables the cooldown.
     # See SchedulerConfig::xpool_reverse_cooldown_s for the design note.
     xpool_reverse_cooldown_s: float = 2.0
+    # HiMA Phase 3: minimum free Mamba slots the budgeter must leave behind
+    # after a mamba_to_kv fire (safety floor against draining Mamba admission
+    # capacity to zero). Under sustained-pressure workloads where Mamba is
+    # chronically near-saturated by design (large cached prefix chains), the
+    # default of 32 can permanently block mamba_to_kv even when KV pressure
+    # legitimately exceeds Mamba pressure; lower it explicitly for such
+    # workloads once headroom has been profiled.
+    xpool_mamba_floor_slots: int = 32
     # HiMA Phase 3 (S2.2-followup): Mamba pool headroom for the budgeter to
     # logically transfer into. The Python SimpleMambaPool tensor is sized to
     # (mamba_pool_total_chunks + this) slots at boot, and the mamba VMM
@@ -1691,6 +1699,102 @@ class ServerArgs:
             help="Pages moved per inter-pool fire.",
         )
         parser.add_argument(
+            "--admitter-mamba-need-slots",
+            type=int,
+            default=ServerArgs.admitter_mamba_need_slots,
+            help="Admitter kv_to_mamba slots per arrival fire (0 = auto).",
+        )
+        parser.add_argument(
+            "--xpool-nb-margin",
+            type=float,
+            default=ServerArgs.xpool_nb_margin,
+            help="XPool direction-decision deadband margin on adjusted pressure.",
+        )
+        parser.add_argument(
+            "--xpool-ewma-tau-s",
+            type=float,
+            default=ServerArgs.xpool_ewma_tau_s,
+            help="XPool EWMA time constant in seconds.",
+        )
+        parser.add_argument(
+            "--xpool-saturation-low",
+            type=float,
+            default=ServerArgs.xpool_saturation_low,
+            help="Skip XPool fire/admit when both pools' EWMA stay below this.",
+        )
+        parser.add_argument(
+            "--xpool-reverse-cooldown-s",
+            type=float,
+            default=ServerArgs.xpool_reverse_cooldown_s,
+            help="Suppress opposite-direction fires for this many seconds after a fire.",
+        )
+        parser.add_argument(
+            "--xpool-mamba-floor-slots",
+            type=int,
+            default=ServerArgs.xpool_mamba_floor_slots,
+            help="Minimum free Mamba slots left after a mamba_to_kv fire.",
+        )
+        parser.add_argument(
+            "--xpool-mamba-headroom-slots",
+            type=int,
+            default=ServerArgs.xpool_mamba_headroom_slots,
+            help="Extra Mamba slots reserved for budgeter transfers (0 = auto).",
+        )
+        parser.add_argument(
+            "--xpool-w-queue",
+            type=float,
+            default=ServerArgs.xpool_w_queue,
+            help="PressureAdapter weight on queue_len for adj_kv_pressure.",
+        )
+        parser.add_argument(
+            "--xpool-w-retract",
+            type=float,
+            default=ServerArgs.xpool_w_retract,
+            help="PressureAdapter weight on retracted count for adj_kv_pressure.",
+        )
+        parser.add_argument(
+            "--xpool-w-paused",
+            type=float,
+            default=ServerArgs.xpool_w_paused,
+            help="PressureAdapter weight on paused count for adj_mamba_pressure.",
+        )
+        parser.add_argument(
+            "--xpool-queue-ref",
+            type=int,
+            default=ServerArgs.xpool_queue_ref,
+            help="Queue reference count for PressureAdapter (0 = auto).",
+        )
+        parser.add_argument(
+            "--xpool-retract-ref",
+            type=int,
+            default=ServerArgs.xpool_retract_ref,
+            help="Retract reference count for PressureAdapter (0 = auto).",
+        )
+        parser.add_argument(
+            "--xpool-paused-ref",
+            type=int,
+            default=ServerArgs.xpool_paused_ref,
+            help="Paused reference count for PressureAdapter (0 = auto).",
+        )
+        parser.add_argument(
+            "--enable-dynamic-admission-cap",
+            action="store_true",
+            default=ServerArgs.enable_dynamic_admission_cap,
+            help="Clamp max_batch_size to current mamba_total_slots after kv_to_mamba fires.",
+        )
+        parser.add_argument(
+            "--override",
+            action="append",
+            default=[],
+            metavar="KEY=VALUE",
+            help=(
+                "Override any ServerArgs field after CLI parse "
+                "(repeatable). Values are json.loads'd so true/false/"
+                "numbers work; bare strings fall through. Example: "
+                "--override xpool_saturation_low=0.4"
+            ),
+        )
+        parser.add_argument(
             "--enforce-eager",
             action="store_true",
             help="Disable CUDA graph.",
@@ -2030,9 +2134,31 @@ class ServerArgs:
         # ``None`` for missing attrs would silently clobber dataclass defaults
         # for non-CLI-exposed fields (e.g. ``enable_inline_detokenizer``).
         attrs = [attr.name for attr in dataclasses.fields(cls)]
-        return cls(
+        server_args = cls(
             **{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
         )
+
+        # Apply --override KEY=VALUE after construction so any ServerArgs
+        # field (including ones without a dedicated CLI flag) can be set
+        # without editing add_cli_args. Values are json.loads'd so
+        # true/false/numbers type correctly; bare strings fall through.
+        for kv in getattr(args, "override", None) or []:
+            if "=" not in kv:
+                raise ValueError(f"--override must be key=value, got {kv!r}")
+            key, _, raw = kv.partition("=")
+            if key not in attrs:
+                raise ValueError(
+                    f"--override unknown ServerArgs field {key!r}; "
+                    f"known fields include e.g. xpool_saturation_low, "
+                    f"enable_budgeter, radix_eviction_policy"
+                )
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError:
+                value = raw
+            setattr(server_args, key, value)
+
+        return server_args
 
     def url(self):
         if is_valid_ipv6_address(self.host):
@@ -2090,15 +2216,6 @@ class PortArgs:
 
     @staticmethod
     def init_new(server_args: ServerArgs, dp_rank: int | None = None) -> "PortArgs":
-        port = server_args.port + random.randint(100, 1000)
-        while True:
-            if is_port_available(port):
-                break
-            if port < 60000:
-                port += 42
-            else:
-                port -= 43
-
         # DP attention. Use TCP + port to handle both single-node and multi-node.
         if server_args.mapping.nnodes == 1 and server_args.dist_init_addr is None:
             # Only use default port fallback when dp_size == 1
@@ -2125,6 +2242,21 @@ class PortArgs:
         # Note: the port at offset +1 (formerly detokenizer_port) is intentionally
         # skipped so the rest of the port layout stays stable for any external
         # tooling that indexed off the historical port cluster.
+        #
+        # ``nccl_port`` used to be a *wide* random offset
+        # (``server_args.port + random.randint(100, 1000)``) chosen independently
+        # of this cluster. When several engines ran on one host spaced only ~100
+        # ports apart (e.g. parallel A/B eval arms on ports 30100/30200/30300),
+        # one engine's random nccl port routinely landed inside a *neighbour's*
+        # fixed ZMQ cluster or gRPC port. Because ``is_port_available`` is a
+        # non-atomic TOCTOU check, both engines could see the same port free and
+        # then bind it: the stray nccl socket squatted a sibling's ZMQ endpoint,
+        # so scheduler/tokenizer pyobj traffic cross-talked between instances and
+        # the receiving main process eventually crashed silently on a foreign
+        # message. Fold nccl into this same contiguous, collectively-scanned
+        # cluster so it is deterministic and disjoint; parallel instances now
+        # only need a modest --port spacing (the cluster spans <10 ports) to stay
+        # fully isolated.
         while True:
             port_base = dist_init_port + 1
             rpc_port = port_base + 2
@@ -2135,6 +2267,7 @@ class PortArgs:
             else:
                 scheduler_input_port = port_base + 2 + 1 + dp_rank
             rpc_ipc_port = scheduler_input_port + 1
+            nccl_port = rpc_ipc_port + 1
             if all(
                 is_port_available(p)
                 for p in [
@@ -2144,6 +2277,7 @@ class PortArgs:
                     metrics_ipc_port,
                     scheduler_input_port,
                     rpc_ipc_port,
+                    nccl_port,
                 ]
             ):
                 break
@@ -2152,7 +2286,7 @@ class PortArgs:
         return PortArgs(
             tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
             scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
-            nccl_port=port,
+            nccl_port=nccl_port,
             rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
             metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_port}",
             tokenizer_worker_ipc_name=None,

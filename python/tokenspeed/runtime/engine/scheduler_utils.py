@@ -131,6 +131,7 @@ def make_config(
     xpool_ewma_tau_s: float = 1.0,
     xpool_saturation_low: float = 0.5,
     xpool_reverse_cooldown_s: float = 2.0,
+    xpool_mamba_floor_slots: int = 32,
     xpool_w_queue: float = 0.0,
     xpool_w_retract: float = 0.0,
     xpool_w_paused: float = 0.0,
@@ -193,6 +194,7 @@ def make_config(
     cfg.xpool_ewma_tau_s = xpool_ewma_tau_s
     cfg.xpool_saturation_low = xpool_saturation_low
     cfg.xpool_reverse_cooldown_s = xpool_reverse_cooldown_s
+    cfg.xpool_mamba_floor_slots = xpool_mamba_floor_slots
     cfg.xpool_w_queue = xpool_w_queue
     cfg.xpool_w_retract = xpool_w_retract
     cfg.xpool_w_paused = xpool_w_paused

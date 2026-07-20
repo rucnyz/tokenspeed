@@ -308,6 +308,25 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
 }
 
 std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* request) {
+    // In-flight gate (2026-07-18): never retract a request that is part of
+    // the dispatched-but-uncommitted forward batch reported via
+    // SetInflightRequests(). Under overlap scheduling that batch's kernels
+    // are still running: applyRetract would free the victim's mamba working
+    // slot (reallocated while the kernel still writes its recurrent state)
+    // and WriteBackDone would later drop its device tree ref (pages reused
+    // or, with XPool fires, physically cuMemUnmap-ed while the kernel still
+    // reads its KV prefix). Observed as CUDA illegal-memory-access seconds
+    // after retracting an actively-decoding victim (long_horizon sys reps,
+    // 2026-07-18). This is the single funnel for every retract path (S2.1
+    // OOM fallback, S2.5-followup-2 proactive drain retract, S2.6 migrate),
+    // so throwing here covers them all; newRetractOperation() catches the
+    // throw and skips this tick, and by the NEXT planning call the batch has
+    // committed, so the victim is retried with no kernel in flight.
+    if (IsRequestInflight(request->Id())) {
+        throw std::runtime_error(
+            "scheduleRetract: victim is in the in-flight forward batch, skipping this attempt");
+    }
+
     auto full_paged_tokens = request->GetFullPagedTokens(true);
     std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(request->GetDeviceNode());
     std::int32_t total_available = static_cast<std::int32_t>(request->GetOccupiedPages().size());
@@ -354,14 +373,22 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
     // pages during overlap), keep the token-aligned alloc_count and take only
     // that many pages this tick — the classic OOM-retract path. This is safe
     // because it never touches `prefix_pages`, which still reflects the real
-    // tree depth.
+    // tree depth. The alloc_count == 0 / local_available > 0 signature (a
+    // Decoding request holding only its working page) is likewise safe here:
+    // the in-flight gate at the top of this function already guarantees the
+    // victim has no kernel in flight, so the working page / mamba slot can
+    // be released without racing a writer. (A 2026-07-18 grace-window
+    // variant deferred this case by 500 ms instead; it livelocked the S2.1
+    // OOM fallback at kv_util=1.0 because boundary-stalled victims never
+    // resolve the signature on their own. The in-flight gate supersedes it.)
     //
-    // If neither case applies, throw so callers skip this tick without
-    // mutating state.
+    // If prefix_pages over-counts (alloc_count < 0), throw so callers skip
+    // this tick without mutating state.
     const std::int32_t local_available =
         static_cast<std::int32_t>(request->GetLocalAllocatorPages().size());
     if (alloc_count != local_available) {
-        if (local_available > alloc_count && alloc_count >= 0) {
+        const bool tolerant = local_available > alloc_count && alloc_count >= 0;
+        if (tolerant) {
             spdlog::warn(
                 "scheduleRetract: alloc_count mismatch for request {} "
                 "(full_paged_tokens={} prefix_pages={} total_available={} "
@@ -424,6 +451,35 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
 
     if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Host>(host_pages_needed)) {
         return {};
+    }
+
+    // TOCTOU guard against overlap scheduling. Everything above this point is
+    // read-only w.r.t. this request's device pages and the shared device tree
+    // (Match()/EnsureCapacityByEvict<Host> only touch host state), but under
+    // overlap scheduling the *asynchronous* forward/prefill dispatched on a
+    // previous tick can still be growing this request's local KV allocator
+    // (ExtendResult appends pages) and a sibling request's retract/finish can
+    // reshape the shared device tree between the entry-point snapshot of
+    // `prefix_pages`/`alloc_count`/`local_available` and the mutation below.
+    // If we Insert<Device>() with a now-stale `prefix_pages` (wrong tree
+    // depth) or TakeFirstPages() more pages than the local allocator still
+    // holds, we either desync later DevicePagesFromRoot() walks -- which
+    // surfaces as an async CUDA illegal-memory-access in a downstream
+    // attention kernel -- or throw OwnedPages::TakeFirst "count out of range".
+    // Re-derive the accounting immediately before mutating and bail if it
+    // shifted; newRetractOperation() catches this and retries the victim next
+    // tick with a backoff, so a skipped attempt is always safe. The common
+    // (no-race) path is unchanged: the re-read equals the snapshot and we fall
+    // straight through.
+    {
+        std::vector<std::int32_t> prefix_pages_now = DevicePagesFromRoot(request->GetDeviceNode());
+        const std::int32_t local_available_now =
+            static_cast<std::int32_t>(request->GetLocalAllocatorPages().size());
+        if (prefix_pages_now != prefix_pages || local_available_now != local_available) {
+            throw std::runtime_error(
+                "scheduleRetract: device tree/local allocator shifted under overlap between "
+                "snapshot and mutation, skipping this attempt");
+        }
     }
 
     if (alloc_count > 0) {
@@ -754,6 +810,13 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     if (ops.empty() && !candidates.empty()) {
         std::vector<Request*> retract_candidates;
         for (Request* req : candidates) {
+            // Skip requests in the dispatched-but-uncommitted forward batch
+            // (see SetInflightRequests): scheduleRetract would refuse them
+            // anyway, and skipping here lets the fallback pick the longest
+            // *eligible* victim instead of burning the tick on a doomed one.
+            if (IsRequestInflight(req->Id())) {
+                continue;
+            }
             if ((req->Is<fsm::Decoding>() || (req->Is<fsm::PrefillDone>() && config_.role != Role::kD)) &&
                 config_.role != Role::kP) {
                 retract_candidates.push_back(req);

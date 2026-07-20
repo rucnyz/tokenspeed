@@ -139,11 +139,34 @@ std::vector<std::int32_t> PageAllocator::Grow(std::int32_t num_pages) {
     // the free list. Always re-asserting the barrier at mapped_pages_ + 1 keeps
     // Grow correct for both the initial baseline restore (no prior tail) and
     // reclaiming previously lent-out pages.
+    //
+    // CRITICAL (double-allocation guard): a page in the re-grown range can
+    // still be OWNED by an in-flight request. This is the normal case when
+    // Grow is undoing a PrepareKvToMambaFire Shrink whose fire was cancelled
+    // because the drain timed out (CancelXPoolFire): the very reason the
+    // drain timed out is that requests still hold capped pages. Such a page
+    // is capped but NOT drained. Pushing it onto the free list here hands it
+    // to a second request while the first still writes through it -- KV
+    // corruption that surfaces as a delayed CUDA illegal-memory-access (the
+    // cc_qwen_t6 @ cap=640000 rep-2 crash, 28 s after a cancelled fire).
+    // Snapshot the in-flight set BEFORE SetCap (which erases the range's
+    // drained markers), and skip those pages: their owners free them through
+    // the regular Deallocate path once done, and since the cap barrier is
+    // then already raised they land back on the free list naturally.
+    std::vector<bool> in_flight(static_cast<std::size_t>(num_pages), false);
+    for (std::int32_t i = 0; i < num_pages; ++i) {
+        const std::int32_t page_id = old_mapped + 1 + i;
+        in_flight[static_cast<std::size_t>(i)] =
+            capped_free_list_.IsCapped(page_id) && !capped_free_list_.IsDrained(page_id);
+    }
     capped_free_list_.SetCap(mapped_pages_ + 1);
     std::vector<std::int32_t> grown;
     grown.reserve(static_cast<std::size_t>(num_pages));
-    for (std::int32_t page_id = old_mapped + 1; page_id <= mapped_pages_; ++page_id) {
-        capped_free_list_.Deallocate(page_id);
+    for (std::int32_t i = 0; i < num_pages; ++i) {
+        const std::int32_t page_id = old_mapped + 1 + i;
+        if (!in_flight[static_cast<std::size_t>(i)]) {
+            capped_free_list_.Deallocate(page_id);
+        }
         grown.push_back(page_id);
     }
     return grown;

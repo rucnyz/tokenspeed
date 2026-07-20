@@ -31,8 +31,8 @@ void CappedFreeList::Reset(std::int32_t size, std::vector<std::int32_t> initial_
     tail_lo_ = kNoTail;
     marks_.clear();
     capped_drained_.clear();
-    free_ids_ = std::move(initial_free);
-    std::sort(free_ids_.begin(), free_ids_.end());
+    free_ids_.clear();
+    free_ids_.insert(initial_free.begin(), initial_free.end());
 }
 
 bool CappedFreeList::inTail(std::int32_t page_id) const {
@@ -57,7 +57,7 @@ void CappedFreeList::MarkCapped(std::int32_t page_id) {
     if (IsCapped(page_id)) {
         return;
     }
-    auto it = std::find(free_ids_.begin(), free_ids_.end(), page_id);
+    auto it = free_ids_.find(page_id);
     if (it != free_ids_.end()) {
         // Page was free; removing it makes it immediately drained.
         free_ids_.erase(it);
@@ -78,8 +78,7 @@ void CappedFreeList::UnmarkCapped(std::int32_t page_id) {
     --n_capped_;
     // Remove from drained set; the page is live again.
     capped_drained_.erase(page_id);
-    free_ids_.push_back(page_id);
-    std::sort(free_ids_.begin(), free_ids_.end());
+    free_ids_.insert(page_id);
 }
 
 void CappedFreeList::SetCap(std::int32_t tail_lo) {
@@ -109,16 +108,14 @@ void CappedFreeList::SetCap(std::int32_t tail_lo) {
     tail_lo_ = tail_lo;
     n_capped_ += (size_ - tail_lo_);
     // Remove newly capped free pages from free_ids_ and mark them drained.
-    free_ids_.erase(
-        std::remove_if(free_ids_.begin(), free_ids_.end(),
-                       [this](std::int32_t id) {
-                           if (inTail(id) || IsCapped(id)) {
-                               capped_drained_.insert(id);
-                               return true;
-                           }
-                           return false;
-                       }),
-        free_ids_.end());
+    // Only the contiguous tail [tail_lo_, size_) can newly enter the cap here:
+    // marks_-capped pages were already removed from free_ids_ by MarkCapped, so
+    // the ordered set lets us drop exactly the tail suffix in O(k log n) instead
+    // of scanning the whole free list.
+    for (auto it = free_ids_.lower_bound(tail_lo_); it != free_ids_.end();) {
+        capped_drained_.insert(*it);
+        it = free_ids_.erase(it);
+    }
 }
 
 std::int32_t CappedFreeList::InFlightCappedCount() const {
@@ -151,8 +148,7 @@ void CappedFreeList::Deallocate(std::int32_t page_id) {
         capped_drained_.insert(page_id);
         return;
     }
-    free_ids_.push_back(page_id);
-    std::sort(free_ids_.begin(), free_ids_.end());
+    free_ids_.insert(page_id);
 }
 
 }  // namespace tokenspeed

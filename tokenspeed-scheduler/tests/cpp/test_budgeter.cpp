@@ -135,6 +135,34 @@ TEST(BudgeterTest, MambaFloorBlocksMambaToKvFire) {
     EXPECT_FALSE(agent.Tick(snap).has_value());
 }
 
+TEST(BudgeterTest, MambaFloorGateCountsEvictableCapacityAsReclaimable) {
+    // Regression (2026-07-20): the mamba_to_kv floor gate used to check only
+    // raw mamba_free_slots, ignoring mamba_evictable_slots entirely. Under
+    // steady load the mamba free list is nearly always near-empty (LPB keeps
+    // finished decodes' slots "evictable" rather than immediately freeing
+    // them) while evictable capacity is plentiful, so the raw-free check
+    // structurally blocked mamba_to_kv on ~95% of KV-pressured ticks in
+    // production (capped long_horizon: median raw mamba_free=3, all 43
+    // committed fires went kv_to_mamba even though KV was the tighter pool
+    // on 56% of ticks) -- worsening KV-bound p99 TTFT. The gate must count
+    // free+evictable, matching Admitter::kCrossEvict's feasibility check.
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.xpool_mamba_floor_slots = 50;  // keep at least 50 *reclaimable* slots
+
+    BudgetAgent agent(config);
+    TinySleep();
+    PoolSnapshot snap = MakeBaseSnapshot();
+    snap.kv_free_pages = 0;                // kv_util = 100%
+    snap.mamba_free_slots = 10;             // raw free below floor=50 ...
+    snap.mamba_evictable_slots = 300;       // ... but free+evictable=310 clears it
+    auto plan = agent.Tick(snap);
+
+    ASSERT_TRUE(plan.has_value())
+        << "mamba_to_kv must fire when reclaimable (free+evictable) mamba "
+           "capacity clears the floor, even if raw free alone does not";
+    EXPECT_EQ(plan->direction, "mamba_to_kv");
+}
+
 TEST(BudgeterTest, MambaEvictableSlotsAreSubtractedFromPressure) {
     // Regression for the HiMA Phase 2 stress test: when mamba's prefix-cache
     // is full of evictable states, those slots should NOT inflate mamba
@@ -491,6 +519,33 @@ TEST(BudgeterTest, PressureAdapterCanLiftBelowSaturationGate) {
     auto plan = agent.Tick(snap);
     ASSERT_TRUE(plan.has_value())
         << "queue burst must lift adj_kv above xpool_saturation_low";
+    EXPECT_EQ(plan->direction, "mamba_to_kv");
+}
+
+TEST(BudgeterTest, PressureAdapterQueueBoostSurvivesDualSaturation) {
+    // Regression for the sustained-pressure workload: once BOTH pools' raw
+    // utilisation EWMA are pinned near 1.0, a symmetric clamp(adjusted, 0, 1)
+    // on adj_kv ties it right back to adj_mamba, permanently hiding a real,
+    // still-growing KV queue and blocking mamba_to_kv forever. adj_kv must be
+    // allowed to exceed 1.0 so the queue boost keeps differentiating
+    // direction even under dual saturation.
+    SchedulerConfig config = MakeBudgeterConfig();
+    config.xpool_w_queue = 0.3;
+    config.xpool_queue_ref = 10;
+    BudgetAgent agent(config);
+
+    TinySleep();
+    PoolSnapshot snap = MakeBaseSnapshot();
+    snap.kv_free_pages = 1;          // kv_util = 99%
+    snap.mamba_free_slots = 1;       // mamba_util = 99% -- both pools saturated
+    snap.queue_len = 20;             // > queue_ref => q_norm = 1
+    // Without the fix: adj_kv = clamp(0.99 + 0.3, 0, 1) = 1.0,
+    //                   adj_mamba = 0.99, gap = 0.01 < nb_margin(0.1) -> no fire.
+    // With the fix:    adj_kv = 0.99 + 0.3 = 1.29 (unclamped),
+    //                   gap = 0.30 >= nb_margin(0.1) -> fires.
+    auto plan = agent.Tick(snap);
+    ASSERT_TRUE(plan.has_value())
+        << "queue backpressure must break a tie between two saturated pools";
     EXPECT_EQ(plan->direction, "mamba_to_kv");
 }
 
