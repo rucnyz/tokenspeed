@@ -21,9 +21,6 @@
 from __future__ import annotations
 
 from collections import Counter
-
-from __future__ import annotations
-
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -191,6 +188,16 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 "tokenspeed_scheduler extension, which keeps the legacy "
                 "per-layer layout."
             )
+
+    def _get_page_size_bytes(self):
+        return (
+            2
+            * self.page_size
+            * self.layer_num
+            * self.head_num
+            * self.head_dim
+            * torch._utils._element_size(self.dtype)
+        )
 
     def _create_buffers(self):
         if getattr(self, "_pre_built_kv_arena", None) is not None:

@@ -134,6 +134,12 @@ public:
                     std::optional<std::int32_t> commit_target_raw_tokens = std::nullopt,
                     std::span<const std::span<const std::int32_t>> commit_token_pages = {});
 
+    // Retract-decode variant: admission for a request re-entering from
+    // Retracted with a fresh-table view.
+    bool AdmitChunkFromRetracted(const std::string& request_id, std::int32_t target_raw_tokens_exclusive,
+                                 std::map<std::string, std::int32_t>& simulated_free,
+                                 const MatchResult::PagedCache& paged_cache_hit);
+
     // Commit newly-written full LCM segments into TreeNode PagedCacheSnapshots.
     void CommitChunk(const std::string& request_id, TreeNode* terminal);
 

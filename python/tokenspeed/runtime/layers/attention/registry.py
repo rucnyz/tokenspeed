@@ -273,13 +273,12 @@ def _create_hybrid_linear_attn(
         )
         pool = LayerMappedKVPool(inner_pool, list(range(num_total_layers)))
     else:
-        # Create KV cache pool (only for full attention layers)
+        # Radix path: the pool is created ONCE below, after the (optional)
+        # XPool pre-arena factory has run, so its tensors can be born on the
+        # arena VA. Creating it here as well would double-allocate the full
+        # KV pool (torch copy + arena copy) and OOM the sys arm.
         num_full_attn_layers = len(full_attn_layers)
-        inner_pool = config.create_pool(
-            num_full_attn_layers, max_num_tokens, rank, enable_memory_saver
-        )
-        # Wrap with layer ID mapping (global layer IDs -> pool indices)
-        pool = LayerMappedKVPool(inner_pool, full_attn_layers)
+        pool = None
 
     # Read mamba2_cache_params to decide whether this model actually has
     # any linear / mamba layers. A draft model on a hybrid-GDN target
@@ -342,7 +341,7 @@ def _create_hybrid_linear_attn(
     # ----------------------------------------------------------------
     kv_arena_group = None
     mamba_arena = None
-    if pre_arenas_factory is not None and len(mamba_layer_ids) > 0:
+    if pre_arenas_factory is not None and len(mamba_layer_ids) > 0 and not flat_kvcache:
         import torch
 
         try:
@@ -368,15 +367,16 @@ def _create_hybrid_linear_attn(
             kv_arena_group = None
             mamba_arena = None
 
-    inner_pool = config.create_pool(
-        num_full_attn_layers,
-        max_num_tokens,
-        rank,
-        enable_memory_saver,
-        kv_arena_group=kv_arena_group,
-    )
-    # Wrap with layer ID mapping (global layer IDs -> pool indices)
-    pool = LayerMappedKVPool(inner_pool, full_attn_layers)
+    if not flat_kvcache:
+        inner_pool = config.create_pool(
+            num_full_attn_layers,
+            max_num_tokens,
+            rank,
+            enable_memory_saver,
+            kv_arena_group=kv_arena_group,
+        )
+        # Wrap with layer ID mapping (global layer IDs -> pool indices)
+        pool = LayerMappedKVPool(inner_pool, full_attn_layers)
 
     if len(mamba_layer_ids) == 0:
         logger.info(

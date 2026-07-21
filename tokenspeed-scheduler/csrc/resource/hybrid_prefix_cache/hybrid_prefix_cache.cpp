@@ -1524,6 +1524,22 @@ bool HybridPrefixCache::AdmitChunk(const std::string& request_id, std::int32_t f
                                 paged_cache_hit, context);
 }
 
+bool HybridPrefixCache::AdmitChunkFromRetracted(const std::string& request_id,
+                                                std::int32_t target_raw_tokens_exclusive,
+                                                std::map<std::string, std::int32_t>& simulated_free,
+                                                const MatchResult::PagedCache& paged_cache_hit) {
+    // Retract-decode admission. The pre-rebase implementation credited pages
+    // still owned by the request's stale table (fresh_table_view +
+    // owned_release_credit) so re-admission did not double-charge them.
+    // Upstream redesigned PagedCacheAdmissionContext around commit targets
+    // and the admission walk no longer takes a release credit, so this build
+    // admits against the plain context: correct but conservative -- under
+    // group-pool pressure a retracted request may defer where the old code
+    // admitted. Port the credit into the upstream admission walk before any
+    // paged-cache-pressure benchmark.
+    return admitPagedCacheChunk(request_id, 0, target_raw_tokens_exclusive, simulated_free, paged_cache_hit, {});
+}
+
 void HybridPrefixCache::CommitChunk(const std::string& request_id, TreeNode* terminal) {
     if (!HasPagedCacheAdjunct()) return;
     if (terminal == nullptr) return;

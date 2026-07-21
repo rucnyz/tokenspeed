@@ -220,6 +220,7 @@ private:
 
     PrefillOperation applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
                                              std::vector<LoadBackOperation>& loadback_ops);
+    PrefillOperation applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillFirstChunkEvent event);
     PrefillOperation applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillEvent event);
     DecodeOperation applyEventAndGenerateOp(Request* request, fsm::ScheduleDecodeEvent event);
     DecodeOperation applyEventAndGenerateOp(Request* request, fsm::ScheduleDecodeFromRetractedEvent event);

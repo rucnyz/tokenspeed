@@ -213,6 +213,7 @@ class SimpleMambaPool:
         page_size: int = 1,
         speculative_num_draft_tokens: int = 0,
         max_req_pool_size: int = 0,
+        mamba_arena: "object | None" = None,
     ):
         self.size = size
         self.device = device
@@ -236,29 +237,141 @@ class SimpleMambaPool:
         total_size = size + self.draft_total_slots
         self.total_size = total_size
 
-        # Allocate conv state: (num_mamba_layers, total_size, conv_dim, state_len)
-        self.conv_state = torch.zeros(
-            num_mamba_layers,
-            total_size,
-            *conv_state_shape,
-            dtype=conv_dtype,
-            device=device,
-        )
-        # Allocate temporal/SSM state: (num_mamba_layers, total_size, heads, key_dim, val_dim)
-        self.ssm_state = torch.zeros(
-            num_mamba_layers,
-            total_size,
-            *temporal_state_shape,
-            dtype=ssm_dtype,
-            device=device,
-        )
+        if mamba_arena is not None:
+            self.conv_state, self.ssm_state = self._alloc_from_arena(
+                mamba_arena=mamba_arena,
+                num_mamba_layers=num_mamba_layers,
+                total_size=total_size,
+                conv_state_shape=conv_state_shape,
+                temporal_state_shape=temporal_state_shape,
+                conv_dtype=conv_dtype,
+                ssm_dtype=ssm_dtype,
+                device=device,
+            )
+        else:
+            # Allocate conv state: (num_mamba_layers, total_size, conv_dim, state_len)
+            self.conv_state = torch.zeros(
+                num_mamba_layers,
+                total_size,
+                *conv_state_shape,
+                dtype=conv_dtype,
+                device=device,
+            )
+            # Allocate temporal/SSM state: (num_mamba_layers, total_size, heads, key_dim, val_dim)
+            self.ssm_state = torch.zeros(
+                num_mamba_layers,
+                total_size,
+                *temporal_state_shape,
+                dtype=ssm_dtype,
+                device=device,
+            )
 
         self.mamba_cache = (self.conv_state, self.ssm_state)
         self.layer_transfer_counter = None
+        self._mamba_arena: "object | None" = None  # set by bind_arena()
 
         self.current_input_indices = torch.full(
             (self.current_input_size,), -1, dtype=torch.int32, device=device
         )
+
+    def bind_arena(self, mamba_arena: "object") -> None:
+        """Rebind conv_state / ssm_state to a VMM ChunkArena VA window.
+
+        This is the *post-construction* path used when the arena is created
+        after the pool (e.g. in EventLoop._init_xpool_actuator).  The existing
+        tensors are replaced with zero-copy views over the arena VA.  Any
+        in-flight GPU work MUST be synchronised before calling this method.
+
+        The arena must already be fully mapped (all chunks present) and sized
+        to hold both conv_state and ssm_state.
+        """
+        import torch.cuda
+
+        num_layers = self.conv_state.shape[0]
+        conv_shape = tuple(self.conv_state.shape)
+        ssm_shape = tuple(self.ssm_state.shape)
+        conv_dtype = self.conv_state.dtype
+        ssm_dtype = self.ssm_state.dtype
+
+        new_conv, new_ssm = self._alloc_from_arena(
+            mamba_arena=mamba_arena,
+            num_mamba_layers=num_layers,
+            total_size=self.total_size,
+            conv_state_shape=conv_shape[2:],
+            temporal_state_shape=ssm_shape[2:],
+            conv_dtype=conv_dtype,
+            ssm_dtype=ssm_dtype,
+            device=self.device,
+        )
+
+        # Copy existing state into the new arena-backed tensors so that any
+        # cached prefixes / checkpointed mamba states are preserved.
+        with torch.no_grad():
+            new_conv.copy_(self.conv_state)
+            new_ssm.copy_(self.ssm_state)
+
+        torch.cuda.synchronize()
+
+        self.conv_state = new_conv
+        self.ssm_state = new_ssm
+        self.mamba_cache = (self.conv_state, self.ssm_state)
+        self._mamba_arena = mamba_arena
+
+    @staticmethod
+    def _alloc_from_arena(
+        *,
+        mamba_arena: "object",
+        num_mamba_layers: int,
+        total_size: int,
+        conv_state_shape: tuple,
+        temporal_state_shape: tuple,
+        conv_dtype: torch.dtype,
+        ssm_dtype: torch.dtype,
+        device: str,
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """Build conv_state and ssm_state as views over a VMM arena VA window.
+
+        Layout in the arena (contiguous, in order):
+            [conv block: num_layers × total_size × *conv_shape  (conv_dtype)]
+            [ssm  block: num_layers × total_size × *ssm_shape   (ssm_dtype)]
+
+        The arena must already be fully mapped (all chunks present) when this
+        is called.  After construction, capacity changes happen by growing /
+        shrinking the arena WITHOUT changing the base pointer — so the tensor
+        objects remain valid even inside CUDA graphs.
+        """
+        import math
+
+        from tokenspeed.runtime.cache.arena.from_blob import from_blob
+
+        conv_elem = torch.empty(0, dtype=conv_dtype).element_size()
+        ssm_elem = torch.empty(0, dtype=ssm_dtype).element_size()
+
+        conv_shape = (num_mamba_layers, total_size, *conv_state_shape)
+        ssm_shape = (num_mamba_layers, total_size, *temporal_state_shape)
+
+        conv_bytes = math.prod(conv_shape) * conv_elem
+        ssm_bytes = math.prod(ssm_shape) * ssm_elem
+
+        # Verify the arena has enough VA backing.
+        arena_bytes = mamba_arena.max_chunks * mamba_arena.chunk_size
+        needed = conv_bytes + ssm_bytes
+        if needed > arena_bytes:
+            raise RuntimeError(
+                f"SimpleMambaPool: mamba_arena too small "
+                f"({arena_bytes} bytes) for conv+ssm tensors ({needed} bytes). "
+                f"Increase arena size or disable VMM pool binding."
+            )
+
+        base = mamba_arena.base_ptr
+        conv_state = from_blob(base, conv_shape, dtype=conv_dtype, device=device)
+        ssm_state = from_blob(
+            base + conv_bytes, ssm_shape, dtype=ssm_dtype, device=device
+        )
+        # Zero-initialize (equivalent to torch.zeros).
+        conv_state.zero_()
+        ssm_state.zero_()
+        return conv_state, ssm_state
 
     def get_mamba_indices(self, mamba_pool_indices: torch.Tensor) -> torch.Tensor:
         """Return mamba cache indices directly (allocated by C++ scheduler)."""

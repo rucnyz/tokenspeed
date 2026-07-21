@@ -306,10 +306,12 @@ async def generate(request: Request):
         return await _proxy_request(request)
     body = await _inject_default_model(await request.body())
     resp = await _proxy_request(request, body_override=body)
-    if not (isinstance(resp, Response) and resp.body):
+    # StreamingResponse (returned by newer smg proxies) has no .body attribute.
+    resp_body = getattr(resp, "body", None)
+    if not (isinstance(resp, Response) and resp_body):
         return resp  # streaming or empty: pass through
     try:
-        parsed = json.loads(resp.body)
+        parsed = json.loads(resp_body)
     except (ValueError, TypeError):
         return resp
 
